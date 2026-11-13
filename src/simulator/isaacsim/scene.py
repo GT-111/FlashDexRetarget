@@ -6,11 +6,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import isaaclab.sim as sim_utils
 import numpy as np
 import torch
 import trimesh
-
-import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
@@ -18,9 +17,17 @@ from isaaclab.sensors import ContactSensor, ContactSensorCfg
 
 from envs.commands.motion_tracking.reference.hand import ALLLINK_BODY_NAMES_BY_SIDE
 from envs.scene._object_setup import object_park_position
+from envs.scene.native import NativeSceneCfg
 
 from .convert_assets import COLVIS_ROBOT_DIRNAME, colvis_enabled
-from .entity import ArticulationAdapter, RigidObjectAdapter, _FreshnessClock
+from .entity import (
+    ArticulationAdapter,
+    FreeArticulationAdapter,
+    NativeRobotAdapter,
+    RigidObjectAdapter,
+    _FreshnessClock,
+    _ObjIndexing,
+)
 from .mjcf_meta import RobotMjcfMeta
 from .sensors import (
     AlllinkContactAdapter,
@@ -85,6 +92,7 @@ class IsaacSceneAdapter:
         self.entities: dict[str, object] = {}
         self.sensors: dict[str, object] = {}
         self.sensor_context = None
+        self._reset_entities = None
 
     @property
     def num_envs(self) -> int:
@@ -114,7 +122,8 @@ class IsaacSceneAdapter:
         self._scene.update(dt)
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
-        for ent in self.entities.values():
+        entities = self.entities.values() if self._reset_entities is None else self._reset_entities
+        for ent in entities:
             ent.reset(env_ids)
         self._scene.reset(env_ids)
 
@@ -234,7 +243,6 @@ def _spawn_support_disks(cfg, stage, num_envs: int, coff: float, roff: float, ma
     if not bool(sd.enable):
         return {}
     from omegaconf import open_dict
-
     from pxr import Sdf, UsdPhysics
 
     from envs.scene._support_disk_setup import support_disk_name, support_park_position
@@ -356,6 +364,8 @@ def build_isaac_scene(
 ):
     """Author + clone the scene, boot physics, wrap in adapters. assigned_obj_slot
     (B,) selects PER-ENV-OBJECT mode; None = legacy parked-slot mode."""
+    if cfg.robot.get("native_scene") is not None:
+        return _build_native_isaac_scene(cfg, sim_ctx, device, meta)
     num_envs = int(cfg.scene.num_envs)
     per_env_mode = assigned_obj_slot is not None
     scene = InteractiveScene(
@@ -783,3 +793,191 @@ def build_isaac_scene(
     scene_adapter._bind_sensor_callbacks = _bind
 
     return scene_adapter, sim_adapter, robot_adapter
+
+
+def _native_articulation_cfg(binding, meta, cfg) -> ArticulationCfg:
+    """Native scalar drives only; no PD drive is created for a passive joint."""
+    if not Path(binding.usd_path).is_file():
+        raise FileNotFoundError(binding.usd_path)
+    driven = meta.driven_joint_names
+    actuators = {}
+    if driven:
+        actuators["native_position"] = ImplicitActuatorCfg(
+            joint_names_expr=driven,
+            stiffness={j: meta.kp_kv_for_joint(j)[0] for j in driven},
+            damping={
+                j: meta.kp_kv_for_joint(j)[1]
+                + float(meta.joint_damping[meta.joint_names.index(j)])
+                for j in driven
+            },
+            effort_limit_sim={
+                j: float(meta.actuator_effort_limit[meta.actuator_names.index(a)])
+                for a, j in meta.actuator_joint.items()
+            },
+        )
+    return ArticulationCfg(
+        prim_path=f"/World/envs/env_.*/{binding.entity_name}",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=binding.usd_path,
+            activate_contact_sensors=True,
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=bool(cfg.robot.get("self_collision", False)),
+                solver_position_iteration_count=int(
+                    cfg.sim.physx.solver_position_iteration_count
+                ),
+                solver_velocity_iteration_count=int(
+                    cfg.sim.physx.solver_velocity_iteration_count
+                ),
+            ),
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=tuple(meta.free_roots[0].default_pose[:3]),
+            rot=tuple(meta.free_roots[0].default_pose[3:]),
+            joint_pos=dict(zip(meta.joint_names, meta.joint_default, strict=True)),
+        ),
+        actuators=actuators,
+    )
+
+
+def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
+    """Compose named FREE hands and one passive articulated object.
+
+    The converted assets come from the configured, already composed source
+    scene. No visual-mesh density estimate or side-based object duplication is
+    used by this path.
+    """
+    layout = NativeSceneCfg.from_mapping(cfg.robot.native_scene)
+    scene = InteractiveScene(
+        InteractiveSceneCfg(
+            num_envs=int(cfg.scene.num_envs),
+            env_spacing=float(cfg.scene.env_spacing),
+        )
+    )
+    static_cfg = sim_utils.UsdFileCfg(usd_path=layout.static_usd_path)
+    static_cfg.func("/World/envs/env_0/NativeStatic", static_cfg)
+    sim_utils.DomeLightCfg(intensity=2000.0).func(
+        "/World/Light", sim_utils.DomeLightCfg(intensity=2000.0)
+    )
+    assets, metadata = {}, {}
+    for binding in layout.articulations:
+        meta = scene_meta.subtree(binding.root_body_name)
+        if (
+            len(meta.free_roots) != 1
+            or meta.free_roots[0].name != binding.root_joint_name
+        ):
+            raise ValueError(f"wrong FREE root for {binding.entity_name!r}")
+        metadata[binding.entity_name] = meta
+        if binding == layout.object and meta.actuator_names:
+            raise ValueError("native object articulation must remain passive")
+        assets[binding.entity_name] = Articulation(
+            _native_articulation_cfg(binding, meta, cfg)
+        )
+    contacts = {}
+    for hand in layout.hands:
+        for body in cfg.robot.contact_links[hand.side]:
+            metadata[hand.entity_name].body_names.index(body)
+            contacts[body] = ContactSensor(
+                ContactSensorCfg(
+                    prim_path=f"/World/envs/env_.*/{hand.entity_name}/{body}",
+                    update_period=0.0,
+                )
+            )
+    scene.clone_environments(copy_from_source=False)
+    scene.filter_collisions(global_prim_paths=[])
+    for name, asset in assets.items():
+        scene.articulations[name] = asset
+    for name, sensor in contacts.items():
+        scene.sensors[f"_native_contact_{name}"] = sensor
+    sim_ctx.reset()
+    scene.update(0.0)
+    clock = _FreshnessClock()
+    sim = IsaacSimAdapter(sim_ctx, device, render=not bool(cfg.get("headless", True)))
+    sim.model.opt.gravity = scene_meta.gravity.copy()
+    sim._clock = clock
+    adapter = IsaacSceneAdapter(scene, device)
+    adapter._clock = clock
+    adapter.native_layout = layout
+    hands = {}
+    for binding in layout.articulations:
+        meta = metadata[binding.entity_name]
+        asset = assets[binding.entity_name]
+        ent = FreeArticulationAdapter(
+            asset,
+            meta,
+            clock,
+            device,
+            root_body_name=binding.root_body_name,
+        )
+        # Passive damping/armature/friction are physical properties, not extra
+        # position actuators. A BOX hinge is never put in the drive roster.
+        joint_ids = ent._isaac_joint_ids.tolist()
+        scalar = dict(joint_ids=joint_ids)
+        damping = meta.joint_damping.copy()
+        for joint in meta.driven_joint_names:
+            damping[meta.joint_names.index(joint)] += meta.kp_kv_for_joint(joint)[1]
+        asset.write_joint_damping_to_sim(
+            torch.as_tensor(damping, device=device), **scalar
+        )
+        asset.write_joint_armature_to_sim(
+            torch.as_tensor(meta.joint_armature, device=device), **scalar
+        )
+        asset.write_joint_friction_coefficient_to_sim(
+            torch.as_tensor(meta.joint_frictionloss, device=device), **scalar
+        )
+        ids = [
+            sim.model.register_body(m, inertia, q)
+            for m, inertia, q in zip(
+                meta.body_mass, meta.body_inertia, meta.body_iquat, strict=True
+            )
+        ]
+        ent.indexing = _ObjIndexing(torch.tensor(ids, dtype=torch.long, device=device))
+        ent.data.indexing = ent.indexing
+        adapter.entities[binding.entity_name] = ent
+        if binding in layout.hands:
+            hands[binding.side] = ent
+    robot = NativeRobotAdapter(hands, scene_meta=scene_meta, clock=clock, device=device)
+    adapter.entities[cfg.robot.entity_name] = robot
+    adapter._reset_entities = [
+        adapter.entities[b.entity_name] for b in layout.articulations
+    ]
+    # Exact named parts are available to the public recorder; they are bodies
+    # of ONE articulation, rather than aliases for two rigid object roots.
+    adapter.object_parts = {
+        p.name: {"entity_name": layout.object.entity_name, "body_name": p.body_name}
+        for p in layout.object.parts
+    }
+    banks = {}
+    for hand in layout.hands:
+        names = list(cfg.robot.contact_links[hand.side])
+        bank = LinkContactBank([contacts[n] for n in names], clock, device)
+        bank.side = hand.side
+        bank.margins = torch.tensor(
+            [scene_meta.body_bound[n] + 0.015 for n in names],
+            device=device,
+        )
+        tip_sites = cfg.robot.site_names.contact[hand.side]
+        bank.tip_rows = tuple(
+            names.index(scene_meta.sites[n].body_name) for n in tip_sites
+        )
+        ids, _ = robot.find_bodies(names, preserve_order=True)
+        bank.link_pos_fn = lambda ids=ids: robot.data.body_link_pos_w[:, ids]
+        prefix = hand.side[0]
+        adapter.sensors[f"{prefix}_alllink_contact"] = AlllinkContactAdapter(bank)
+        adapter.sensors[f"{prefix}_alllink_contact_pos"] = AlllinkContactPosAdapter(
+            bank
+        )
+        adapter.sensors[f"{prefix}_fingertip_contact"] = FingertipContactAdapter(bank)
+        adapter.sensors[f"{prefix}_fingertip_penetration"] = (
+            FingertipPenetrationAdapter(bank, side=hand.side)
+        )
+        banks[hand.side] = bank
+
+    def bind(_slot_fn, command_fn):
+        for bank in banks.values():
+            bank.command_fn = command_fn
+
+    adapter._bind_sensor_callbacks = bind
+    # TODO(Isaac gate): verify the imported passive mimic constraints, exact
+    # collision shapes/filter pairs/materials/inertials and named link paths.
+    # MJCF solver contact-pair semantics are not presumed equal to PhysX.
+    return adapter, sim, robot

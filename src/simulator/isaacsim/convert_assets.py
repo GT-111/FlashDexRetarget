@@ -51,6 +51,10 @@ def parse_args() -> argparse.Namespace:
                         help="convert xhand_<variant><suffix>.urdf into converted<suffix>/ "
                              "(e.g. _spec)")
     parser.add_argument(
+        "--native-scene-config",
+        help="selected native_scene yaml: split its MJCF into named FREE articulations and statics",
+    )
+    parser.add_argument(
         "--collision-visual", action="store_true",
         help="write the debug variant whose visual meshes ARE the collision geometry "
         f"(objects -> {COLVIS_OBJ_DIRNAME}/, robot -> converted_colvis/); "
@@ -73,6 +77,139 @@ def _up_to_date(usd_path: str, sources: list[str]) -> bool:
         return False
     usd_mtime = os.path.getmtime(usd_path)
     return all(os.path.getmtime(s) <= usd_mtime for s in sources if os.path.exists(s))
+
+
+def write_native_mjcf_assets(layout) -> dict[str, str]:
+    """Write importer inputs from ONE authoritative composed scene.
+
+    Explicit compiled inertials prevent importer density estimates from changing
+    bodies whose original inertial was derived from multiple collision geoms.
+    Source mesh coordinates, body transforms and passive equalities are retained.
+    This function compiles metadata only; it does not create MjData or step.
+    """
+    from pathlib import Path
+
+    import mujoco
+
+    source = Path(layout.scene_xml_path).resolve()
+    spec = mujoco.MjSpec.from_file(str(source))
+    meshdir = source.parent / (spec.meshdir or "")
+    for mesh in spec.meshes:
+        if mesh.file and not Path(mesh.file).is_absolute():
+            mesh.file = str((meshdir / mesh.file).resolve())
+    spec.meshdir = ""
+    model = spec.compile()
+    actual_roots = {
+        model.body(int(model.jnt_bodyid[j])).name
+        for j in range(model.njnt)
+        if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE
+    }
+    if actual_roots != {binding.root_body_name for binding in layout.articulations}:
+        raise ValueError("configured native articulations must cover the source FREE roots")
+    original = ET.fromstring(spec.to_xml())
+    for body in original.findall(".//body"):
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body.get("name"))
+        if model.body_mass[bid] <= 0:
+            continue
+        inertial = body.find("inertial")
+        if inertial is None:
+            inertial = ET.SubElement(body, "inertial")
+        inertial.attrib.clear()
+        for key, value in (
+            ("pos", model.body_ipos[bid]),
+            ("quat", model.body_iquat[bid]),
+            ("diaginertia", model.body_inertia[bid]),
+        ):
+            inertial.set(key, " ".join(format(float(v), ".17g") for v in value))
+        inertial.set("mass", format(float(model.body_mass[bid]), ".17g"))
+    roots = {b.root_body_name for b in layout.articulations}
+    outputs = {}
+    selected = [
+        (b.entity_name, b.root_body_name, b.usd_path) for b in layout.articulations
+    ]
+    selected.append(("static", None, layout.static_usd_path))
+    for name, root_name, usd in selected:
+        document = copy.deepcopy(original)
+        world = document.find("worldbody")
+        for child in list(world):
+            keep = (
+                child.tag == "body" and child.get("name") == root_name
+                if root_name is not None
+                else child.get("name") not in roots
+            )
+            if not keep:
+                world.remove(child)
+        joints = {j.get("name") for j in world.iter("joint")}
+        # FREE motor channels are replaced by the configured root-wrench action,
+        # not imported as fake scalar position drives.
+        for section in ("actuator", "equality"):
+            element = document.find(section)
+            if element is not None:
+                for item in list(element):
+                    references = [
+                        item.get(k)
+                        for k in ("joint", "joint1", "joint2")
+                        if item.get(k)
+                    ]
+                    if not references or not all(j in joints for j in references):
+                        element.remove(item)
+        geoms = {g.get("name") for g in world.iter("geom")}
+        contact = document.find("contact")
+        if contact is not None:
+            for pair in list(contact):
+                if pair.get("geom1") not in geoms or pair.get("geom2") not in geoms:
+                    contact.remove(pair)
+        meshes = {g.get("mesh") for g in world.iter("geom") if g.get("mesh")}
+        asset = document.find("asset")
+        if asset is not None:
+            for mesh in list(asset.findall("mesh")):
+                if mesh.get("name") not in meshes:
+                    asset.remove(mesh)
+        for section in ("sensor", "keyframe"):
+            element = document.find(section)
+            if element is not None:
+                document.remove(element)
+        output = Path(usd).with_suffix(".xml")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        ET.ElementTree(document).write(output, encoding="utf-8", xml_declaration=True)
+        outputs[name] = str(output)
+    return outputs
+
+
+def convert_native_scene(config_path: str) -> None:
+    """Use the pinned Isaac Lab MJCF converter, never the rigid density path."""
+    from pathlib import Path
+
+    from isaaclab.sim.converters import MjcfConverter, MjcfConverterCfg
+    from omegaconf import OmegaConf
+
+    from envs.scene.native import NativeSceneCfg
+
+    config = OmegaConf.load(config_path)
+    mapping = config.robot.native_scene if "robot" in config else config
+    layout = NativeSceneCfg.from_mapping(mapping)
+    inputs = write_native_mjcf_assets(layout)
+    selected = [(b.entity_name, b.usd_path, False) for b in layout.articulations]
+    selected.append(("static", layout.static_usd_path, True))
+    for name, usd, fixed in selected:
+        destination = Path(usd)
+        MjcfConverter(
+            MjcfConverterCfg(
+                asset_path=inputs[name],
+                usd_dir=str(destination.parent),
+                usd_file_name=destination.name,
+                force_usd_conversion=True,
+                make_instanceable=False,
+                fix_base=fixed,
+                import_inertia_tensor=True,
+                import_sites=True,
+                link_density=0.0,
+            )
+        )
+        _log(f"converted configured native asset {name}: {destination}")
+    # TODO(Isaac gate): assert actual USD mimic gearing, inertials, collision
+    # shape/filter/material parity. Successful conversion alone is not that
+    # qualification; MJCF explicit contact pairs do not transfer by assumption.
 
 
 def object_mass_properties(obj_dir: str):
@@ -325,6 +462,8 @@ def main() -> None:
     if args.robot:
         convert_robot(force=args.force, collision_visual=args.collision_visual,
                       variant=args.robot_variant, suffix=args.robot_suffix, robot=args.robot_name)
+    if args.native_scene_config:
+        convert_native_scene(args.native_scene_config)
 
     _log("all conversions done")
     sys.stdout.flush()

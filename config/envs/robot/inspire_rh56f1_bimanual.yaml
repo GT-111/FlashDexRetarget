@@ -1,0 +1,108 @@
+# @package _global_
+
+# New producer condition. Assets are selected by the operator; this file does
+# not copy/change the accepted 8e native meshes or the 5070 composed scene.
+robot:
+  entity_name: robot
+  self_collision: true
+  xml_path: ${robot.native_scene.scene_xml_path}
+  body_names:
+    fingers: [thumb, index, middle, ring, pinky]
+  joint_names:
+    wrist_trans: []
+    wrist_rot: []
+    finger:
+      - left_ctrl_thumb_1_joint
+      - left_ctrl_thumb_2_joint
+      - left_ctrl_index_1_joint
+      - left_ctrl_middle_1_joint
+      - left_ctrl_ring_1_joint
+      - left_ctrl_little_1_joint
+      - right_ctrl_thumb_1_joint
+      - right_ctrl_thumb_2_joint
+      - right_ctrl_index_1_joint
+      - right_ctrl_middle_1_joint
+      - right_ctrl_ring_1_joint
+      - right_ctrl_little_1_joint
+  site_names:
+    tip:
+      left: [left_thumb_tip, left_index_tip, left_middle_tip, left_ring_tip, left_little_tip]
+      right: [right_thumb_tip, right_index_tip, right_middle_tip, right_ring_tip, right_little_tip]
+    contact: ${robot.site_names.tip}
+  contact_links:
+    left: [left_wrist, left_thumb_1, left_thumb_2, left_thumb_3, left_thumb_4,
+           left_index_1, left_index_2, left_middle_1, left_middle_2,
+           left_ring_1, left_ring_2, left_little_1, left_little_2]
+    right: [right_wrist, right_thumb_1, right_thumb_2, right_thumb_3, right_thumb_4,
+            right_index_1, right_index_2, right_middle_1, right_middle_2,
+            right_ring_1, right_ring_2, right_little_1, right_little_2]
+  # Only the asset's declared source correspondences. Missing anatomical roles
+  # are not filled by choosing another physical link. Flash calls little pinky.
+  body_mapping:
+    all:
+      - [thumb_4, thumb_distal]
+      - [index_1, index_proximal]
+      - [index_2, index_intermediate]
+      - [middle_2, middle_intermediate]
+      - [ring_2, ring_intermediate]
+      - [little_1, pinky_proximal]
+      - [little_2, pinky_intermediate]
+    level1: {}
+    level2: {}
+
+  native_scene:
+    scene_xml_path: ${oc.env:FDR_NATIVE_SCENE_XML}
+    static_usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/static.usd
+    hands:
+      - side: left
+        entity_name: hand_left
+        root_body_name: left_wrist
+        root_joint_name: left_tracking_wrist_free
+        usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/hand_left.usd
+        command_actuator_names:
+          - left_ctrl_thumb_1_joint
+          - left_ctrl_thumb_2_joint
+          - left_ctrl_index_1_joint
+          - left_ctrl_middle_1_joint
+          - left_ctrl_ring_1_joint
+          - left_ctrl_little_1_joint
+        root_control:
+          position_stiffness: 400.0
+          position_damping: 40.0
+          rotation_stiffness: 400.0
+          rotation_damping: 40.0
+          force_limit_n: null
+          torque_limit_nm: null
+          gravity_compensation: 1.0
+          gravity_world_m_per_s2: [0.0, 0.0, -9.81]
+      - side: right
+        entity_name: hand_right
+        root_body_name: right_wrist
+        root_joint_name: right_tracking_wrist_free
+        usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/hand_right.usd
+        command_actuator_names:
+          - right_ctrl_thumb_1_joint
+          - right_ctrl_thumb_2_joint
+          - right_ctrl_index_1_joint
+          - right_ctrl_middle_1_joint
+          - right_ctrl_ring_1_joint
+          - right_ctrl_little_1_joint
+        root_control: ${robot.native_scene.hands.0.root_control}
+    object:
+      entity_name: articulated_object
+      root_body_name: object_0
+      root_joint_name: object_0_free
+      usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/articulated_object.usd
+      parts:
+        - name: base
+          body_name: object_0
+          mesh_path: ${oc.env:FDR_NATIVE_BOX_BASE_MESH}
+          body_from_mesh_position_m: [0.0, 0.0, 0.0]
+          body_from_mesh_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+          distance_sign: unsigned
+        - name: lid
+          body_name: object_0_articulated
+          mesh_path: ${oc.env:FDR_NATIVE_BOX_LID_MESH}
+          body_from_mesh_position_m: [0.0, 0.0, 0.0]
+          body_from_mesh_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+          distance_sign: unsigned

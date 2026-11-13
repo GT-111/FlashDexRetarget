@@ -6,7 +6,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-
 from mjlab.rl import RslRlVecEnvWrapper
 
 from envs import (  # builders only; mujoco-specific side effects are gated
@@ -19,6 +18,7 @@ from envs import (  # builders only; mujoco-specific side effects are gated
     build_terminations,
 )
 from envs.scene._object_setup import object_pool_dir
+from envs.scene.native import NativeSceneCfg
 
 from .convert_assets import COLVIS_OBJ_DIRNAME, colvis_enabled
 from .env import IsaacEnvCfg, IsaacManagerBasedRlEnv
@@ -246,7 +246,9 @@ def _make_manager_cfgs(cfg) -> dict:
     command_name = cfg.commands.name
     # Route the command through the Isaac subclass (sensor-wiring delta only).
     cfg.commands._target_ = (
-        "simulator.isaacsim.commands_isaac.IsaacMotionTrackingCommandCfg"
+        "simulator.isaacsim.commands_isaac.IsaacNativeMotionTrackingCommandCfg"
+        if cfg.robot.get("native_scene") is not None
+        else "simulator.isaacsim.commands_isaac.IsaacMotionTrackingCommandCfg"
     )
     return dict(
         observations=build_observations(
@@ -270,18 +272,33 @@ def _make_manager_cfgs(cfg) -> dict:
 def create_envs_isaac(cfg, device: str = "cuda"):
     """Build the Isaac train env (+ shared-eval facade), wrapper-compatible
     with the mujoco ``create_envs`` return signature."""
+    import os
+
     from isaaclab.sim import PhysxCfg, SimulationCfg, SimulationContext
 
     from .scene import build_isaac_scene
 
-    import os
+    native = cfg.robot.get("native_scene")
+    if native is None:
+        per_env_mode = os.environ.get("FDR_SLOTS", "0") != "1"
+        object_slots, assigned = _discover_object_slots(cfg, per_env_mode)
+        per_env_mode = per_env_mode and assigned is not None
+        xml_path = _SIM_DIR / str(cfg.robot.xml_path)
+    else:
+        from omegaconf import open_dict
 
-    per_env_mode = os.environ.get("FDR_SLOTS", "0") != "1"
-    object_slots, assigned = _discover_object_slots(cfg, per_env_mode)
-    # Singular (per-pair) pts have no slot table — legacy replicated scene.
-    per_env_mode = per_env_mode and assigned is not None
-
-    xml_path = _SIM_DIR / str(cfg.robot.xml_path)
+        layout = NativeSceneCfg.from_mapping(native)
+        per_env_mode, object_slots, assigned = False, [], None
+        xml_path = Path(layout.scene_xml_path)
+        with open_dict(cfg.commands):
+            cfg.commands.native_scene = native
+            cfg.commands.object.entity_names = {
+                h.side: layout.object.entity_name for h in layout.hands
+            }
+        if cfg.commands.object.pin_objects:
+            raise ValueError("native articulated object task requires pin_objects=false")
+        if cfg.commands.object.support_disks.enable:
+            raise ValueError("native scene uses its authored static support")
     meta = load_robot_mjcf_meta(xml_path)
 
     px = cfg.sim.physx
@@ -293,6 +310,7 @@ def create_envs_isaac(cfg, device: str = "cuda"):
 
     sim_ctx = SimulationContext(
         SimulationCfg(
+            **({"gravity": tuple(meta.gravity)} if native is not None else {}),
             dt=timestep,
             render_interval=decimation,
             device=device,

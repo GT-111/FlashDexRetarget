@@ -424,3 +424,87 @@ class TrackingPerformance:
             flag = "  <- paper strict" if k == 1.0 else ""
             print(f"  SR @ k={k:.1f}: {m[f'success_rate_{k:.1f}'] * 100:6.2f}%{flag}")
         print(f"  action_rate_l2: {m['action_rate_l2']:.4f}")
+
+
+class NativeArticulatedTrackingPerformance:
+    """Supported registered-root/part/hinge errors, with bounded accumulators.
+
+    No rigid-side alias or mean-centred SPIDER score can certify an articulated
+    task. This callback reports the actual fields and their support separately;
+    it deliberately supplies no success selector or paired-contact claim.
+    """
+
+    def __init__(self, command_name: str, grace_steps: int = 0):
+        self.command_name = command_name
+        self.grace_steps = grace_steps
+
+    def on_start(self, env):
+        self.cmd = env.command_manager.get_term(self.command_name)
+        command = self.cmd
+        self.valid_steps = command.motion_num_frames - command.motion_steps
+        self.rollout_steps = int(self.valid_steps.max())
+        self.t = 0
+        self.groups = {
+            "root_position_error_m": (tuple(command._side_list), "root_pose_support"),
+            "root_rotation_error_rad": (tuple(command._side_list), "root_pose_support"),
+            "part_position_error_m": (
+                tuple(p.name for p in command.native_layout.object.parts),
+                "part_pose_support",
+            ),
+            "part_rotation_error_rad": (
+                tuple(p.name for p in command.native_layout.object.parts),
+                "part_pose_support",
+            ),
+            "joint_position_error_rad": (
+                tuple(command.native_object.joint_names),
+                "joint_position_support",
+            ),
+        }
+        self.sums, self.maxima, self.masses = {}, {}, {}
+        for key, (names, _) in self.groups.items():
+            shape = (env.num_envs, len(names))
+            self.sums[key] = torch.zeros(shape, device=env.device)
+            self.maxima[key] = torch.zeros(shape, device=env.device)
+            self.masses[key] = torch.zeros(shape, device=env.device, dtype=torch.int64)
+
+    def on_step(self, env):
+        del env
+        active = (self.t < self.valid_steps) & (self.t >= self.grace_steps)
+        self.t += 1
+        facts = self.cmd.native_step_metrics
+        for key, (_, support_key) in self.groups.items():
+            mask = facts[support_key] & active[:, None]
+            value = torch.where(mask, facts[key], 0.0)
+            self.sums[key] += value
+            self.maxima[key] = torch.maximum(self.maxima[key], value)
+            self.masses[key] += mask
+
+    def collect_state(self, active_mask=None):
+        rows = slice(None) if active_mask is None else active_mask
+        return {
+            group: {k: v[rows].clone() for k, v in fields.items()}
+            for group, fields in (
+                ("sums", self.sums),
+                ("maxima", self.maxima),
+                ("masses", self.masses),
+            )
+        }
+
+    def reduce_state(self, states):
+        output = {}
+        for key, (names, _) in self.groups.items():
+            sums = torch.cat([s["sums"][key] for s in states]).sum(0)
+            mass = torch.cat([s["masses"][key] for s in states]).sum(0)
+            maxima = torch.cat([s["maxima"][key] for s in states]).amax(0)
+            for i, name in enumerate(names):
+                prefix = f"native/{key}/{name}"
+                count = int(mass[i])
+                output[f"{prefix}/supported_rows"] = count
+                output[f"{prefix}/mean"] = (
+                    float(sums[i] / mass[i]) if count else float("nan")
+                )
+                output[f"{prefix}/max"] = float(maxima[i]) if count else float("nan")
+        return output
+
+    def get_metrics(self):
+        return self.reduce_state([self.collect_state()])

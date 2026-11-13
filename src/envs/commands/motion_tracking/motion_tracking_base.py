@@ -10,6 +10,7 @@ from mjlab.managers import CommandTerm
 
 from .monitor.debug_vis import DebugVisMixin
 from .monitor.metrics import MetricsMixin
+from .motion_tracking_cfg import MotionTrackingCommandCfg
 from .objects.assist import ObjectAssistMixin
 from .objects.multi_object import MultiObjectMixin
 from .reference.hand import HandPropertiesMixin
@@ -18,7 +19,6 @@ from .reference.object import ObjectPropertiesMixin
 from .reset.sampling import SamplingMixin
 from .reset.static_offset import StaticOffsetMixin
 from .reset.support_disks import SupportDisksMixin
-from .motion_tracking_cfg import MotionTrackingCommandCfg
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
@@ -88,11 +88,11 @@ class MotionTrackingCommandBase(
         for side in self.motion_lib.hand_sides:
             self._level1_body_ids[side] = [
                 self.robot.body_names.index(f"{side}_{level1_mapping[f][0]}")
-                for f in self.finger_names
+                for f in self.finger_names if f in level1_mapping
             ]
             self._level2_body_ids[side] = [
                 self.robot.body_names.index(f"{side}_{level2_mapping[f][0]}")
-                for f in self.finger_names
+                for f in self.finger_names if f in level2_mapping
             ]
             self._all_body_ids[side] = [
                 self.robot.body_names.index(f"{side}_{rb}") for rb, _ in all_body_mano
@@ -121,9 +121,11 @@ class MotionTrackingCommandBase(
             joint_names = self.motion_lib.mano_joint_names[side]
             self._level1_mano_ids[side] = [
                 joint_names.index(level1_mapping[f][1]) for f in self.finger_names
+                if f in level1_mapping
             ]
             self._level2_mano_ids[side] = [
                 joint_names.index(level2_mapping[f][1]) for f in self.finger_names
+                if f in level2_mapping
             ]
             self._all_mano_ids[side] = [
                 joint_names.index(mj) for _, mj in all_body_mano
@@ -169,6 +171,12 @@ class MotionTrackingCommandBase(
     def future_ref_joint_vel(self, offsets: torch.Tensor) -> torch.Tensor:
         return self.motion_lib.robot_joint_vel[self._future_motion_flat_ids(offsets)]
 
+    def _reference_free_root_states(self) -> dict:
+        return {}
+
+    def _reference_root_body_names(self) -> dict[str, str]:
+        return {}
+
     def _compute_robot_ref_state(self) -> None:
         import mujoco
 
@@ -195,9 +203,10 @@ class MotionTrackingCommandBase(
             side: [site_by_name[n] for n in self.cfg.site_names["tip"][side]]
             for side in self._side_list
         }
+        root_bodies = self._reference_root_body_names()
         palm_ids = {
             side: site_by_name[self.cfg.site_names["palm"][side]]
-            for side in self._side_list
+            for side in self._side_list if side not in root_bodies
         }
 
         # xpos (body frame) to match the sim robot_level_trans_w targets.
@@ -210,6 +219,7 @@ class MotionTrackingCommandBase(
         lvl1_body_ids = {
             side: [
                 body_by_name[f"{side}_{level1_map[f][0]}"] for f in self.finger_names
+                if f in level1_map
             ]
             for side in self._side_list
         }
@@ -236,7 +246,7 @@ class MotionTrackingCommandBase(
         rest = data.qpos.copy()
         rest_v = data.qvel.copy()
         tips = np.zeros((T, n_sides, n_fing, 3), dtype=np.float32)
-        lvl1 = np.zeros((T, n_sides, n_fing, 3), dtype=np.float32)
+        lvl1 = np.zeros((T, n_sides, len(level1_map), 3), dtype=np.float32)
         allp = np.zeros((T, n_sides, n_all, 3), dtype=np.float32)
         allv = np.zeros((T, n_sides, n_all, 3), dtype=np.float32)
         tipv = np.zeros((T, n_sides, n_fing, 3), dtype=np.float32)
@@ -246,20 +256,37 @@ class MotionTrackingCommandBase(
         vel6 = np.zeros(6, dtype=np.float64)  # mj_objectVelocity [ang(3), lin(3)]
         BODY = mujoco.mjtObj.mjOBJ_XBODY  # body frame (not COM) world velocity
         SITE = mujoco.mjtObj.mjOBJ_SITE
+        free_roots = []
+        for name, states in self._reference_free_root_states().items():
+            joint = model.joint(name)
+            if joint.type != mujoco.mjtJoint.mjJNT_FREE:
+                raise ValueError(f"native root {name!r} is not FREE")
+            free_roots.append((int(joint.qposadr[0]), int(joint.dofadr[0]), states))
         for t in range(T):
             data.qpos[:] = rest
             data.qvel[:] = rest_v
             data.qpos[col_qadr] = qpos[t]
             data.qvel[col_dadr] = qvel[t]
+            for qa, va, states in free_roots:
+                state = states[t]
+                data.qpos[qa:qa + 7] = state[:7]
+                data.qvel[va:va + 3] = state[7:10]
+                conjugate = state[3:7].copy()
+                conjugate[1:] *= -1
+                mujoco.mju_rotVecQuat(data.qvel[va + 3:va + 6], state[10:13], conjugate)
             mujoco.mj_fwdPosition(model, data)
             mujoco.mj_fwdVelocity(model, data)
             for si, side in enumerate(self._side_list):
                 tips[t, si] = data.site_xpos[tip_ids[side]]
                 lvl1[t, si] = data.xpos[lvl1_body_ids[side]]
                 allp[t, si] = data.xpos[all_body_ids[side]]
-                wpos[t, si] = data.site_xpos[palm_ids[side]]
-                mujoco.mju_mat2Quat(q, data.site_xmat[palm_ids[side]])
-                wquat[t, si] = q
+                if side in root_bodies:
+                    bid = body_by_name[root_bodies[side]]
+                    wpos[t, si], wquat[t, si] = data.xpos[bid], data.xquat[bid]
+                else:
+                    wpos[t, si] = data.site_xpos[palm_ids[side]]
+                    mujoco.mju_mat2Quat(q, data.site_xmat[palm_ids[side]])
+                    wquat[t, si] = q
                 for k, bid in enumerate(all_body_ids[side]):
                     mujoco.mj_objectVelocity(model, data, BODY, bid, vel6, 0)
                     allv[t, si, k] = vel6[3:6]

@@ -57,6 +57,27 @@ installed-command authority. The original `RolloutRecord` remains available.
 Success archives retain their first-success selection meaning; they are not a
 frozen final-policy evaluation or a qualification of a different physics backend.
 
+The native Isaac interface uses `NativeSceneCfg` to select actual floating hand
+articulations and one object articulation from an authored MJCF. Each hand keeps
+its FREE root and declared independent actuators; an articulated object keeps
+its passive joints. `convert_assets.py --native-scene-config <resolved.yaml>`
+splits those named assets for conversion. Select
+`envs.actions.native.NativeResidualActionCfg` for world-frame wrist residuals
+and absolute or reference-relative fingers. Action dimensions and side ownership
+come from the named bindings. The root PD law recomputes mass, inertia and the
+root-link wrench at every physical substep, without applying object assistance.
+
+The example F1 action recipe has translation/rotation component scales of
+0.1 m/1 rad, raw clipping at +/-1 and configured wrist filtering. It is a separate
+producer condition from DexForge's main-tracker wrist recipe. Preserve the
+resolved action configuration alongside exported installed targets and root-law
+metadata. Four CPU contract cases cover mechanics, scene splitting, actual
+action/reward callers and root wrench computation; imported USD, PhysX dynamics
+and a complete native task still need qualification. Robot/actions overrides
+alone do not replace the stock scalar-wrist BC reward or rigid-object SDF
+observations: the native reference carrier and task profile must use the named
+root and part APIs.
+
 ## Setup
 
 ```sh

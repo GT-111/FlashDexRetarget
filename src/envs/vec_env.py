@@ -131,18 +131,15 @@ class FlatObsVecEnv(VectorEnv):
         self._action_sides = self._action_side_indices(sides)
 
     def _action_side_indices(self, sides: list[str]) -> dict[str, list[int]]:
-        """Action-vector indices per side (joint-name prefix R_/right_ vs L_/left_); the action
-        term groups dims by type ([wrist_trans R,L | wrist_rot R,L | fingers R,L]), not by side."""
+        """Use the action term's ownership; coordinates are grouped by type, not side."""
         from envs._common import action_term
 
         act_term = action_term(self._env)
-        names = act_term._entity.joint_names
-        joint_ids = [int(j) for j in act_term._all_joint_ids.tolist()]
-        prefixes = {"right": ("R_", "right_"), "left": ("L_", "left_")}
-        out = {s_: [i for i, j in enumerate(joint_ids) if names[j].startswith(prefixes[s_])] for s_ in sides}
+        names = act_term.action_names
+        out = {s_: [i for i, owner in enumerate(act_term.action_sides) if owner == s_] for s_ in sides}
         covered = sorted(i for v in out.values() for i in v)
-        if covered != list(range(len(joint_ids))):
-            raise ValueError(f"action dims not partitioned by side: {out} over {len(joint_ids)} dims")
+        if covered != list(range(act_term.action_dim)):
+            raise ValueError(f"action dims not partitioned by side: {out} over {names}")
         print("[reward_heads] action sides: " + ", ".join(f"{k}={v}" for k, v in out.items()), flush=True)
         return out
 

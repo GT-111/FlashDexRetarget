@@ -7,7 +7,14 @@ import inspect
 from typing import TYPE_CHECKING
 
 import torch
-from mjlab.utils.lab_api.math import quat_apply, quat_mul
+from mjlab.utils.lab_api.math import (
+    matrix_from_quat,
+    quat_apply,
+    quat_box_minus,
+    quat_mul,
+)
+
+from envs.scene.native import NativeRootControlCfg
 
 from .mjcf_meta import RobotMjcfMeta, site_table
 
@@ -85,8 +92,11 @@ class ArticulationData:
     @property
     def qfrc_actuator(self) -> torch.Tensor:
         # applied joint efforts (implicit PD), entity joint order
-        tau = self._a._art.data.applied_torque
-        return tau[:, self._a._isaac_joint_ids]
+        return self._a._joint_effort()
+
+    @property
+    def default_root_state(self) -> torch.Tensor:
+        return self._a._default_root_state
 
     # bodies (entity == MJCF order, world excluded)
     @property
@@ -179,6 +189,10 @@ class ArticulationAdapter:
         self._isaac_body_ids = torch.tensor(ids, dtype=torch.long, device=device)
         jids, _ = articulation.find_joints(self.joint_names, preserve_order=True)
         self._isaac_joint_ids = torch.tensor(jids, dtype=torch.long, device=device)
+        self._driven_joint_ids = torch.tensor(
+            [self.joint_names.index(n) for n in meta.driven_joint_names],
+            dtype=torch.long, device=device,
+        )
         # inverse permutation: isaac joint slot -> entity column
         inv = torch.empty_like(self._isaac_joint_ids)
         inv[torch.argsort(self._isaac_joint_ids)] = torch.arange(
@@ -261,6 +275,9 @@ class ArticulationAdapter:
 
         return self._cache.get("joint_vel", fetch)
 
+    def _joint_effort(self) -> torch.Tensor:
+        return self._art.data.applied_torque[:, self._isaac_joint_ids]
+
     def _body_pose(self):
         def fetch_pair():
             tf = self._art.root_physx_view.get_link_transforms()
@@ -338,9 +355,11 @@ class ArticulationAdapter:
             self._joint_pos_target[:] = position
         else:
             self._joint_pos_target[env_ids] = position
-        self._art.set_joint_position_target(
-            position.to(self.device), joint_ids=ids.tolist(), env_ids=env_ids
-        )
+        if self._driven_joint_ids.numel():
+            self._art.set_joint_position_target(
+                position[:, self._driven_joint_ids].to(self.device),
+                joint_ids=ids[self._driven_joint_ids].tolist(), env_ids=env_ids,
+            )
         self._clock.bump()
 
     def set_joint_position_target(
@@ -352,6 +371,8 @@ class ArticulationAdapter:
             ent_ids = joint_ids
         else:
             ent_ids = torch.tensor(joint_ids, dtype=torch.long, device=self.device)
+        if any(self.joint_names[int(i)] not in self._meta.driven_joint_names for i in ent_ids):
+            raise ValueError("passive native joints cannot receive position targets")
         self._joint_pos_target[:, ent_ids] = target
         isaac_ids = self._isaac_joint_ids[ent_ids]
         self._art.set_joint_position_target(target, joint_ids=isaac_ids.tolist())
@@ -375,6 +396,218 @@ class ArticulationAdapter:
         # Always the full buffer: Isaac Lab derives has_external_wrench from the written slice only.
         f = self._gravcomp_full * self._gravcomp_scale
         self._art.set_external_force_and_torque(f, torch.zeros_like(f), is_global=True)
+
+
+class FreeArticulationAdapter(ArticulationAdapter):
+    """One actual floating articulation; scalar joints remain named DOFs.
+
+    The root is reset through Isaac Lab's public link-state API. During a
+    rollout it is driven by an external wrench, never by pose teleportation.
+    """
+
+    is_fixed_base = False
+
+    def __init__(self, articulation, meta, clock, device, *, root_body_name):
+        super().__init__(articulation, meta, clock, device)
+        if articulation.is_fixed_base:
+            raise ValueError(f"native articulation {root_body_name!r} has a fixed base")
+        if meta.body_names[0] != root_body_name:
+            raise ValueError("native root must be the named articulation root body")
+        if len(meta.free_roots) != 1 or meta.free_roots[0].body_name != root_body_name:
+            raise ValueError("native articulation must contain its declared FREE root")
+        self.root_body_name = root_body_name
+        b = articulation.num_instances
+        self._default_root_state = torch.zeros(b, 13, device=device)
+        self._default_root_state[:, :7] = torch.as_tensor(
+            meta.free_roots[0].default_pose, dtype=torch.float32, device=device
+        )
+        self._default_joint_pos[:] = torch.as_tensor(
+            meta.joint_default, dtype=torch.float32, device=device
+        )
+        self._mass = torch.as_tensor(meta.body_mass, dtype=torch.float32, device=device)
+        self._inertia = torch.as_tensor(
+            meta.body_inertia, dtype=torch.float32, device=device
+        )
+        self._inertia_quat = torch.as_tensor(
+            meta.body_iquat, dtype=torch.float32, device=device
+        )
+        self._ipos = torch.as_tensor(meta.body_ipos, dtype=torch.float32, device=device)
+
+    def write_root_state_to_sim(self, root_state, env_ids=None) -> None:
+        self._art.write_root_link_state_to_sim(root_state, env_ids=env_ids)
+        self._clock.bump()
+
+    def apply_root_pose_target(
+        self,
+        target_state_w: torch.Tensor,
+        support: torch.Tensor,
+        control: NativeRootControlCfg,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recompute WORLD PD at every physics substep, about the subtree COM."""
+        pos, quat = self._body_pose()
+        lin, omega = self._body_vel()
+        current = torch.cat([pos[:, 0], quat[:, 0], lin[:, 0], omega[:, 0]], -1)
+        target = torch.where(support[:, None], target_state_w, current)
+        acceleration = control.position_stiffness * (
+            target[:, :3] - current[:, :3]
+        ) + control.position_damping * (target[:, 7:10] - current[:, 7:10])
+        angular_acceleration = control.rotation_stiffness * quat_box_minus(
+            target[:, 3:7], current[:, 3:7]
+        ) + control.rotation_damping * (target[:, 10:13] - current[:, 10:13])
+        body_com = pos + quat_apply(quat, self._ipos.expand_as(pos))
+        total_mass = self._mass.sum()
+        center = (body_com * self._mass[None, :, None]).sum(1) / total_mass
+        r = body_com - center[:, None]
+        rotation = matrix_from_quat(quat_mul(quat, self._inertia_quat.expand_as(quat)))
+        inertia = (
+            rotation @ torch.diag_embed(self._inertia) @ rotation.transpose(-1, -2)
+        )
+        eye = torch.eye(3, device=self.device, dtype=pos.dtype)
+        parallel = (
+            r.square().sum(-1)[..., None, None] * eye
+            - r[..., :, None] * r[..., None, :]
+        )
+        inertia = (inertia + self._mass[None, :, None, None] * parallel).sum(1)
+        force = torch.where(support[:, None], total_mass * acceleration, 0.0)
+        torque = torch.where(
+            support[:, None],
+            (inertia @ angular_acceleration[..., None]).squeeze(-1),
+            0.0,
+        )
+        gravity = (
+            -total_mass
+            * control.gravity_compensation
+            * force.new_tensor(control.gravity_world_m_per_s2)
+        )
+        force = _limit_vector(force + gravity, control.force_limit_n)
+        # PhysX applies the wrench at each link COM. Shift the root-link COM
+        # torque so translation does not create an unintended subtree moment.
+        torque = _limit_vector(
+            torque + torch.cross(center - body_com[:, 0], force, dim=-1),
+            control.torque_limit_nm,
+        )
+        forces = torch.zeros_like(pos)
+        torques = torch.zeros_like(pos)
+        forces[:, 0] = force
+        torques[:, 0] = torque
+        # TODO(Isaac gate): verify imported inertials/equalities and the public
+        # WORLD-at-link-COM wrench path against the selected source scene.
+        self._art.set_external_force_and_torque(
+            forces,
+            torques,
+            body_ids=self._isaac_body_ids.tolist(),
+            is_global=True,
+        )
+        return force, torque
+
+
+def _limit_vector(vector: torch.Tensor, limit: float | None) -> torch.Tensor:
+    if limit is None:
+        return vector
+    return vector * (
+        float(limit) / vector.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    ).clamp(max=1.0)
+
+
+class NativeRobotAdapter(ArticulationAdapter):
+    """The named robot view of independent FREE hand articulations.
+
+    Each child still owns its real articulation and root. Concatenation is only
+    the existing robot entity's named scalar/body/site view, not a welded robot.
+    """
+
+    is_fixed_base = False
+
+    def __init__(self, hands, *, scene_meta, clock, device):
+        from types import SimpleNamespace
+
+        import mujoco
+
+        self.hands: dict[str, FreeArticulationAdapter] = hands
+        self.device = device
+        self._meta = scene_meta
+        self._clock = clock
+        self._parts = tuple(hands.values())
+        self.joint_names = [n for a in self._parts for n in a.joint_names]
+        self.body_names = [n for a in self._parts for n in a.body_names]
+        self.site_names = [n for a in self._parts for n in a.site_names]
+        self.num_joints = len(self.joint_names)
+        self._joint_pos_target = torch.cat(
+            [a._joint_pos_target for a in self._parts], 1
+        )
+        self._soft_limits = torch.cat([a._soft_limits for a in self._parts], 1)
+        self._default_joint_pos = torch.cat(
+            [a._default_joint_pos for a in self._parts], 1
+        )
+        self._default_joint_vel = torch.cat(
+            [a._default_joint_vel for a in self._parts], 1
+        )
+        self._default_root_state = self._parts[0]._default_root_state
+        self.cfg = SimpleNamespace(
+            spec_fn=lambda: mujoco.MjSpec.from_file(scene_meta.xml_path)
+        )
+        self.data = ArticulationData(self)
+
+    def _joint_pos(self):
+        return torch.cat([a._joint_pos() for a in self._parts], 1)
+
+    def native_command_limits(self, actuator_names):
+        return self._meta.command_limits(tuple(actuator_names))
+
+    def _joint_vel(self):
+        return torch.cat([a._joint_vel() for a in self._parts], 1)
+
+    def _joint_effort(self):
+        return torch.cat([a._joint_effort() for a in self._parts], 1)
+
+    def _body_pose(self):
+        poses = [a._body_pose() for a in self._parts]
+        return tuple(torch.cat([p[i] for p in poses], 1) for i in range(2))
+
+    def _body_vel(self):
+        velocities = [a._body_vel() for a in self._parts]
+        return tuple(torch.cat([v[i] for v in velocities], 1) for i in range(2))
+
+    def _site_kin(self):
+        sites = [a._site_kin() for a in self._parts]
+        return tuple(torch.cat([s[i] for s in sites], 1) for i in range(4))
+
+    def write_joint_state_to_sim(
+        self, position, velocity, joint_ids=None, env_ids=None
+    ):
+        if joint_ids is not None:
+            raise ValueError(
+                "native robot reset requires the complete named scalar state"
+            )
+        start = 0
+        for part in self._parts:
+            stop = start + part.num_joints
+            part.write_joint_state_to_sim(
+                position[:, start:stop], velocity[:, start:stop], env_ids=env_ids
+            )
+            start = stop
+        rows = slice(None) if env_ids is None else env_ids
+        self._joint_pos_target[rows] = position
+
+    def set_joint_position_target(self, target, joint_ids=None):
+        ids = list(range(self.num_joints)) if joint_ids is None else list(joint_ids)
+        start = 0
+        for part in self._parts:
+            columns = [
+                i
+                for i, j in enumerate(ids)
+                if start <= int(j) < start + part.num_joints
+            ]
+            if columns:
+                local = [int(ids[i]) - start for i in columns]
+                part.set_joint_position_target(target[:, columns], joint_ids=local)
+            start += part.num_joints
+        self._joint_pos_target[:, ids] = target
+
+    def reset(self, env_ids=None):
+        for part in self._parts:
+            part.reset(env_ids)
+        self._clock.bump()
 
 
 # ─── Object (single free rigid body) ─────────────────────────────────────────
