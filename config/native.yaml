@@ -1,0 +1,17 @@
+# Explicit native producer task. The stock flashdexretarget config is unchanged.
+defaults:
+  - flashdexretarget
+  - override envs: native
+  - override eval: native
+  - _self_
+
+# The operator supplies the actual scene/source/command recording binding and
+# declares tracking tolerances. Passing them is not contact/task qualification.
+native_recording_binding: ???
+native_tracking_tolerances:
+  root_position_error_m: ???
+  root_rotation_error_rad: ???
+  part_position_error_m: ???
+  part_rotation_error_rad: ???
+  joint_position_error_rad: ???
+  command_position_error_rad: ???

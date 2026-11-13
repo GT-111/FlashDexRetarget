@@ -269,6 +269,23 @@ def _make_manager_cfgs(cfg) -> dict:
     )
 
 
+def _bind_native_scene_config(cfg) -> NativeSceneCfg:
+    """Bind the selected named scene to its existing command configuration."""
+    from omegaconf import open_dict
+
+    layout = NativeSceneCfg.from_mapping(cfg.robot.native_scene)
+    with open_dict(cfg.commands):
+        cfg.commands.native_scene = cfg.robot.native_scene
+        cfg.commands.object.entity_names = {
+            h.side: layout.object.entity_name for h in layout.hands
+        }
+    if cfg.commands.object.pin_objects:
+        raise ValueError("native object task requires pin_objects=false")
+    if cfg.commands.object.support_disks.enable:
+        raise ValueError("native scene uses its authored static support")
+    return layout
+
+
 def create_envs_isaac(cfg, device: str = "cuda"):
     """Build the Isaac train env (+ shared-eval facade), wrapper-compatible
     with the mujoco ``create_envs`` return signature."""
@@ -285,20 +302,9 @@ def create_envs_isaac(cfg, device: str = "cuda"):
         per_env_mode = per_env_mode and assigned is not None
         xml_path = _SIM_DIR / str(cfg.robot.xml_path)
     else:
-        from omegaconf import open_dict
-
-        layout = NativeSceneCfg.from_mapping(native)
+        layout = _bind_native_scene_config(cfg)
         per_env_mode, object_slots, assigned = False, [], None
         xml_path = Path(layout.scene_xml_path)
-        with open_dict(cfg.commands):
-            cfg.commands.native_scene = native
-            cfg.commands.object.entity_names = {
-                h.side: layout.object.entity_name for h in layout.hands
-            }
-        if cfg.commands.object.pin_objects:
-            raise ValueError("native articulated object task requires pin_objects=false")
-        if cfg.commands.object.support_disks.enable:
-            raise ValueError("native scene uses its authored static support")
     meta = load_robot_mjcf_meta(xml_path)
 
     px = cfg.sim.physx

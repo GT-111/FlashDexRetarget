@@ -155,11 +155,7 @@ class SharedEvalEnv:
         cmd.cfg.object.pin_objects = False
         # External wrenches persist in IsaacLab: clear any stale pin wrench so
         # eval rollouts are strictly assist-free.
-        for side in cmd._side_list:
-            for name in cmd.obj_entity_names(side):
-                obj = env.scene[name]
-                z = torch.zeros(env.num_envs, 1, 3, device=env.device)
-                obj.write_external_wrench_to_sim(forces=z, torques=z.clone())
+        cmd.clear_object_wrenches()
         self._in_eval = True
 
     def exit_eval(self) -> None:

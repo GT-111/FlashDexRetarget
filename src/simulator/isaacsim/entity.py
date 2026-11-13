@@ -437,6 +437,14 @@ class FreeArticulationAdapter(ArticulationAdapter):
         self._art.write_root_link_state_to_sim(root_state, env_ids=env_ids)
         self._clock.bump()
 
+    def clear_external_wrenches(self, env_ids=None):
+        count = self._art.num_instances if env_ids is None else len(env_ids)
+        zero = torch.zeros(count, len(self.body_names), 3, device=self.device)
+        self._art.set_external_force_and_torque(
+            zero, zero.clone(), body_ids=self._isaac_body_ids.tolist(),
+            env_ids=env_ids, is_global=True,
+        )
+
     def apply_root_pose_target(
         self,
         target_state_w: torch.Tensor,
@@ -664,6 +672,8 @@ class RigidObjectAdapter:
         clock: _FreshnessClock,
         device: str,
         default_root_state: torch.Tensor,
+        *,
+        body_name: str | None = None,
     ) -> None:
         self._obj = obj
         self._clock = clock
@@ -673,6 +683,9 @@ class RigidObjectAdapter:
             torch.tensor([global_body_id], dtype=torch.long, device=device)
         )
         self._default_root_state = default_root_state  # (B, 13)
+        if body_name is not None:
+            self.body_names = [body_name]
+            self.joint_names = ()  # A physical rigid object has no scalar joints.
         view = obj.root_physx_view
         com = view.get_coms().reshape(obj.num_instances, -1)[:, :3].to(device)
         self._com_local = com  # (B, 3)
@@ -755,3 +768,8 @@ class RigidObjectAdapter:
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         self._obj.reset(env_ids=env_ids)
+
+    def clear_external_wrenches(self, env_ids=None):
+        count = self._obj.num_instances if env_ids is None else len(env_ids)
+        zero = torch.zeros(count, 1, 3, device=self.device)
+        self.write_external_wrench_to_sim(zero, zero.clone(), env_ids=env_ids)

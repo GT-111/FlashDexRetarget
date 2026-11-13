@@ -135,6 +135,24 @@ class NativeResidualAction(ActionTerm):
             "effort_authority": "hand_roots_only_no_object_assistance",
             "main_tracker_numeric_parity": False,
         }
+        self._action_recipe = {
+            "action_names": self.action_names,
+            "action_sides": self.action_sides,
+            "scale": cfg.action_scale,
+            "offset": cfg.action_offset,
+            "processed_action_clip": None
+            if self._clip is None
+            else self._clip.cpu().tolist(),
+            "translation_residual_per_axis_m": cfg.translation_residual_m,
+            "rotation_residual_per_axis_rad": cfg.rotation_residual_rad,
+            "rotation_convention": "world_left_rotvec",
+            "finger_residual_rad": cfg.finger_residual_rad,
+            "finger_effective_limits_rad": limits.cpu().tolist(),
+            "cutoff_hz": dict(cfg.cutoff_hz),
+            "filter_alpha": self._alpha.cpu().tolist(),
+            "control_period_s": float(env.step_dt),
+            "condition": "external_physx_producer_not_main_tracker_numeric_parity",
+        }
         self.ref_joint_pos_used = None
 
     @property
@@ -144,6 +162,10 @@ class NativeResidualAction(ActionTerm):
     @property
     def raw_action(self) -> torch.Tensor:
         return self._raw_actions
+
+    @property
+    def finger_command_limits(self) -> torch.Tensor:
+        return torch.stack((self._lower, self._upper), -1)
 
     @property
     def installed_control(self) -> dict:
@@ -165,6 +187,7 @@ class NativeResidualAction(ActionTerm):
             "root_force_n": self._root_force,
             "root_torque_nm": self._root_torque,
             "root_control": self._root_control_metadata,
+            "action_recipe": self._action_recipe,
         }
 
     def process_actions(self, actions: torch.Tensor) -> None:

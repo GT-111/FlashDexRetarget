@@ -73,9 +73,7 @@ producer condition from DexForge's main-tracker wrist recipe. Preserve the
 resolved action configuration alongside exported installed targets and root-law
 metadata. Four CPU contract cases cover mechanics, scene splitting, actual
 action/reward callers and root wrench computation; imported USD, PhysX dynamics
-and a complete native task still need qualification. Robot/actions overrides
-alone do not replace the stock scalar-wrist BC reward or rigid-object SDF
-observations: the native task profile must use the named root and part APIs.
+and physical task execution still need qualification.
 
 A trusted prepared clip can carry an explicit `native_reference` mapping in its
 NPZ. The existing crop and `build_motion_pt` path retain its per-row native
@@ -88,6 +86,20 @@ Unknown rates have zero values and false support; cropping preserves the clock
 origin and complete source frame inventory. Three CPU cases qualify this
 pack/reader contract. Actual native reference generation and physical admission
 remain required.
+
+Select the existing trainer's native task with `--config_name native`. Supply
+`native_recording_binding` and all six `native_tracking_tolerances` explicitly;
+the latter select reference-tracking archives, independently of contact or task
+success. The profile uses named hand roots and object-part SDFs, independent
+finger-command BC, supported future references and native state terminations.
+It disables object pinning, perturbations and adaptive assistance. BOX keeps
+one free base and its passive hinge. For a real zero-joint rigid object, pass
+`--overrides 'envs/native_object@native_object=rigid'` and the declared scene
+bindings; no artificial hinge is added. Eight CPU cases cover normal Hydra
+composition, command clocks, part/joint ordering, action and support routing,
+reset, wrench cleanup, complete endpoint selection and finite-state admission.
+Offline reference generation, USD/PhysX import and physical response remain
+unqualified.
 
 ## Setup
 

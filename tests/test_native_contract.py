@@ -273,6 +273,14 @@ def test_actual_native_action_derives_dimensions_and_records_accepted_supported_
     np.testing.assert_array_equal(record["reference_motion_steps"], [4, 5])
     assert len(accepted) == 2 and record["installed_valid"].all()
     assert record["root_control"]["main_tracker_numeric_parity"] is False
+    recipe = record["action_recipe"]
+    assert recipe["translation_residual_per_axis_m"] == 0.1
+    assert recipe["rotation_residual_per_axis_rad"] == np.pi / 2
+    assert recipe["action_names"] == action.action_names
+    assert recipe["action_sides"] == action.action_sides
+    import json
+
+    json.dumps(recipe)  # A recorder can retain the actual accepted action recipe.
     action.reset(torch.tensor([0]))
     np.testing.assert_array_equal(record["installed_valid"], [False, True])
 

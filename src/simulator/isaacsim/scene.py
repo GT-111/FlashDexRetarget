@@ -839,6 +839,22 @@ def _native_articulation_cfg(binding, meta, cfg) -> ArticulationCfg:
     )
 
 
+def _native_rigid_object_cfg(binding, meta) -> RigidObjectCfg:
+    """The rigid family has one actual FREE body and no scalar articulation."""
+    if meta.body_names != [binding.root_body_name]:
+        raise ValueError("native rigid object requires its one declared physical body")
+    if not Path(binding.usd_path).is_file():
+        raise FileNotFoundError(binding.usd_path)
+    return RigidObjectCfg(
+        prim_path=f"/World/envs/env_.*/{binding.entity_name}",
+        spawn=sim_utils.UsdFileCfg(usd_path=binding.usd_path),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=tuple(meta.free_roots[0].default_pose[:3]),
+            rot=tuple(meta.free_roots[0].default_pose[3:]),
+        ),
+    )
+
+
 def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     """Compose named FREE hands and one passive articulated object.
 
@@ -858,7 +874,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     sim_utils.DomeLightCfg(intensity=2000.0).func(
         "/World/Light", sim_utils.DomeLightCfg(intensity=2000.0)
     )
-    assets, metadata = {}, {}
+    assets, metadata, rigid = {}, {}, set()
     for binding in layout.articulations:
         meta = scene_meta.subtree(binding.root_body_name)
         if (
@@ -869,9 +885,13 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         metadata[binding.entity_name] = meta
         if binding == layout.object and meta.actuator_names:
             raise ValueError("native object articulation must remain passive")
-        assets[binding.entity_name] = Articulation(
-            _native_articulation_cfg(binding, meta, cfg)
-        )
+        if binding == layout.object and not meta.joint_names:
+            assets[binding.entity_name] = RigidObject(_native_rigid_object_cfg(binding, meta))
+            rigid.add(binding.entity_name)
+        else:
+            assets[binding.entity_name] = Articulation(
+                _native_articulation_cfg(binding, meta, cfg)
+            )
     contacts = {}
     for hand in layout.hands:
         for body in cfg.robot.contact_links[hand.side]:
@@ -885,7 +905,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     scene.clone_environments(copy_from_source=False)
     scene.filter_collisions(global_prim_paths=[])
     for name, asset in assets.items():
-        scene.articulations[name] = asset
+        (scene.rigid_objects if name in rigid else scene.articulations)[name] = asset
     for name, sensor in contacts.items():
         scene.sensors[f"_native_contact_{name}"] = sensor
     sim_ctx.reset()
@@ -901,6 +921,20 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     for binding in layout.articulations:
         meta = metadata[binding.entity_name]
         asset = assets[binding.entity_name]
+        ids = [
+            sim.model.register_body(m, inertia, q)
+            for m, inertia, q in zip(
+                meta.body_mass, meta.body_inertia, meta.body_iquat, strict=True
+            )
+        ]
+        if binding.entity_name in rigid:
+            default = torch.zeros(asset.num_instances, 13, device=device)
+            default[:, :7] = torch.as_tensor(meta.free_roots[0].default_pose, device=device)
+            ent = RigidObjectAdapter(
+                asset, ids[0], clock, device, default, body_name=binding.root_body_name,
+            )
+            adapter.entities[binding.entity_name] = ent
+            continue
         ent = FreeArticulationAdapter(
             asset,
             meta,
@@ -924,12 +958,6 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         asset.write_joint_friction_coefficient_to_sim(
             torch.as_tensor(meta.joint_frictionloss, device=device), **scalar
         )
-        ids = [
-            sim.model.register_body(m, inertia, q)
-            for m, inertia, q in zip(
-                meta.body_mass, meta.body_inertia, meta.body_iquat, strict=True
-            )
-        ]
         ent.indexing = _ObjIndexing(torch.tensor(ids, dtype=torch.long, device=device))
         ent.data.indexing = ent.indexing
         adapter.entities[binding.entity_name] = ent

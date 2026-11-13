@@ -1,0 +1,13 @@
+# @package robot.native_scene.object
+
+# Select an actual composed rigid-object scene and its original mesh. This is
+# a real zero-joint object, not an articulated proxy with a fake hinge.
+entity_name: native_object
+root_body_name: ${oc.env:FDR_NATIVE_OBJECT_ROOT_BODY}
+root_joint_name: ${oc.env:FDR_NATIVE_OBJECT_ROOT_JOINT}
+usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/native_object.usd
+parts:
+  - name: object
+    body_name: ${oc.env:FDR_NATIVE_OBJECT_ROOT_BODY}
+    mesh_path: ${oc.env:FDR_NATIVE_OBJECT_MESH}
+    distance_sign: unsigned

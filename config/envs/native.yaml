@@ -1,0 +1,103 @@
+# @package _global_
+
+defaults:
+  - scene: base
+  - events: no_domain_rand
+  - robot: inspire_rh56f1_bimanual
+  - actions: native
+  - commands: motion_tracking
+  - simulator: isaacsim
+  - native_object: box
+  - _self_
+
+num_envs: 2048
+decimation: 4
+episode_length_s: 20.0
+
+# Native reference poses/rates are supplied explicitly; no object pinning,
+# adaptive assistance, target-pose noise, support-disk generation or perturbation.
+curriculum: {}
+commands:
+  ref_noise:
+    enable: false
+  hand:
+    noise_to_initial_level: 0.0
+    zero_init_vel: false
+  object:
+    pin_objects: false
+    pin_mode: none
+    zero_init_vel: false
+    perturb:
+      enabled: false
+    static_offset:
+      enable: false
+    support_disks:
+      enable: false
+
+obs:
+  _target_: envs.observations.native.NativeMotionTrackingObs
+  obs_dict:
+    actor_obs: &native_observations
+      - robot_wrist_pose_w
+      - robot_wrist_lin_vel_w
+      - robot_wrist_ang_vel_w
+      - robot_joint_pos
+      - robot_joint_vel
+      - robot_tip_trans_wrist
+      - robot_tip_lin_vel_wrist
+      - native_installed_command_error
+      - native_command_reference_error
+      - native_root_reference_error
+      - native_object_parts_wrist
+      - native_reference_parts_wrist
+      - native_object_joint_state
+      - native_object_joint_reference_error
+      - native_reference_support
+      - native_tip_part_distances
+      - native_tip_part_normals_wrist
+    critic_obs: *native_observations
+  encoded_groups:
+    future_traj: native_future_reference
+  obs_params:
+    native_future_reference:
+      n_future: ${runner.agent.traj_encoder.n_future}
+      stride: 1
+  obs_scales: {}
+  noise_scales: {}
+  actor_enable_corruption: false
+  critic_enable_corruption: false
+  nan_policy: disabled
+
+rewards:
+  _target_: envs.rewards.native.NativeMotionTrackingRewards
+  split_sides: false
+  reward_weights:
+    native_root_pose: 0.3
+    native_object_part_pose: 1.0
+    native_object_articulation: 0.3
+    native_command_bc: 0.3
+    action_penalty: -0.01
+    termination_penalty: -50.0
+  reward_scales:
+    native_command_bc: 500.0
+  reward_params:
+    native_root_pose: {position_scale_m: 0.1, rotation_scale_rad: 0.3333333333333333}
+    native_object_part_pose: {position_scale_m: 0.1, rotation_scale_rad: 0.3333333333333333}
+    native_object_articulation: {scale_rad: 0.1}
+
+terminations:
+  _target_: envs.terminations.native.NativeMotionTrackingTerminations
+  time_out: {enabled: true, time_out: true}
+  motion_clip_ended: {enabled: true, time_out: true}
+  native_object_dropped:
+    params: {drop_margin_m: 0.1}
+  native_reference_diverged:
+    params:
+      root_position_m: 0.2
+      root_rotation_rad: 1.5707963267948966
+      part_position_m: 0.2
+      part_rotation_rad: 1.5707963267948966
+      grace_steps: 15
+  native_velocity_diverged:
+    params: {linear_m_per_s: 100.0, angular_rad_per_s: 200.0, joint_rad_per_s: 200.0}
+  native_state_nonfinite: {}
