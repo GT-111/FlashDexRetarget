@@ -135,7 +135,12 @@ class RolloutRecord:
 
 
 _NATIVE_SIDES = ("left", "right")
-_NATIVE_RECORDING = "dexforge-flashdex-achieved-state-v1"
+_NATIVE_RECORDING = "dexforge-flashdex-achieved-state-v2"
+_INSTALLED_ARRAYS = (
+    "finger_target_rad", "finger_source_support", "root_state_w", "root_pose_support",
+    "root_linear_velocity_support", "root_angular_velocity_support", "installed_valid",
+    "reference_motion_ids", "reference_motion_steps", "root_force_n", "root_torque_nm",
+)
 
 
 class NativeRolloutRecord(RolloutRecord):
@@ -189,7 +194,34 @@ class NativeRolloutRecord(RolloutRecord):
                     or not np.allclose(lineage["scene_from_source_world"], self.binding["scene_from_source_world"],
                                        atol=1e-9, rtol=0)):
                 raise ValueError("FlashDex native binding differs from the actual imported frame/scene lineage")
+        installed = [(name, env.action_manager.get_term(name)) for name in env.action_manager.active_terms
+                     if hasattr(env.action_manager.get_term(name), "installed_control")]
+        if len(installed) > 1:
+            raise ValueError("FlashDex native export requires one combined installed-control owner")
+        self.installed_term = installed[0][1] if installed else None
+        self.installed_metadata = None
+        if self.installed_term is not None:
+            control = self.installed_term.installed_control
+            for side, body in zip(control["hand_sides"], control["hand_body_names"], strict=True):
+                if self.binding["hands"][side]["body_name"] != body:
+                    raise ValueError("FlashDex installed root body differs from its recorded native hand")
+            self.installed_metadata = {field: control[field] for field in (
+                "hand_sides", "hand_body_names", "finger_actuator_names", "finger_joint_names",
+                "root_control", "action_recipe")}
+            self.installed_metadata.update(term_name=installed[0][0],
+                coordinate_frame="env-local p/WXYZ; WORLD link twist and hand-root force/torque",
+                effort_sampling="actual last physics substep; not interval-mean effort")
+        self.object_joint_metadata = None
+        if hasattr(self.cmd, "native_object"):
+            self.object_joint_metadata = dict(entity_name=self.cmd.native_layout.object.entity_name,
+                joint_names=list(self.cmd.native_object.joint_names),
+                authority="observed simulator scalar state; independent from reference support")
         self.native_frames = []
+        phase = self.cmd.reference_phase
+        self.valid_steps_per_env = (
+            self.cmd.motion_lib._motion_num_frames[phase["motion_ids"]] - phase["motion_steps"]
+        )
+        self.rollout_steps = int((self.valid_steps_per_env - 1).clamp_min(0).max())
         # The author on_start does not capture reset. Its recorder can retain
         # this factual row without changing the policy or environment loop.
         self.on_step(env)
@@ -208,12 +240,26 @@ class NativeRolloutRecord(RolloutRecord):
         parts = torch.cat((part_position, part_quaternion), dim=-1).detach().to("cpu", torch.float32)
         pinning = bool(self.cmd.cfg.object.pin_objects)
         curriculum = self.cmd._xfrc_curr_ctrl is not None
-        self.native_frames.append({
+        phase = self.cmd.reference_phase
+        frame = {
             "hands": hands, "parts": parts,
-            "motion_steps": self.cmd.motion_steps.detach().to("cpu", torch.int64).clone(),
-            "motion_ids": self.cmd.motion_ids.detach().to("cpu", torch.int64).clone(),
+            # Metrics observe the achieved endpoint before compute advances the
+            # next-target cursor. In particular, the final cursor is clamped.
+            "motion_steps": phase["motion_steps"].detach().to("cpu", torch.int64).clone(),
+            "motion_ids": phase["motion_ids"].detach().to("cpu", torch.int64).clone(),
+            "command_motion_steps": self.cmd.motion_steps.detach().to("cpu", torch.int64).clone(),
+            "command_motion_ids": self.cmd.motion_ids.detach().to("cpu", torch.int64).clone(),
             "pinning": pinning, "curriculum": curriculum,
-        })
+        }
+        if self.installed_term is not None:
+            control = self.installed_term.installed_control
+            frame["installed"] = {field: control[field].detach().to("cpu").clone()
+                                  for field in _INSTALLED_ARRAYS}
+            frame["installed"]["root_state_w"][..., :3] -= self._env_origins.cpu()[:, None]
+        if self.object_joint_metadata is not None:
+            frame["object_joint_pos"] = self.cmd.native_object_joint_pos.detach().to("cpu").clone()
+            frame["object_joint_vel"] = self.cmd.native_object_joint_vel.detach().to("cpu").clone()
+        self.native_frames.append(frame)
 
     def collect_state(self, active_mask=None):
         state = super().collect_state(active_mask)
@@ -221,8 +267,16 @@ class NativeRolloutRecord(RolloutRecord):
         state["native_frames"] = [{**frame, "hands": frame["hands"][select],
                                        "parts": frame["parts"][select],
                                    "motion_steps": frame["motion_steps"][select],
-                                   "motion_ids": frame["motion_ids"][select]}
+                                   "motion_ids": frame["motion_ids"][select],
+                                   "command_motion_steps": frame["command_motion_steps"][select],
+                                   "command_motion_ids": frame["command_motion_ids"][select]}
                                   for frame in self.native_frames]
+        for selected, frame in zip(state["native_frames"], self.native_frames, strict=True):
+            if "installed" in frame:
+                selected["installed"] = {field: value[select] for field, value in frame["installed"].items()}
+            if "object_joint_pos" in frame:
+                selected["object_joint_pos"] = frame["object_joint_pos"][select]
+                selected["object_joint_vel"] = frame["object_joint_vel"][select]
         return state
 
     def rollout_arrays(self, states, env_index):
@@ -243,6 +297,9 @@ class NativeRolloutRecord(RolloutRecord):
                     native_object_part_pose=np.stack([frame["parts"][row].numpy() for frame in frames]),
                     recorded_motion_steps=np.array([int(frame["motion_steps"][row]) for frame in frames], np.int64),
                     recorded_motion_ids=np.array([int(frame["motion_ids"][row]) for frame in frames], np.int64),
+                    command_motion_steps=np.array([int(frame["command_motion_steps"][row]) for frame in frames], np.int64),
+                    command_motion_ids=np.array([int(frame["command_motion_ids"][row]) for frame in frames], np.int64),
+                    reference_phase_authority=np.asarray("pre_advance_command_metrics"),
                     object_pinning=np.array([frame["pinning"] for frame in frames], bool),
                     assist_curriculum=np.array([frame["curriculum"] for frame in frames], bool),
                     elapsed_time_ns=np.rint(np.arange(count) * self.step_dt * 1e9).astype(np.int64),
@@ -252,6 +309,18 @@ class NativeRolloutRecord(RolloutRecord):
                     native_binding_json=np.asarray(json.dumps(binding)),
                     prepared_name=np.asarray(name),
                 )
+                if self.installed_metadata is not None:
+                    result["installed_control_metadata_json"] = np.asarray(json.dumps(self.installed_metadata))
+                    for field in _INSTALLED_ARRAYS:
+                        key = "installed_control_valid" if field == "installed_valid" else "installed_" + field
+                        result[key] = np.stack([
+                            frame["installed"][field][row].numpy() for frame in frames])
+                if self.object_joint_metadata is not None:
+                    result["object_joint_metadata_json"] = np.asarray(json.dumps(self.object_joint_metadata))
+                    for field in ("object_joint_pos", "object_joint_vel"):
+                        result[field] = np.stack([frame[field][row].numpy() for frame in frames])
+                    for field in ("object_joint_position_support", "object_joint_velocity_support"):
+                        result[field] = np.ones_like(result["object_joint_pos"], dtype=bool)
                 return result
             offset += size
         raise IndexError(env_index)

@@ -69,6 +69,11 @@ class MetricsMixin:
         self.contact_miss_max = torch.zeros_like(self.contact_miss_counter)
 
     def _update_metrics(self) -> None:
+        # CommandTerm.compute advances the cursor after evaluating these metrics.
+        self.reference_phase = {
+            "motion_ids": self.motion_ids.clone(),
+            "motion_steps": self.motion_steps.clone(),
+        }
         side_prefixes = {"right": "r", "left": "l"}
         for si, side in enumerate(self._side_list):
             p = side_prefixes[side]

@@ -378,6 +378,11 @@ class IsaacNativeMotionTrackingCommand(IsaacMotionTrackingCommand):
     def _update_metrics(self):
         from mjlab.utils.lab_api.math import quat_error_magnitude
 
+        # This override bypasses common metrics, including its pre-advance phase.
+        self.reference_phase = {
+            "motion_ids": self.motion_ids.clone(),
+            "motion_steps": self.motion_steps.clone(),
+        }
         ml, ids = self.motion_lib, self._motion_flat_ids
         ref = self.ref_native_root_state_w
         root_p = (ref[..., :3] - self.robot_wrist_trans_w).norm(dim=-1)

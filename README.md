@@ -52,8 +52,17 @@ and supply its `binding` JSON. The binding names the actual bilateral hand
 bodies, native joint correspondence, ordered object parts, source-to-scene
 transform, prepared source clocks and assistance receipt. The recorder captures
 reset before subsequent achieved states, preserving measured Q/Qvel and raw
-action validity. Global robot roots and raw actions do not acquire wrist or
-installed-command authority. The original `RolloutRecord` remains available.
+action validity. Source rows come from the actual pre-advance command reference
+phase; the next-target cursor is retained separately, including its clamped
+final value. When the action term exposes accepted finger and FREE-root targets,
+those targets, reference IDs, source support and resolved action recipe are
+recorded independently of raw actions. Root wrench samples are last-substep
+control values, not contact forces or interval averages. Actual object joint
+Q/Qvel keeps its own support, including empty axes for a rigid object. Global
+robot roots and raw actions do not acquire wrist or installed-command authority.
+Five CPU cases exercise reset, two actual action/command applications, the final
+endpoint and ordinary DexForge reader reopening. The original `RolloutRecord`
+remains available.
 Success archives retain their first-success selection meaning; they are not a
 frozen final-policy evaluation or a qualification of a different physics backend.
 

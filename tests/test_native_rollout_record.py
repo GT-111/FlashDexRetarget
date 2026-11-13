@@ -2,14 +2,118 @@
 
 import importlib.util
 import json
+from dataclasses import asdict
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import torch
 
 from evaluation.callbacks.rollout_record import NativeRolloutRecord
 from evaluation.callbacks.success_export import export_success
+
+
+def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False):
+    """Run actual command/action owners with explicit synthetic backend facts.
+
+    The physical state is supplied by this protocol fixture; no dynamics model,
+    FK, simulator application or policy is executed.
+    """
+    from simulator.isaacsim import bootstrap
+
+    bootstrap()
+    from mjlab.managers import CommandTerm
+    from mjlab.managers.action_manager import ActionManager
+    from test_native_task_contract import _command
+
+    from envs.actions.native import NativeResidualActionCfg
+    from envs.actions.residual import ResidualActionCfg
+    from envs.commands.motion_tracking.monitor.metrics import MetricsMixin
+    from envs.commands.motion_tracking.motion_tracking import MotionTrackingCommand
+
+    native_command, env, _calls = _command(rigid=rigid)
+    robot, library = native_command.robot, native_command.motion_lib
+    robot.body_names = ["left_root", "right_root"]
+    robot.data.root_link_pos_w = torch.full((1, 3), 999.)
+    robot.data.root_link_quat_w = torch.tensor([[1., 0., 0., 0.]])
+    robot.data.joint_pos_target = torch.zeros((1, 3))
+    robot.data.soft_joint_pos_limits = torch.tensor([[[-1., 1.]] * 3])
+    correspondence = {"command_left": "left_driver", "command_right": "right_driver"}
+    robot.find_joints_by_actuator_names = lambda names: (
+        [robot.joint_names.index(correspondence[name]) for name in names],
+        [correspondence[name] for name in names])
+    robot.native_command_limits = lambda names: np.tile((-1., 1.), (len(names), 1))
+    robot.set_joint_position_target = lambda target, joint_ids: robot.data.joint_pos_target.__setitem__(
+        (slice(None), joint_ids), target)
+    for hand in robot.hands.values():
+        hand.apply_root_pose_target = lambda target, support, control: (torch.ones((1, 3)), torch.full((1, 3), 2.))
+    name, source = next(iter(binding["clips"].items()))
+    library.motion_files = ["synthetic#" + name]
+    library.source_lineage = [{"capture_id": source["source_unit_id"],
+        "selected_source_frame_index": source["selected_source_frame_index"],
+        "scene_from_source_world": binding["scene_from_source_world"]}]
+    library.source_query_ordinal = [np.asarray(source["prepared_source_ordinal"])]
+    library.source_import_elapsed_ns = [np.asarray(source["prepared_elapsed_time_ns"], np.int64) + 1_000_000_000]
+    env.scene.env_origins = torch.tensor([[1., 2., 3.]])
+    env.close = lambda: None
+    native_command.cfg.object.entity_names = {"left": "object", "right": "object"}
+    native_command._eval_mode = True
+    native_command._xfrc_curr_ctrl = None
+    native_command.time_left = torch.ones(1)
+    if native:
+        command = native_command
+        action_cfg = NativeResidualActionCfg(entity_name="robot", command_name="motion",
+            native_scene=asdict(command.native_layout), translation_residual_m=.1, rotation_residual_rad=1.,
+            cutoff_hz={"wrist_trans": 5., "wrist_rot": 5., "finger": None}, clip={".*": (-1., 1.)})
+    else:
+        zeros = torch.zeros((1, 2, 3))
+        quaternions = torch.tensor([[[1., 0., 0., 0.]] * 2])
+        tips = torch.zeros((1, 2, 1, 3))
+        command = SimpleNamespace(motion_ids=native_command.motion_ids, motion_steps=native_command.motion_steps,
+            motion_lib=library, robot=robot, cfg=native_command.cfg, _eval_mode=True, _xfrc_curr_ctrl=None,
+            time_left=torch.ones(1), _side_list=["left", "right"], finger_names=("index",), metrics={},
+            has_objects=False, _levels=lambda: (1, 2), _apply_object_assist=lambda: None,
+            mano_wrist_trans_w=zeros, robot_wrist_trans_w=zeros, mano_wrist_quat_w=quaternions,
+            robot_wrist_quat_w=quaternions, mano_tip_trans_w=tips, robot_tip_trans_w=tips,
+            mano_wrist_lin_vel_w=zeros, robot_wrist_lin_vel_w=zeros,
+            mano_wrist_ang_vel_w=zeros, robot_wrist_ang_vel_w=zeros,
+            mano_tip_lin_vel_w=tips, robot_tip_lin_vel_w=tips,
+            mano_level_trans_w=lambda side, level: torch.zeros((1, 1, 3)),
+            robot_level_trans_w=lambda side, level: torch.zeros((1, 1, 3)),
+            mano_all_joints_lin_vel_w=lambda side: torch.zeros((1, 1, 3)),
+            robot_all_joints_lin_vel_w=lambda side: torch.zeros((1, 1, 3)),
+            ref_joint_pos=torch.zeros((1, 3)), sim_obj_trans_w=torch.zeros((1, 2, 3)),
+            sim_obj_quat_w=quaternions)
+        command._update_metrics = MethodType(MetricsMixin._update_metrics, command)
+        command._update_command = MethodType(MotionTrackingCommand._update_command, command)
+        action_cfg = ResidualActionCfg(entity_name="robot", command_name="motion",
+            actuator_names={"wrist_trans": (), "wrist_rot": (), "finger": tuple(correspondence)},
+            residual_scale={"wrist_trans": .1, "wrist_rot": 1., "finger": None}, clip={".*": (-1., 1.)})
+    env.command_manager = SimpleNamespace(get_term=lambda name: command)
+    env.action_manager = ActionManager({"actual": action_cfg}, env)
+    env.action_manager.reset()
+    CommandTerm.compute(command, dt=0.)
+    recorder = NativeRolloutRecord(binding=binding)
+    recorder.on_start(env)
+    assert command.reference_phase["motion_steps"].item() == 0
+    assert command.motion_steps.item() == 1
+    for row in (1, 2):
+        raw = torch.full((1, env.action_manager.total_action_dim), float(row + 1))
+        env.action_manager.process_action(raw)
+        env.action_manager.apply_action()
+        # Separate observed-state fixture values, not the accepted target or an invented plant.
+        robot.data.joint_pos += .01
+        robot.data.joint_vel[:] = row + .25
+        robot.data.body_link_pos_w += .001
+        if native and not rigid:
+            command.native_object.data.joint_vel[:] = row + .5
+        CommandTerm.compute(command, dt=env.step_dt)
+        recorder.on_step(env)
+        assert command.reference_phase["motion_steps"].item() == row
+    output = tmp_path / "phase-success"
+    assert export_success(output, recorder, [recorder.collect_state()], torch.tensor([True]), torch.tensor([0]),
+        123, "synthetic phase fixture; not physics/task success", motion_names=[name]) == 1
+    return output / "manifest.json"
 
 
 def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_lineage(tmp_path):
@@ -31,8 +135,10 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
             root_link_pos_w=torch.full((1, 3), 999.), root_link_quat_w=torch.tensor([[1., 0., 0., 0.]]),
             body_link_pos_w=torch.tensor([[[999., 999., 999.], [3., 4., 5.], [6., 7., 8.]]]),
             body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 3])))
-    command = SimpleNamespace(robot=robot, motion_steps=torch.zeros(1, dtype=torch.int64),
+    command = SimpleNamespace(robot=robot, motion_steps=torch.ones(1, dtype=torch.int64),
         motion_ids=torch.zeros(1, dtype=torch.int64), _xfrc_curr_ctrl=None,
+        reference_phase={"motion_ids": torch.zeros(1, dtype=torch.int64),
+                         "motion_steps": torch.zeros(1, dtype=torch.int64)},
         cfg=SimpleNamespace(object=SimpleNamespace(pin_objects=False)),
         sim_obj_trans_w=torch.zeros((1, 1, 3)), sim_obj_quat_w=torch.tensor([[[1., 0., 0., 0.]]]),
         motion_lib=SimpleNamespace(motion_files=["file#S10001__st00"], _motion_num_frames=torch.tensor([2]),
@@ -46,11 +152,11 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
         data=SimpleNamespace(body_link_pos_w=torch.tensor([[[8., 9., 10.]]]),
                              body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]]]))))
     env = SimpleNamespace(step_dt=.02, num_envs=1, scene=scene,
-        action_manager=SimpleNamespace(action=torch.tensor([[77., 88.]])),
+        action_manager=SimpleNamespace(action=torch.tensor([[77., 88.]]), active_terms=[]),
         command_manager=SimpleNamespace(get_term=lambda name: command))
     callback = NativeRolloutRecord(binding=binding)
     callback.on_start(env)
-    command.motion_steps += 1
+    command.reference_phase = {"motion_ids": command.motion_ids.clone(), "motion_steps": torch.ones(1, dtype=torch.int64)}
     robot.data.body_link_pos_w += .25
     robot.data.joint_pos += .1
     callback.on_step(env)
