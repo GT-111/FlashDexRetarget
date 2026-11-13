@@ -43,15 +43,19 @@ def tip_contacts(tips: np.ndarray, pose: np.ndarray, verts: np.ndarray, tree: cK
 def load_clip(path: Path, meshes: C.ObjectMeshes, fps: float, cfg) -> tuple[dict, dict]:
     clip = C.load_clip(path)
     dt, sigma = 1.0 / fps, cfg.vel_sigma
-    qpos = clip["qpos"].astype(np.float32)
+    native = C.native_reference(clip)
+    qpos = (native["joint_pos"] if native is not None else clip["qpos"]).astype(np.float32)
     T = len(qpos)
     if T < 2:
         raise ValueError(f"{path.name}: needs at least 2 frames")
     sides = C.sides(clip)
     if not sides:
         raise ValueError(f"{path.name}: no mano_right_* / mano_left_* arrays")
-    d = {"joint_pos": qpos, "joint_vel": velocity(qpos, dt, sigma)}
+    d = {"joint_pos": qpos, "joint_vel": (
+        native["joint_vel"].astype(np.float32) if native is not None else velocity(qpos, dt, sigma))}
     meta: dict = {"sides": sides, "support": clip.get("support_disks")}
+    if native is not None:
+        meta["native_reference"] = native
     if "source_lineage_json" in clip:
         meta["source_lineage"] = json.loads(str(clip["source_lineage_json"]))
         for name in ("source_query_ordinal", "source_import_elapsed_ns"):
@@ -107,6 +111,9 @@ def build(clips: Path, dataset: Path, fps: float, cfg, names: set[str] | None = 
     bad = [f.name for f, m in zip(files, metas) if m["sides"] != sides]
     if bad:
         raise ValueError(f"every clip needs the same hand sides {sides}; differs: {bad[:5]}")
+    native = [m.get("native_reference") for m in metas]
+    if any(item is not None for item in native) and not all(item is not None for item in native):
+        raise ValueError("one motion.pt cannot mix native references with scalar-wrist stock clips")
 
     packed: dict = {k: torch.from_numpy(np.concatenate([r[k] for r in rows])) for k in rows[0]}
     frames = torch.tensor([len(r["joint_pos"]) for r in rows], dtype=torch.long)
@@ -114,6 +121,8 @@ def build(clips: Path, dataset: Path, fps: float, cfg, names: set[str] | None = 
     packed["length_starts"] = torch.cumsum(frames, 0) - frames
     packed["motion_filename"] = [f.stem for f in files]
     packed["motion_source_lineage"] = [m.get("source_lineage") for m in metas]
+    if native[0] is not None:
+        packed["motion_native_reference"] = native
     for s in sides:
         packed[f"mano_{s}_joint_names"] = list(C.MANO_JOINT_NAMES)
 

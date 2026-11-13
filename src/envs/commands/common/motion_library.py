@@ -25,6 +25,7 @@ class MotionLibrary:
         self.device = device
         self.finger_names = finger_names
         self.num_robot_joints = robot.num_joints
+        self.robot_joint_names = tuple(robot.joint_names)
 
         motion_dicts, motion_files = load_motions(motion_file)
         # Keep the per-trajectory identifiers: eval-side exports name clips by them.
@@ -70,6 +71,12 @@ class MotionLibrary:
 
     def _parse_robot_data(self, motion_dicts: list[dict]) -> None:
         """Joint positions and velocities for warm-start reset."""
+        native = [d.get("native_reference") for d in motion_dicts]
+        if any(reference is not None for reference in native):
+            if not all(reference is not None for reference in native):
+                raise ValueError("a motion library cannot mix native and scalar-wrist stock references")
+            self._parse_native_reference(motion_dicts)
+            return
         n = self.num_robot_joints
         joint_offset = n if self.hand_sides == ("left",) else 0
         s = slice(joint_offset, joint_offset + n)
@@ -79,6 +86,52 @@ class MotionLibrary:
         self.robot_joint_vel = _concat(
             [d["joint_vel"][:, s] for d in motion_dicts], self.device
         )
+
+    def _parse_native_reference(self, motion_dicts: list[dict]) -> None:
+        from retarget.human_demo.clips import native_reference
+
+        references = [native_reference(d) for d in motion_dicts]
+        first = references[0]
+        for field in ("root_body_names", "object_entity_name", "object_root_body_name",
+                      "object_part_body_names", "object_joint_names"):
+            if any(reference[field] != first[field] for reference in references[1:]):
+                raise ValueError(f"native references select different physical {field}")
+        columns = []
+        for reference in references:
+            names = reference["joint_names"]
+            if set(names) != set(self.robot_joint_names):
+                raise ValueError("native reference joints differ from the actual named robot scalar coordinates")
+            columns.append([names.index(name) for name in self.robot_joint_names])
+        self.native_joint_names = self.robot_joint_names
+        for attribute, field, dtype in (
+            ("robot_joint_pos", "joint_pos", torch.float32),
+            ("robot_joint_vel", "joint_vel", torch.float32),
+            ("native_joint_position_support", "joint_position_support", torch.bool),
+            ("native_joint_velocity_support", "joint_velocity_support", torch.bool),
+        ):
+            setattr(self, attribute, _concat(
+                [reference[field][:, ids] for reference, ids in zip(references, columns, strict=True)],
+                self.device, dtype=dtype))
+        self.native_time_ns = _concat([reference["time_ns"] for reference in references],
+                                     self.device, dtype=torch.int64)
+        self.native_clock_authority = [reference["clock_authority"] for reference in references]
+        self.native_reference_provenance = [reference["provenance"] for reference in references]
+        self.native_root_body_names = first["root_body_names"]
+        for field in ("root_state_w", "root_pose_support", "root_linear_velocity_support",
+                      "root_angular_velocity_support"):
+            dtype = torch.float32 if field == "root_state_w" else torch.bool
+            setattr(self, "native_" + field, {
+                side: _concat([reference[field][side] for reference in references], self.device, dtype=dtype)
+                for side in self.native_root_body_names})
+        for field in ("object_entity_name", "object_root_body_name", "object_part_body_names",
+                      "object_joint_names"):
+            setattr(self, "native_" + field, first[field])
+        for field in ("object_part_state_w", "object_part_pose_support", "object_part_linear_velocity_support",
+                      "object_part_angular_velocity_support", "object_joint_pos", "object_joint_vel",
+                      "object_joint_position_support", "object_joint_velocity_support"):
+            dtype = torch.bool if field.endswith("support") else torch.float32
+            setattr(self, "native_" + field,
+                    _concat([reference[field] for reference in references], self.device, dtype=dtype))
 
     # ── MANO reference ──────────────────────────────────────────────────
 
@@ -224,6 +277,11 @@ def load_motions(
     motion_dicts = [dict(np.load(motion_file, allow_pickle=True))]
     if "source_lineage_json" in motion_dicts[0]:
         motion_dicts[0]["source_lineage"] = json.loads(str(motion_dicts[0]["source_lineage_json"]))
+    if "native_reference" in motion_dicts[0]:
+        native = motion_dicts[0]["native_reference"].item()
+        motion_dicts[0]["native_reference"] = native
+        motion_dicts[0]["joint_pos"] = native["joint_pos"]
+        motion_dicts[0]["joint_vel"] = native["joint_vel"]
     return motion_dicts, [str(motion_file)]
 
 
@@ -254,6 +312,8 @@ def _load_packed_pt(
             d[k] = packed[k][start : start + n_frames].cpu().numpy()
         if "motion_source_lineage" in packed:
             d["source_lineage"] = packed["motion_source_lineage"][m]
+        if "motion_native_reference" in packed:
+            d["native_reference"] = packed["motion_native_reference"][m]
         for jn_key in ("mano_right_joint_names", "mano_left_joint_names"):
             if jn_key in packed:
                 d[jn_key] = np.array(packed[jn_key])

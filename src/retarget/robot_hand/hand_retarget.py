@@ -21,6 +21,9 @@ def _crop(clip: dict, n: int) -> dict:
     T = C.num_frames(clip)
     out = {}
     for k, v in clip.items():
+        if k == "native_reference":
+            out[k] = C.crop_native_reference(C.native_reference(clip), n)
+            continue
         per_frame = isinstance(v, np.ndarray) and v.ndim > 0 and len(v) == T
         out[k] = v[n:] if per_frame and not k.endswith(("support_disks", "_joint_names")) else v
     return out

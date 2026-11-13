@@ -75,8 +75,19 @@ metadata. Four CPU contract cases cover mechanics, scene splitting, actual
 action/reward callers and root wrench computation; imported USD, PhysX dynamics
 and a complete native task still need qualification. Robot/actions overrides
 alone do not replace the stock scalar-wrist BC reward or rigid-object SDF
-observations: the native reference carrier and task profile must use the named
-root and part APIs.
+observations: the native task profile must use the named root and part APIs.
+
+A trusted prepared clip can carry an explicit `native_reference` mapping in its
+NPZ. The existing crop and `build_motion_pt` path retain its per-row native
+joint Q/Qvel, named hand roots, object parts and passive joints, independent
+support masks, exact prepared `time_ns` and provenance. Root/part states use
+position, WXYZ rotation, world link velocity and world angular velocity.
+`MotionLibrary` maps physical joint columns by the runtime joint names and
+exposes these facts separately from MANO and stock scalar-wrist references.
+Unknown rates have zero values and false support; cropping preserves the clock
+origin and complete source frame inventory. Three CPU cases qualify this
+pack/reader contract. Actual native reference generation and physical admission
+remain required.
 
 ## Setup
 
