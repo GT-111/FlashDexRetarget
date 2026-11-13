@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -29,6 +30,9 @@ class MotionLibrary:
         # Keep the per-trajectory identifiers: eval-side exports name clips by them.
         self.motion_file = str(motion_file)
         self.motion_files = motion_files
+        self.source_lineage = [d.get("source_lineage") for d in motion_dicts]
+        self.source_query_ordinal = [d.get("source_query_ordinal") for d in motion_dicts]
+        self.source_import_elapsed_ns = [d.get("source_import_elapsed_ns") for d in motion_dicts]
         self.hand_sides = _detect_sides(motion_dicts[0])
 
         self.num_trajectories = len(motion_dicts)
@@ -218,6 +222,8 @@ def load_motions(
         return _load_packed_pt(str(motion_file))
 
     motion_dicts = [dict(np.load(motion_file, allow_pickle=True))]
+    if "source_lineage_json" in motion_dicts[0]:
+        motion_dicts[0]["source_lineage"] = json.loads(str(motion_dicts[0]["source_lineage_json"]))
     return motion_dicts, [str(motion_file)]
 
 
@@ -246,6 +252,8 @@ def _load_packed_pt(
         d: dict[str, np.ndarray] = {}
         for k in flat_keys:
             d[k] = packed[k][start : start + n_frames].cpu().numpy()
+        if "motion_source_lineage" in packed:
+            d["source_lineage"] = packed["motion_source_lineage"][m]
         for jn_key in ("mano_right_joint_names", "mano_left_joint_names"):
             if jn_key in packed:
                 d[jn_key] = np.array(packed[jn_key])

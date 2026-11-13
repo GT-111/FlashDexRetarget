@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,12 @@ def load_clip(path: Path, meshes: C.ObjectMeshes, fps: float, cfg) -> tuple[dict
         raise ValueError(f"{path.name}: no mano_right_* / mano_left_* arrays")
     d = {"joint_pos": qpos, "joint_vel": velocity(qpos, dt, sigma)}
     meta: dict = {"sides": sides, "support": clip.get("support_disks")}
+    if "source_lineage_json" in clip:
+        meta["source_lineage"] = json.loads(str(clip["source_lineage_json"]))
+        for name in ("source_query_ordinal", "source_import_elapsed_ns"):
+            if clip[name].shape != (T,):
+                raise ValueError(f"{path.name}: {name} must match the actually cropped reference")
+            d[name] = clip[name].copy()
     tip_cols = [C.MANO_JOINT_NAMES.index(f"{f}_tip") for f in C.FINGERS]
     for s in sides:
         joints = C.joints(clip, s).astype(np.float32)
@@ -106,6 +113,7 @@ def build(clips: Path, dataset: Path, fps: float, cfg, names: set[str] | None = 
     packed["motion_num_frames"] = frames
     packed["length_starts"] = torch.cumsum(frames, 0) - frames
     packed["motion_filename"] = [f.stem for f in files]
+    packed["motion_source_lineage"] = [m.get("source_lineage") for m in metas]
     for s in sides:
         packed[f"mano_{s}_joint_names"] = list(C.MANO_JOINT_NAMES)
 

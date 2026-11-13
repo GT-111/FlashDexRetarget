@@ -3,8 +3,11 @@ device->host copy per step, split back into fields at export time."""
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 
@@ -129,3 +132,126 @@ class RolloutRecord:
                 return out
             offset += n
         raise IndexError(f"env_index {env_index} out of range for {offset} envs")
+
+
+_NATIVE_SIDES = ("left", "right")
+_NATIVE_RECORDING = "dexforge-flashdex-achieved-state-v1"
+
+
+class NativeRolloutRecord(RolloutRecord):
+    """Record reset and actual named hand bodies for native reference export.
+
+    Select this callback with a literal run binding. Raw manager actions remain
+    separate from any installed-control readout supplied by the actual action
+    term. Full source IDs/crop mapping come from the import, never from FPS alone.
+    """
+    def __init__(self, *, binding: dict | str, command_name: str = "motion"):
+        super().__init__(command_name=command_name)
+        self.binding = json.loads(Path(binding).read_text()) if isinstance(binding, str) else dict(binding)
+
+    def on_start(self, env):
+        super().on_start(env)
+        robot = self.cmd.robot
+        self.joint_names = tuple(robot.joint_names)
+        self.body_names = tuple(robot.body_names)
+        self.hand_indices = tuple(self.body_names.index(self.binding["hands"][side]["body_name"])
+                                  for side in _NATIVE_SIDES)
+        for hand in self.binding["hands"].values():
+            for name in hand["physical_joint_names"].values():
+                self.joint_names.index(name)
+        self.object_parts = []
+        addresses = set()
+        for part in self.binding["object_parts"].values():
+            address = (part["entity_name"], part["body_name"])
+            if address in addresses:
+                raise ValueError("FlashDex shared object aliases cannot become two distinct physical parts")
+            addresses.add(address)
+            entity = env.scene[part["entity_name"]]
+            self.object_parts.append((entity, entity.body_names.index(part["body_name"])))
+        if tuple(self.binding["object_parts"]) != tuple(self.binding["object_part_names"]):
+            raise ValueError("FlashDex named part order must match the actual scene-body bindings")
+        self.step_dt = float(env.step_dt)
+        if not np.isfinite(self.step_dt) or self.step_dt <= 0:
+            raise ValueError("FlashDex recorder requires the actual positive environment control interval")
+        self.motion_names = [name.rsplit("#", 1)[-1] for name in self.cmd.motion_lib.motion_files]
+        for index, name in enumerate(self.motion_names):
+            clip = self.binding["clips"][name]
+            if len(clip["prepared_time_ns"]) != int(self.cmd.motion_lib._motion_num_frames[index]):
+                raise ValueError("FlashDex prepared source clock differs from the actual motion library")
+            lineage = self.cmd.motion_lib.source_lineage[index]
+            ordinal = self.cmd.motion_lib.source_query_ordinal[index]
+            elapsed = self.cmd.motion_lib.source_import_elapsed_ns[index]
+            if (lineage is None or ordinal is None or elapsed is None
+                    or lineage["capture_id"] != clip["source_unit_id"]
+                    or not np.array_equal(lineage["selected_source_frame_index"], clip["selected_source_frame_index"])
+                    or not np.array_equal(ordinal, clip["prepared_source_ordinal"])
+                    or not np.array_equal(elapsed - elapsed[0], clip["prepared_elapsed_time_ns"])
+                    or not np.allclose(lineage["scene_from_source_world"], self.binding["scene_from_source_world"],
+                                       atol=1e-9, rtol=0)):
+                raise ValueError("FlashDex native binding differs from the actual imported frame/scene lineage")
+        self.native_frames = []
+        # The author on_start does not capture reset. Its recorder can retain
+        # this factual row without changing the policy or environment loop.
+        self.on_step(env)
+
+    def on_step(self, env):
+        import torch
+
+        super().on_step(env)
+        robot = self.cmd.robot
+        pos = robot.data.body_link_pos_w[:, self.hand_indices] - self._env_origins[:, None]
+        quat = robot.data.body_link_quat_w[:, self.hand_indices]
+        hands = torch.cat((pos, quat), dim=-1).detach().to("cpu", torch.float32)
+        part_position = torch.stack([entity.data.body_link_pos_w[:, body] for entity, body in self.object_parts], dim=1)
+        part_position -= self._env_origins[:, None]
+        part_quaternion = torch.stack([entity.data.body_link_quat_w[:, body] for entity, body in self.object_parts], dim=1)
+        parts = torch.cat((part_position, part_quaternion), dim=-1).detach().to("cpu", torch.float32)
+        pinning = bool(self.cmd.cfg.object.pin_objects)
+        curriculum = self.cmd._xfrc_curr_ctrl is not None
+        self.native_frames.append({
+            "hands": hands, "parts": parts,
+            "motion_steps": self.cmd.motion_steps.detach().to("cpu", torch.int64).clone(),
+            "motion_ids": self.cmd.motion_ids.detach().to("cpu", torch.int64).clone(),
+            "pinning": pinning, "curriculum": curriculum,
+        })
+
+    def collect_state(self, active_mask=None):
+        state = super().collect_state(active_mask)
+        select = slice(None) if active_mask is None else active_mask.cpu()
+        state["native_frames"] = [{**frame, "hands": frame["hands"][select],
+                                       "parts": frame["parts"][select],
+                                   "motion_steps": frame["motion_steps"][select],
+                                   "motion_ids": frame["motion_ids"][select]}
+                                  for frame in self.native_frames]
+        return state
+
+    def rollout_arrays(self, states, env_index):
+        result = super().rollout_arrays(states, env_index)
+        if result is None:
+            return None
+        offset = 0
+        for state in states:
+            size = len(state["valid_steps_per_env"])
+            if env_index < offset + size:
+                row = env_index - offset
+                count = len(result["joint_pos"])
+                frames = state["native_frames"][:count]
+                name = self.motion_names[int(result["motion_id"])]
+                binding = {**self.binding, "clips": {name: self.binding["clips"][name]}}
+                result.update(
+                    native_hand_pose=np.stack([frame["hands"][row].numpy() for frame in frames]),
+                    native_object_part_pose=np.stack([frame["parts"][row].numpy() for frame in frames]),
+                    recorded_motion_steps=np.array([int(frame["motion_steps"][row]) for frame in frames], np.int64),
+                    recorded_motion_ids=np.array([int(frame["motion_ids"][row]) for frame in frames], np.int64),
+                    object_pinning=np.array([frame["pinning"] for frame in frames], bool),
+                    assist_curriculum=np.array([frame["curriculum"] for frame in frames], bool),
+                    elapsed_time_ns=np.rint(np.arange(count) * self.step_dt * 1e9).astype(np.int64),
+                    raw_action_valid=np.arange(count) > 0,
+                    joint_names=np.asarray(self.joint_names),
+                    recording=np.asarray(_NATIVE_RECORDING),
+                    native_binding_json=np.asarray(json.dumps(binding)),
+                    prepared_name=np.asarray(name),
+                )
+                return result
+            offset += size
+        raise IndexError(env_index)

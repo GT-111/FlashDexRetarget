@@ -12,7 +12,12 @@ from retarget.robot_hand.quality import flags
 
 
 def _crop(clip: dict, n: int) -> dict:
-    """Drop the first n frames of every per-frame array."""
+    """Drop real per-frame facts, including source query lineage, with the IK prefix.
+
+    The source's original ID inventory is scalar JSON and remains unchanged.
+    ``source_import_elapsed_ns`` keeps its pre-crop origin; packing and export
+    retain the actual crop instead of claiming this new reset is capture t0.
+    """
     T = C.num_frames(clip)
     out = {}
     for k, v in clip.items():

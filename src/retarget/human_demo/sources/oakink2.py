@@ -9,7 +9,14 @@ import torch
 import trimesh
 from scipy.spatial.transform import Rotation
 
-from retarget.human_demo.sources.base import YUP_TO_ZUP, Demo, Hand, Source as Base, _forward, _mano
+from retarget.human_demo.sources.base import (
+    YUP_TO_ZUP,
+    Demo,
+    Hand,
+    Source as Base,
+    _forward,
+    _mano,
+)
 
 
 class Source(Base):
@@ -50,7 +57,20 @@ class Source(Base):
             poses = {o: np.stack([anno["obj_transf"][o][f] for f in frames]).astype(np.float64)
                      for o in set(objects.values())}
             out.append(Demo(name, 120.0, hands, objects, poses, to_world=YUP_TO_ZUP,
-                            scales={o: self.scales[o] for o in {*poses, *context} if o in self.scales}, context=context))
+                            scales={o: self.scales[o] for o in {*poses, *context} if o in self.scales}, context=context,
+                            source_lineage={
+                                "source_id": "oakink2",
+                                "capture_id": seq,
+                                "selected_source_frame_index": [int(f) for f in frames],
+                                "source_frame_origin": int(anno["mocap_frame_id_list"][0]),
+                                "source_fps": 120.0,
+                                "source_clock_authority": "nominal_120Hz_original_frame_index_capture_origin",
+                                "program_key": key,
+                                # A source view can renumber stages; source-view.json owns the original ordinal.
+                                "loader_program_ordinal": i,
+                                "physical_capture_time_ns": None,
+                                "physical_availability_time_ns": None,
+                            }))
         return out
 
     def _held(self, hands: dict[str, Hand], anno: dict, frames: list[int], candidates, lists: dict) -> dict[str, str]:

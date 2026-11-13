@@ -38,6 +38,25 @@ MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget
 - [`docs/guide/kinematic_retargeting.md`](docs/guide/kinematic_retargeting.md): data, from a released dataset to
   `motion.pt`: dataset layout, clip format, every pipeline step and its settings, `motion.pt` contents.
 
+## DexForge integration in this fork
+
+The `codex/dexforge-f1-box` branch starts from upstream
+`6f95e133aa4b7ca6a784eac93725df3de4d41509` with FlashSAC
+`9822b1b7e0b5cce45e7f79d6b3e2c169fa042faa`. The source import carries original
+OakInk frame IDs, the actual ordinal resampling and later IK crop through
+`motion.pt`. These additions preserve the upstream training and admission rules.
+
+For factual native export, select
+`evaluation.callbacks.rollout_record.NativeRolloutRecord` in `eval.callbacks`
+and supply its `binding` JSON. The binding names the actual bilateral hand
+bodies, native joint correspondence, ordered object parts, source-to-scene
+transform, prepared source clocks and assistance receipt. The recorder captures
+reset before subsequent achieved states, preserving measured Q/Qvel and raw
+action validity. Global robot roots and raw actions do not acquire wrist or
+installed-command authority. The original `RolloutRecord` remains available.
+Success archives retain their first-success selection meaning; they are not a
+frozen final-policy evaluation or a qualification of a different physics backend.
+
 ## Setup
 
 ```sh
