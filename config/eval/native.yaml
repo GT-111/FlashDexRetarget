@@ -25,6 +25,11 @@ eval:
       command_name: ${commands.name}
       grace_steps: 0
       thresholds: ${native_tracking_tolerances}
+    - _target_: evaluation.callbacks.contact_performance.NativeContactPerformance
+      command_name: ${commands.name}
+      grace_steps: 0
+      normal_force_threshold_n: 0.5
+      separation_bound_m: 0.02
     - _target_: evaluation.callbacks.rollout_record.NativeRolloutRecord
       command_name: ${commands.name}
       binding: ${native_recording_binding}

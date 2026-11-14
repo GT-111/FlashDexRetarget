@@ -81,6 +81,13 @@ class IsaacSimAdapter:
         entity.init_gravcomp(scale, self.gravity_world_m_per_s2())
         self._gravity_compensators.append(entity)
 
+    def begin_control_step(self) -> None:
+        # This adapter has no exact hand-part interval force readout.
+        pass
+
+    def end_control_step(self) -> None:
+        pass
+
     def step(self) -> None:
         self._sim.step(render=self.render)
 

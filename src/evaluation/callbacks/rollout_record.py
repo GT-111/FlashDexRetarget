@@ -145,6 +145,11 @@ _CONTACT_ARRAYS = (
     "normal_force_n", "force_bearing_contact_present",
     "force_bearing_distance_max_m", "measurement_support",
 )
+_CONTACT_INTERVAL_ARRAYS = (
+    "normal_force_n", "force_bearing_contact_present", "force_bearing_distance_max_m",
+    "measurement_support", "sample_recorded", "clock_support",
+    "sample_begin_time_s", "sample_end_time_s", "interval_complete",
+)
 
 
 class NativeRolloutRecord(RolloutRecord):
@@ -247,6 +252,23 @@ class NativeRolloutRecord(RolloutRecord):
                 unsupported="NaN normal force/separation and false measurement support",
                 provenance="derived target execution evidence, not original observed source contacts",
             )
+        self._contact_interval_reader = getattr(env.scene, "hand_part_contact_interval_facts", None)
+        interval = None if self._contact_interval_reader is None else self._contact_interval_reader()
+        self.contact_interval_metadata = None
+        if interval is not None:
+            self.contact_interval_metadata = dict(
+                schema="solver_hand_part_control_interval_v1",
+                pairs=[interval["addresses"][name] for name in self._contact_names],
+                num_substeps=interval["num_substeps"], clock=interval["clock"], sampling=interval["sampling"],
+                normal_force_authority=interval["normal_force_authority"],
+                distance_authority=interval["distance_authority"],
+                pair_field_axes="recorded endpoint, configured substep, named pair",
+                common_field_axes="recorded endpoint, configured substep; interval_complete is endpoint-only",
+                interval_complete="all configured substeps recorded with valid contiguous solver clocks; force support remains independent",
+                reset="no executed interval; NaN readings and false support/complete",
+                source_required_contact_phase="UNKNOWN; no source engagement is inferred from actual force or hinge sign",
+                provenance="derived target execution evidence, not original observed source contacts",
+            )
         self.native_frames = []
         phase = self.cmd.reference_phase
         self.valid_steps_per_env = (
@@ -303,6 +325,15 @@ class NativeRolloutRecord(RolloutRecord):
             frame["contact"]["measurement_support"] = facts["measurement_support"][:, None].expand(
                 -1, len(self._contact_names)).detach().cpu().clone()
             frame["contact_sample_time_s"] = facts["sample_time_s"].detach().cpu().clone()
+        if self.contact_interval_metadata is not None:
+            interval = self._contact_interval_reader()
+            frame["contact_interval"] = {
+                key: torch.stack([interval["pairs"][name][key] for name in self._contact_names], -1).detach().cpu().clone()
+                for key in _CONTACT_ARRAYS if key != "measurement_support"
+            }
+            for key in ("measurement_support", "sample_recorded", "clock_support",
+                        "sample_begin_time_s", "sample_end_time_s", "interval_complete"):
+                frame["contact_interval"][key] = interval[key].detach().cpu().clone()
         self.native_frames.append(frame)
 
     def collect_state(self, active_mask=None):
@@ -327,6 +358,8 @@ class NativeRolloutRecord(RolloutRecord):
                 selected["contact_sample_time_s"] = frame["contact_sample_time_s"][select]
             if "physics_time_s" in frame:
                 selected["physics_time_s"] = frame["physics_time_s"][select]
+            if "contact_interval" in frame:
+                selected["contact_interval"] = {key: value[select] for key, value in frame["contact_interval"].items()}
         return state
 
     def rollout_arrays(self, states, env_index):
@@ -393,6 +426,11 @@ class NativeRolloutRecord(RolloutRecord):
                     for field in _CONTACT_ARRAYS:
                         result["hand_part_" + field] = np.stack([frame["contact"][field][row].numpy() for frame in frames])
                     result["hand_part_sample_time_s"] = np.array([float(frame["contact_sample_time_s"][row]) for frame in frames])
+                if self.contact_interval_metadata is not None:
+                    result["hand_part_interval_metadata_json"] = np.asarray(json.dumps(self.contact_interval_metadata))
+                    for field in _CONTACT_INTERVAL_ARRAYS:
+                        result["hand_part_interval_" + field] = np.stack([
+                            frame["contact_interval"][field][row].numpy() for frame in frames])
                 return result
             offset += size
         raise IndexError(env_index)

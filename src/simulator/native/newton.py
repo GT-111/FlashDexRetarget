@@ -50,6 +50,7 @@ class NewtonPlant(NativePlant):
         self.invalidate_contacts(env_ids)
 
     def advance(self):
+        self.prepare_contact_substep()
         sample_time = self.physics_time()
         result = self.backend.step_torch(self.control, nsteps=1)
         self._state = result.public_state
@@ -62,6 +63,7 @@ class NewtonPlant(NativePlant):
                 self.contact_facts[name][key].copy_(value)
         self.contact_support[:] = True
         self.contact_sample_time_s.copy_(sample_time)
+        self.record_contact_substep()
 
     def body_state(self, body_ids):
         return self.backend.get_body_state_w_torch(np.asarray(body_ids))

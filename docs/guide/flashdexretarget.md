@@ -185,6 +185,35 @@ reject signed-penetration requests. `NativeRolloutRecord` exports optional
 `native_contact_association_metadata_json` without turning unavailable pair
 forces into measured zero or original source contact labels.
 
+Native execution exposes two contact readouts. `hand_part_contact_facts()`
+retains the last solved physics sample and its substep-begin clock.
+`hand_part_contact_interval_facts()` retains every configured substep from the
+current manager control interval, with solver begin/end clocks, independent
+recording/measurement/clock support and named hand-subtree × object-part
+addresses. These discrete solved samples do not certify continuous force.
+
+The readouts borrow stopped views of fixed storage until the next control,
+state change or reset. Capacity comes from `decimation`. Reset or authored
+state installation discards affected rows; physical restore preserves its
+last-solve facts but does not invent an executed control interval. Starting a
+control discards its old interval before action or physics work, so an
+interrupted control cannot reuse earlier completed evidence. Unknown force
+remains distinct from measured zero contact.
+
+`NativeRolloutRecord` copies these samples into `hand_part_interval_*` arrays
+with explicit metadata. Existing last-solve fields retain their meaning.
+The native measurement callback reduces supported sample counts, duration
+quadrature and force-duration quadrature into the normal current-policy
+per-motion JSON. Its thresholds are configured in `eval/native.yaml`; it
+does not certify source-required engagement, a BOX phase or task success.
+The device tape is bounded by worlds, configured substeps and actual pairs;
+the optional full-trajectory CPU recorder still needs its own memory budget.
+
+Isaac net-link forces and SDF association leave exact pair-force intervals
+unavailable. Derived target-force evidence does not replace original
+ARCTIC/OakInk source-contact support. Source roles, missing spans, phase
+durations and full-horizon outcomes retain their separate source/task authority.
+
 ### Installed dynamics and gravity
 
 `entity.body_inertial_properties()` exposes named, stopped properties with an

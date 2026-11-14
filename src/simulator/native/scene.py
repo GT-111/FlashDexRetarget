@@ -156,6 +156,14 @@ class NativeSim:
         self._clock = _FreshnessClock()
         self._pending = None
 
+    def begin_control_step(self):
+        if self.plant.contact_interval is not None:
+            self.plant.contact_interval.begin()
+
+    def end_control_step(self):
+        if self.plant.contact_interval is not None:
+            self.plant.contact_interval.finish()
+
     def gravity_world_m_per_s2(self):
         """Constructor gravity of the executing, nonrandomized native recipe."""
         return self._gravity_world_m_per_s2
@@ -280,4 +288,14 @@ class NativeScene:
             "clock": "actual_solver_time_at_last_integrated_substep_begin",
             "normal_force_authority": "actual_solver_body_pair_positive_normal_force",
             "distance_authority": "force_bearing_actual_collider_max_absolute_separation",
+        }
+
+    def hand_part_contact_interval_facts(self):
+        if self.sim.plant.contact_interval is None:
+            return None
+        last = self.hand_part_contact_facts()
+        return {
+            **self.sim.plant.contact_interval.facts(), "addresses": last["addresses"],
+            "normal_force_authority": last["normal_force_authority"],
+            "distance_authority": last["distance_authority"],
         }

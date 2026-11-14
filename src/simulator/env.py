@@ -222,6 +222,7 @@ class ManagerBasedRlEnv:
         if not self.cfg.auto_reset and torch.any(self._manual_reset_pending):
             raise RuntimeError("pending manual resets before step()")
 
+        self.sim.begin_control_step()
         self.action_manager.process_action(action.to(self.device))
 
         for _ in range(self.cfg.decimation):
@@ -231,6 +232,7 @@ class ManagerBasedRlEnv:
             self.sim.step()
             self._bump_clock()
             self.scene.update(dt=self.physics_dt)
+        self.sim.end_control_step()
 
         self.episode_length_buf += 1
         self.common_step_counter += 1

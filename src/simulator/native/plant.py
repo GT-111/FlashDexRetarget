@@ -9,6 +9,8 @@ import numpy as np
 import torch
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
 
+from .contacts import ControlIntervalContacts
+
 
 def free_root_velocity_to_native(state_w):
     """FREE translation rates are WORLD, angular generalized rates are body-local."""
@@ -78,6 +80,7 @@ class NativePlant(ABC):
         self.model, self.num_envs = model, int(num_envs)
         self.device = str(device)
         self.contact_pairs = contact_pairs
+        self.contact_interval = None
         self.control = torch.zeros(self.num_envs, model.nu, device=device)
         self.contact_support = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
         self.contact_sample_time_s = torch.full((self.num_envs,), float("nan"), dtype=torch.float64, device=device)
@@ -90,7 +93,20 @@ class NativePlant(ABC):
             for name in contact_pairs
         }
 
+    def configure_control_interval(self, num_substeps):
+        self.contact_interval = ControlIntervalContacts(self, num_substeps)
+
+    def prepare_contact_substep(self):
+        if self.contact_interval is not None:
+            self.contact_interval.before_substep()
+
+    def record_contact_substep(self):
+        if self.contact_interval is not None:
+            self.contact_interval.append(self)
+
     def invalidate_contacts(self, rows):
+        if self.contact_interval is not None:
+            self.contact_interval.discard(rows)
         self.contact_support[rows] = False
         self.contact_sample_time_s[rows] = float("nan")
         for facts in self.contact_facts.values():
@@ -149,3 +165,7 @@ class NativePlant(ABC):
         for name, facts in snapshot.contact_facts.items():
             for key, value in facts.items():
                 self.contact_facts[name][key].copy_(value)
+        if self.contact_interval is not None:
+            # A restored last-solve sample remains truthful; it is not evidence
+            # that a new complete manager control interval has executed.
+            self.contact_interval.discard()

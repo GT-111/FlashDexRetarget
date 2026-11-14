@@ -78,6 +78,10 @@ class IsaacSceneAdapter:
         """Net-link forces and SDF association do not provide exact pair forces."""
         return None
 
+    def hand_part_contact_interval_facts(self):
+        """Exact pair-force intervals are unavailable from net-link/SDF views."""
+        return None
+
     @property
     def num_envs(self) -> int:
         return self._scene.cfg.num_envs

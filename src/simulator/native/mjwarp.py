@@ -81,6 +81,7 @@ class MjWarpPlant(NativePlant):
 
     def advance(self):
         with self._scope():
+            self.prepare_contact_substep()
             sample_time = self.physics_time()
             self._ctrl.copy_(self.control)
             self._mjw.step(self._model, self._data)
@@ -90,6 +91,7 @@ class MjWarpPlant(NativePlant):
             self._read_solved_contacts()
             self.contact_sample_time_s.copy_(sample_time)
             self.forward()
+            self.record_contact_substep()
 
     def _read_solved_contacts(self):
         self._mjw.contact_force(self._model, self._data, self._contact_ids, False, self._contact_forces)

@@ -38,6 +38,7 @@ def create_native_envs(cfg, device="cuda"):
         scene_xml_path=layout.scene_xml_path, num_envs=int(cfg.scene.num_envs),
         sim_dt=float(cfg.sim.dt), device=device, contact_pairs=pairs, **config,
     )
+    plant.configure_control_interval(int(cfg.decimation))
     sim = NativeSim(plant)
     scene = NativeScene(layout, meta, sim, cfg.robot.entity_name)
     env = ManagerBasedRlEnv(
