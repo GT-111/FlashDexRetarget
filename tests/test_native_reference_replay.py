@@ -239,7 +239,7 @@ def test_native_replay_rejects_another_entity_with_the_same_scalar_names():
         _replay_case(rigid=False, source_entity="other_robot")
 
 
-def test_native_profiles_declare_50hz_without_changing_author_clock():
+def test_native_profiles_declare_50hz_and_author_installs_240hz():
     from hydra import compose, initialize_config_dir
 
     config_dir = str(Path(__file__).resolve().parents[1] / "config")
@@ -251,4 +251,9 @@ def test_native_profiles_declare_50hz_without_changing_author_clock():
             assert float(cfg.sim.dt) == 0.005
             assert float(cfg.sim.dt) * int(cfg.decimation) == 0.02
         author = compose(config_name="flashdexretarget")
-        assert float(author.sim.dt) == 0.0041666667
+        author_dt = float(author.sim.dt)
+        # Match the pinned Isaac 5.1 setter/getter contract, not a rounded label.
+        installed_hz = int(1.0 / author_dt)
+        assert installed_hz == 240
+        assert 1.0 / installed_hz == author_dt
+        assert author_dt * int(author.decimation) == 1.0 / 60.0

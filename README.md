@@ -191,7 +191,7 @@ author-stack dependency list does not resolve or replace the native runtime.
 `requirements/native_cu128.txt` is a separate candidate constraint set. Actual
 installed engine versions and physical qualification come from the selected
 runtime receipt; that file does not establish them or authorize environment
-replacement. `scripts/setup.sh` continues to create the author Isaac environment.
+replacement. Setup selects the isolated author or native environment explicitly.
 
 ## Setup
 
@@ -208,8 +208,35 @@ cd FlashDexRetarget
 bash scripts/setup.sh
 ```
 
-One script builds the conda env `FlashDexRetarget` (pinned Isaac freeze, rsl_rl_flashsac), `scripts/env.sh`
-and the XHAND and Sharpa Wave USDs.
+The default `--profile isaac` builds the Python 3.11 conda environment
+`FlashDexRetarget`, the pinned author stack and `scripts/env.sh`. It converts the
+default XHand asset. Select stock robot configurations explicitly; the script
+does not maintain a second robot roster:
+
+```sh
+bash scripts/setup.sh --profile isaac \
+    --robot-config config/envs/robot/sharpa_bimanual.yaml
+# Repeat --robot-config for multiple stock assets, or use a resolved native run:
+bash scripts/setup.sh --profile isaac --native-scene-config /path/to/native-run.yaml
+```
+
+Direct MuJoCo Warp and Newton select the separate Python 3.12 environment
+`FlashDexRetargetNative` and its generated `env/native.sh`. They install the
+existing `requirements/native_cu128.txt` without installing, importing or
+converting Isaac assets. Newton also requires the operator's selected DexForge
+checkout and installs its public core/tracking packages with `--no-deps`:
+
+```sh
+bash scripts/setup.sh --profile mjwarp
+bash scripts/setup.sh --profile newton --dexforge-root /path/to/DexForge
+```
+
+`--env NAME` selects a different conda environment; setup checks its Python minor
+version before installation and regenerates that profile's activation file.
+Keep machine overrides in the calling shell. The native engine pins are candidate
+constraints, not a claim that a new environment or scene passed physical or
+learning qualification. Select a new or stopped environment; setup does not
+manage running jobs or protect an active environment from package replacement.
 
 Each stock robot config declares `sim.robot_asset`: the source URDF, destination
 USD and any MJCF-to-USD body-name mapping. Setup and runtime read that same
@@ -229,8 +256,11 @@ the stock robot binding. See [asset configuration](docs/guide/flashdexretarget.m
 for registering another asset and the collision-visual debug variant.
 
 > [!CAUTION]
-> `setup.sh` installs every package with `--no-deps`. Add packages to this env the same way
-> (`pip install --no-deps <pkg>`): a plain `pip install` pulls newer torch / warp and breaks Isaac Lab.
+> The author Isaac freeze and local Flash/SAC packages use `--no-deps`; a plain
+> `pip install` in that environment can replace its Torch/Warp stack. Native setup
+> resolves the separate pinned native requirements inside its own environment;
+> Flash/SAC and the selected DexForge packages still use `--no-deps` so the
+> author-only project metadata cannot pull Isaac into native.
 
 <details>
 <summary>Troubleshooting</summary>
@@ -292,7 +322,25 @@ MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget
     logger.wandb.run_name=my_run runner.agent.buffer_device_type=cpu
 ```
 
-`ROBOT=sharpa` (with its `sharpa/motion.pt`) trains the Sharpa Wave hand. The defaults live in `config/`
+Select another robot through the normal Hydra config, for example
+`envs/robot@robot=sharpa_bimanual` with its `sharpa/motion.pt`; no robot name is
+guessed from the motion path. Native profiles select the existing native task
+and configured plant, while all task/scene/asset parameters remain Hydra inputs:
+
+```sh
+MOTION=<prepared_dataset>/motion.pt bash scripts/train_flashdexretarget.sh \
+    --profile newton envs/robot@robot=inspire_rh56f1_bimanual \
+    native_recording_binding=/path/to/binding.json \
+    native_tracking_tolerances.root_position_error_m=0.03
+```
+
+Supply the complete native recording binding, scene/mesh environment variables
+and all declared tracking tolerances described above; the single tolerance shown
+here illustrates an override, not a complete runnable task recipe. Use
+`--profile mjwarp` for direct MuJoCo Warp and `--profile isaac` for the author
+environment (the default). `--profile isaac --config_name native` selects the
+same native task on Isaac; `--config_name` also accepts another registered run
+configuration. The defaults live in `config/`
 (learner: `config/runner/flashsac.yaml`). The policy is evaluated on every clip each 20M env steps, and
 all outputs share the configured `run_dir` (default `logs/flashsac/<run>/`).
 Set `run_dir=/absolute/node-local/path/new-run` for campaign placement; the entry

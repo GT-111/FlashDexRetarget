@@ -5,15 +5,18 @@ Setup is in the [README](../../README.md#setup); the data pipeline (release -> `
 
 ## Training
 
-`scripts/train_flashdexretarget.sh` sources `scripts/env.sh` and runs `train.py`. It takes the motion
-file and the robot as environment variables; every other option is a Hydra override passed as an argument.
+`scripts/train_flashdexretarget.sh` runs the existing `train.py` with the selected
+runtime's activation file. `MOTION` supplies the data; robot, scene and learner
+selection use ordinary Hydra overrides. Nonempty `ROBOT` is rejected with the
+replacement syntax, so an old Sharpa invocation cannot silently launch XHand.
 
 ```sh
 # XHAND, on a dataset prepared with scripts/retarget/<release>.sh
 MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget.sh
 
 # Sharpa Wave (clips retargeted to assets/robot/sharpa/bimanual.xml)
-ROBOT=sharpa MOTION=<output_dataset_path>/sharpa/motion.pt bash scripts/train_flashdexretarget.sh
+MOTION=<output_dataset_path>/sharpa/motion.pt bash scripts/train_flashdexretarget.sh \
+    envs/robot@robot=sharpa_bimanual
 
 # any config key, e.g. a run name, fewer envs, a smaller buffer, no wandb upload
 MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget.sh \
@@ -24,13 +27,16 @@ MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget
 
 ### Launcher
 
-| variable | default | meaning |
+| input | default | meaning |
 |---|---|---|
 | `MOTION` | – (required) | motion `.pt` to train on ([`kinematic_retargeting.md`](kinematic_retargeting.md)) |
-| `ROBOT` | `xhand` | `xhand` or `sharpa`: robot config and robot USD |
+| `--profile` | `isaac` | `isaac` activates `scripts/env.sh`; `mjwarp`/`newton` activate `env/native.sh` and select the native task and plant |
+| `--config_name` | profile default | existing run config; use `--profile isaac --config_name native` for the native Isaac task |
+| `envs/robot@robot` | run-config default | actual Hydra robot configuration and its asset bindings |
 
-The run is named `flashdexretarget-<dataset>-<robot>` and tagged `<dataset>`, `<robot>` in wandb, where
-`<dataset>` is the directory of `MOTION` (`<dataset>/motion.pt` or `<dataset>/<robot>/motion.pt`);
+The run is named `flashdexretarget-<directory>-<profile>` and tagged
+`<directory>`, `<profile>` in wandb, where `<directory>` is the immediate parent
+of `MOTION`;
 `logger.wandb.run_name=<name>` replaces it.
 
 ### Robot assets
@@ -295,7 +301,11 @@ its physical facts.
 
 The native profiles use 5 ms physics and four substeps per 20 ms control endpoint;
 the prepared carrier must match the actual clock. The stock Isaac author profile
-retains 1/240 s physics. Configure `n_future`, replay capacity, storage dtype and
+uses the full-precision reciprocal of 240 Hz. Isaac Sim 5.1 stores
+`int(1 / dt)` steps per second, so the old rounded `0.0041666667` literal
+requests 239 Hz. This source prediction does not establish an unrecorded
+historical runtime clock. Record the installed scene frequency and actual dt
+when qualifying physics. Configure `n_future`, replay capacity, storage dtype and
 device in `runner.agent` and admit memory for the resulting layout. Float16 replay
 quantizes stored factual observations; it does not quantize the integer phase,
 source clocks or library support. Reconstructed geometric values inherit that
