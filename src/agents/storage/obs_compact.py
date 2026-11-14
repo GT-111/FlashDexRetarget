@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
-from mjlab.utils.lab_api.math import matrix_from_quat, normalize, quat_apply_inverse, quat_from_matrix
+from mjlab.utils.lab_api.math import (
+    matrix_from_quat,
+    normalize,
+    quat_apply_inverse,
+    quat_from_matrix,
+)
 
 AUX_DIM = 2  # (motion_id, motion_step) per row, int32
 
@@ -22,6 +27,8 @@ class TermSpan:
     scale: torch.Tensor | None  # broadcastable over the term's columns
     clip: tuple[float, float] | None
     has_noise: bool
+    entity_name: str | None = None
+    joint_names: tuple[str, ...] | None = None  # actual column order of named Q/Qvel terms
 
 
 def flat_obs_layout(env: Any, group_order: list[str]) -> list[TermSpan]:
@@ -42,6 +49,13 @@ def flat_obs_layout(env: Any, group_order: list[str]) -> list[TermSpan]:
                 scale = torch.as_tensor(scale, dtype=torch.float32).reshape(-1)
                 if scale.numel() not in (1, n):
                     raise ValueError(f"obs term {name!r}: scale has {scale.numel()} entries for {n} columns.")
+            entity_name, joint_names = None, None
+            if name in ("robot_joint_pos", "robot_joint_vel"):
+                asset = cfg.params["asset_cfg"]
+                entity_name = asset.name
+                actual = env.scene[asset.name].joint_names
+                ids = asset.joint_ids
+                joint_names = tuple(actual[ids]) if isinstance(ids, slice) else tuple(actual[int(i)] for i in ids)
             spans.append(
                 TermSpan(
                     name=name,
@@ -52,6 +66,8 @@ def flat_obs_layout(env: Any, group_order: list[str]) -> list[TermSpan]:
                     scale=scale,
                     clip=None if cfg.clip is None else (float(cfg.clip[0]), float(cfg.clip[1])),
                     has_noise=cfg.noise is not None,
+                    entity_name=entity_name,
+                    joint_names=joint_names,
                 )
             )
             off += n
@@ -83,6 +99,14 @@ class ObsCompactor:
             "obj_keypoint_lin_vel_wrist",
         ),),
         "ref_future_mano_wrist_tips_traj_rel_wrist": (("robot_wrist_pose_w", "robot_tip_trans_wrist"),),
+        "native_future_reference": ((
+            "robot_wrist_pose_w",
+            "robot_wrist_lin_vel_w",
+            "robot_wrist_ang_vel_w",
+            "robot_joint_pos",
+            "robot_joint_vel",
+            "native_object_joint_state",
+        ),),
         # narrowed to what the listed components read by _recon_alternatives
         "ref_future_traj_wrist": ((
             "robot_wrist_pose_w",
@@ -159,6 +183,25 @@ class ObsCompactor:
                 scale = None if ssp.scale is None else ssp.scale.to(self._device)
                 self._src[s] = (cols.to(self._device), scale)
         self._recon_scale = [None if sp.scale is None else sp.scale.to(self._device) for sp in self._recon]
+        self._native_joint_columns: dict[str, torch.Tensor] = {}
+        if any(sp.name == "native_future_reference" for sp in self._recon):
+            for source in self.RECON_SOURCES["native_future_reference"][0]:
+                if by_name[source].clip is not None:
+                    raise ValueError(f"native replay cannot recover clipped {source} values")
+                scale = by_name[source].scale
+                if scale is not None and bool((scale == 0).any()):
+                    raise ValueError(f"native replay cannot recover zero-scaled {source} values")
+            commands = tuple(command.robot.joint_names[int(i)] for i in command.native_command_joint_ids)
+            for source in ("robot_joint_pos", "robot_joint_vel"):
+                span = by_name[source]
+                if span.entity_name is None or command._env.scene[span.entity_name] is not command.robot:
+                    raise ValueError(f"native replay {source} must observe the command's actual robot entity")
+                names = span.joint_names
+                if names is None or any(name not in names for name in commands):
+                    raise ValueError(f"native replay {source} is missing required named command columns")
+                self._native_joint_columns[source] = torch.tensor(
+                    [names.index(name) for name in commands], dtype=torch.long, device=self._device,
+                )
         self._builders: dict[str, Callable[..., torch.Tensor]] = {
             "obj_point_cloud_wrist": self._build_obj_point_cloud_wrist,
             "ref_future_obj_point_cloud_delta_wrist": self._build_future_obj_point_cloud_delta_wrist,
@@ -166,6 +209,7 @@ class ObsCompactor:
             "ref_future_obj_keypoint_traj_wrist": self._build_future_obj_keypoint_traj_wrist,
             "ref_future_mano_wrist_tips_traj_rel_wrist": self._build_future_mano_wrist_tips_traj_rel,
             "ref_future_traj_wrist": self._build_future_traj_rel,
+            "native_future_reference": self._build_native_future_reference,
         }
         names = [f"{sp.name}[{sp.end - sp.start}]" for sp in self._recon]
         print(f"[obs_compact] full {self._full_dim} -> compact {self._compact_dim} (+{AUX_DIM} int aux); rebuilt: {names}")
@@ -279,6 +323,32 @@ class ObsCompactor:
 
     def _offsets(self, n_future: int, max_future_steps: int) -> torch.Tensor:
         return torch.linspace(1.0, float(max_future_steps), n_future, device=self._device).round().long()
+
+    def _build_native_future_reference(self, compact, mid, step, n_future, stride):
+        from envs.observations.native import build_native_future_reference
+
+        sides = len(self._sides)
+        object_state = self._get(compact, "native_object_joint_state")
+        joints = object_state.shape[-1] // 2
+        object_position = object_state[:, :joints]
+        object_velocity = object_state[:, joints:]
+        return build_native_future_reference(
+            self._cmd.motion_lib,
+            mid,
+            step,
+            sides=self._sides,
+            wrist_pose=self._get(compact, "robot_wrist_pose_w").reshape(-1, sides, 7),
+            wrist_linear_velocity=self._get(compact, "robot_wrist_lin_vel_w").reshape(-1, sides, 3),
+            wrist_angular_velocity=self._get(compact, "robot_wrist_ang_vel_w").reshape(-1, sides, 3),
+            command_position=self._get(compact, "robot_joint_pos")[:, self._native_joint_columns["robot_joint_pos"]],
+            command_velocity=self._get(compact, "robot_joint_vel")[:, self._native_joint_columns["robot_joint_vel"]],
+            object_joint_position=object_position,
+            object_joint_velocity=object_velocity,
+            command_joint_ids=self._cmd.native_command_joint_ids,
+            object_joint_columns=self._cmd._object_joint_columns,
+            n_future=n_future,
+            stride=stride,
+        )
 
     def _surface_pts(self, side: str, mid: torch.Tensor, n_points: int, n_obj_verts: int) -> torch.Tensor:
         """(N, P, 3) object-local FPS keypoints for each row's active object (shared env cache)."""

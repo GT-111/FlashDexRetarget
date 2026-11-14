@@ -4,6 +4,9 @@ defaults:
   - _self_
 
 sim:
+  # Native prepared references use 50 Hz control with the task's four substeps.
+  # Keep the author's stock 1/240 s Isaac recipe in isaacsim.yaml unchanged.
+  dt: 0.005
   native_assets:
     static: ${oc.env:FDR_NATIVE_USD_DIR}/static.usd
     articulations:

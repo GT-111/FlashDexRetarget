@@ -168,6 +168,30 @@ snapshot. The new run writes `learning-restored.pt` and `learning-restore.json` 
 its actual restored RNG and curriculum state can be compared with the full checkpoint. Old replay
 files lacking the current fragment and learning state are not full learning resumes.
 
+The native task uses the same compact replay implementation. Only its future
+reference span is dropped; its factual base observations stay stored. The shared
+native future builder reconstructs that span from scene-local wrist p/WXYZ,
+WORLD linear/angular velocity, complete named hand Q/Qvel, object-joint Q/Qvel,
+and the stored `(motion_id, motion_step)`. The immutable library supplies actual
+native column correspondence, independent support and exact int64 query times.
+The physical world count and replay sample count may differ. Reconstruction
+does not consult live achieved state or replace a saved phase with the current
+command cursor. Existing final-observation and fragment-address handling applies.
+Resolved observation entity/joint columns select the native commands by their
+actual names. A different Q/Qvel column order is supported; missing required
+command columns, clipped reconstruction inputs or zero source scales cannot
+recover the factual input and are rejected. Q/Qvel must observe the command's
+actual robot entity; a different entity with matching scalar names cannot supply
+its physical facts.
+
+The native profiles use 5 ms physics and four substeps per 20 ms control endpoint;
+the prepared carrier must match the actual clock. The stock Isaac author profile
+retains 1/240 s physics. Configure `n_future`, replay capacity, storage dtype and
+device in `runner.agent` and admit memory for the resulting layout. Float16 replay
+quantizes stored factual observations; it does not quantize the integer phase,
+source clocks or library support. Reconstructed geometric values inherit that
+existing factual-storage precision rather than recovering discarded precision.
+
 ## Other algorithms
 
 The runner config picks the algorithm: `runner=flashsac` (the default). A new algorithm is

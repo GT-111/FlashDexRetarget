@@ -15,14 +15,16 @@ from .._common import action_term
 from .motion_tracking import MotionTrackingObs
 
 
-def _parts_in_wrist(command, states, support=None):
-    """Part p/R/v/omega relative to each actual physical wrist body."""
+def _parts_relative_to_wrist(
+    states, wrist_pose, wrist_linear_velocity, wrist_angular_velocity, support=None
+):
+    """Part p/R/v/omega in each wrist chart, with any common position origin."""
     result = []
-    for i in range(len(command._side_list)):
-        p = command.robot_wrist_trans_w[:, i, None]
-        q = command.robot_wrist_quat_w[:, i, None].expand(-1, states.shape[1], -1)
-        v = command.robot_wrist_lin_vel_w[:, i, None]
-        w = command.robot_wrist_ang_vel_w[:, i, None]
+    for i in range(wrist_pose.shape[1]):
+        p = wrist_pose[:, i, None, :3]
+        q = wrist_pose[:, i, None, 3:7].expand(-1, states.shape[1], -1)
+        v = wrist_linear_velocity[:, i, None]
+        w = wrist_angular_velocity[:, i, None]
         r = states[..., :3] - p
         local_q = quat_mul(quat_inv(q), states[..., 3:7])
         fields = [
@@ -44,6 +46,116 @@ def _parts_in_wrist(command, states, support=None):
             ]
         result.extend(fields)
     return torch.cat(result, -1)
+
+
+def _parts_in_wrist(command, states, support=None):
+    """Part state relative to the current physical wrist bodies."""
+    return _parts_relative_to_wrist(
+        states,
+        torch.cat((command.robot_wrist_trans_w, command.robot_wrist_quat_w), -1),
+        command.robot_wrist_lin_vel_w,
+        command.robot_wrist_ang_vel_w,
+        support,
+    )
+
+
+def build_native_future_reference(
+    motion_lib,
+    motion_ids,
+    motion_steps,
+    *,
+    sides,
+    wrist_pose,
+    wrist_linear_velocity,
+    wrist_angular_velocity,
+    command_position,
+    command_velocity,
+    object_joint_position,
+    object_joint_velocity,
+    command_joint_ids,
+    object_joint_columns,
+    n_future,
+    stride,
+):
+    """Build live or replay lookahead from factual state and immutable references.
+
+    Wrist positions and reference positions share the scene-local origin;
+    twists retain WORLD axes. Batch size comes from the supplied state, never
+    from live worlds. ``motion_steps`` is the observation's own command phase.
+    Native support, column permutations and int64 query clocks stay independent.
+    """
+    ml = motion_lib
+    offsets = torch.arange(1, n_future + 1, device=motion_steps.device) * stride
+    future_steps = motion_steps[:, None] + offsets
+    last = ml._motion_num_frames[motion_ids, None] - 1
+    valid = future_steps <= last
+    ids = ml.length_starts[motion_ids, None] + torch.minimum(future_steps, last)
+    current = ml.native_time_ns[ml.length_starts[motion_ids] + motion_steps]
+    rows = []
+    for k in range(n_future):
+        index = ids[:, k]
+        fields = []
+        for side_index, side in enumerate(sides):
+            target = ml.native_root_state_w[side][index]
+            pose = ml.native_root_pose_support[side][index]
+            linear = ml.native_root_linear_velocity_support[side][index] & pose
+            angular = ml.native_root_angular_velocity_support[side][index] & pose
+            values = (
+                target[:, :3] - wrist_pose[:, side_index, :3],
+                quat_box_minus(target[:, 3:7], wrist_pose[:, side_index, 3:7]),
+                target[:, 7:10] - wrist_linear_velocity[:, side_index],
+                target[:, 10:13] - wrist_angular_velocity[:, side_index],
+            )
+            fields.extend(
+                torch.where(mask[:, None], value, 0.0)
+                for mask, value in zip(
+                    (pose, pose, linear, angular), values, strict=True
+                )
+            )
+            fields.extend(mask[:, None].float() for mask in (pose, linear, angular))
+        for position, velocity, position_support, velocity_support, actual_q, actual_v in (
+            (
+                ml.robot_joint_pos[index][:, command_joint_ids],
+                ml.robot_joint_vel[index][:, command_joint_ids],
+                ml.native_joint_position_support[index][:, command_joint_ids],
+                ml.native_joint_velocity_support[index][:, command_joint_ids],
+                command_position,
+                command_velocity,
+            ),
+            (
+                ml.native_object_joint_pos[index][:, object_joint_columns],
+                ml.native_object_joint_vel[index][:, object_joint_columns],
+                ml.native_object_joint_position_support[index][:, object_joint_columns],
+                ml.native_object_joint_velocity_support[index][:, object_joint_columns],
+                object_joint_position,
+                object_joint_velocity,
+            ),
+        ):
+            fields.extend(
+                (
+                    torch.where(position_support, position - actual_q, 0.0),
+                    torch.where(velocity_support, velocity - actual_v, 0.0),
+                    position_support.float(),
+                    velocity_support.float(),
+                )
+            )
+        pose = ml.native_object_part_pose_support[index]
+        linear = ml.native_object_part_linear_velocity_support[index] & pose
+        angular = ml.native_object_part_angular_velocity_support[index] & pose
+        fields.append(
+            _parts_relative_to_wrist(
+                ml.native_object_part_state_w[index],
+                wrist_pose,
+                wrist_linear_velocity,
+                wrist_angular_velocity,
+                (pose, pose, linear, angular),
+            )
+        )
+        fields.extend(mask.float() for mask in (pose, linear, angular))
+        # Subtract exact clocks before converting to seconds, including nonzero origins.
+        fields.append(((ml.native_time_ns[index] - current).double() * 1e-9)[:, None].float())
+        rows.append(torch.where(valid[:, k, None], torch.cat(fields, -1), 0.0))
+    return torch.stack(rows, 1).flatten(1)
 
 
 class NativeMotionTrackingObs(MotionTrackingObs):
@@ -227,85 +339,26 @@ class NativeMotionTrackingObs(MotionTrackingObs):
         unknown; it does not acquire an invented source timestamp or velocity.
         """
         command = env.command_manager.get_term(command_name)
-        ml = command.motion_lib
-        offsets = torch.arange(1, n_future + 1, device=env.device) * stride
-        ids = command._future_motion_flat_ids(offsets)
-        valid = (
-            command.motion_steps[:, None] + offsets
-            <= command.motion_num_frames[:, None] - 1
+        return build_native_future_reference(
+            command.motion_lib,
+            command.motion_ids,
+            command.motion_steps,
+            sides=command._side_list,
+            wrist_pose=torch.cat(
+                (
+                    command.robot_wrist_trans_w - env.scene.env_origins[:, None],
+                    command.robot_wrist_quat_w,
+                ),
+                -1,
+            ),
+            wrist_linear_velocity=command.robot_wrist_lin_vel_w,
+            wrist_angular_velocity=command.robot_wrist_ang_vel_w,
+            command_position=command.robot.data.joint_pos[:, command.native_command_joint_ids],
+            command_velocity=command.robot.data.joint_vel[:, command.native_command_joint_ids],
+            object_joint_position=command.native_object_joint_pos,
+            object_joint_velocity=command.native_object_joint_vel,
+            command_joint_ids=command.native_command_joint_ids,
+            object_joint_columns=command._object_joint_columns,
+            n_future=n_future,
+            stride=stride,
         )
-        current = ml.native_time_ns[command._motion_flat_ids]
-        rows = []
-        for k in range(n_future):
-            index = ids[:, k]
-            fields = []
-            for side_index, side in enumerate(command._side_list):
-                target = ml.native_root_state_w[side][index]
-                pose = ml.native_root_pose_support[side][index]
-                linear = ml.native_root_linear_velocity_support[side][index] & pose
-                angular = ml.native_root_angular_velocity_support[side][index] & pose
-                position = (
-                    target[:, :3]
-                    + env.scene.env_origins
-                    - command.robot_wrist_trans_w[:, side_index]
-                )
-                values = (
-                    position,
-                    quat_box_minus(
-                        target[:, 3:7], command.robot_wrist_quat_w[:, side_index]
-                    ),
-                    target[:, 7:10] - command.robot_wrist_lin_vel_w[:, side_index],
-                    target[:, 10:13] - command.robot_wrist_ang_vel_w[:, side_index],
-                )
-                fields.extend(
-                    torch.where(mask[:, None], value, 0.0)
-                    for mask, value in zip(
-                        (pose, pose, linear, angular), values, strict=True
-                    )
-                )
-                fields.extend(mask[:, None].float() for mask in (pose, linear, angular))
-            for reference, position, velocity in (
-                (
-                    command.command_reference(index),
-                    command.robot.data.joint_pos[:, command.native_command_joint_ids],
-                    command.robot.data.joint_vel[:, command.native_command_joint_ids],
-                ),
-                (
-                    command.object_joint_reference(index),
-                    command.native_object_joint_pos,
-                    command.native_object_joint_vel,
-                ),
-            ):
-                fields.extend(
-                    (
-                        torch.where(
-                            reference["position_support"],
-                            reference["position"] - position,
-                            0.0,
-                        ),
-                        torch.where(
-                            reference["velocity_support"],
-                            reference["velocity"] - velocity,
-                            0.0,
-                        ),
-                        reference["position_support"].float(),
-                        reference["velocity_support"].float(),
-                    )
-                )
-            pose = ml.native_object_part_pose_support[index]
-            linear = ml.native_object_part_linear_velocity_support[index] & pose
-            angular = ml.native_object_part_angular_velocity_support[index] & pose
-            fields.append(
-                _parts_in_wrist(
-                    command,
-                    command.object_part_reference(index),
-                    (pose, pose, linear, angular),
-                )
-            )
-            fields.extend(mask.float() for mask in (pose, linear, angular))
-            fields.append(
-                ((ml.native_time_ns[index] - current).double() * 1e-9)[:, None].float()
-            )
-            row = torch.cat(fields, -1)
-            rows.append(torch.where(valid[:, k, None], row, 0.0))
-        return torch.stack(rows, 1).flatten(1)

@@ -11,7 +11,7 @@ defaults:
   - _self_
 
 num_envs: 2048
-decimation: 4
+decimation: 4  # all native engine profiles: 5 ms physics, 20 ms reference/control
 episode_length_s: 20.0
 
 # Native reference poses/rates are supplied explicitly; no object pinning,

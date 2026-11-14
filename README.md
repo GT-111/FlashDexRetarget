@@ -132,6 +132,26 @@ direct MuJoCo Warp loads the authored MJCF itself. Newton's selected
 not two independent dynamics solvers. The default Newton contact route is
 MuJoCo; original-triangle BVH requires an explicit `collision_generation` recipe.
 
+All three native engine profiles declare 5 ms physics and four substeps per
+20 ms control endpoint. The prepared carrier must match that actual cadence;
+the command rejects a different reference grid. The stock author Isaac profile
+keeps its 1/240 s physics recipe.
+
+Native replay keeps `runner.agent.buffer_compact_obs=true`. Its future window
+is reconstructed by the same observation builder used during collection, from
+stored wrist pose/twist, complete named hand Q/Qvel, object-joint Q/Qvel and
+the row's independent int32 motion/phase address. Sampling does not read current
+live worlds. Original int64 reference clocks, support and missing tails retain
+their authority. Resolved entity and joint names route Q/Qvel columns into the
+native command order; their stored column order may differ. Required named
+columns must be present and observe the command's actual robot entity.
+Reconstruction sources must remain unclipped with nonzero scales. Network
+widths still follow the actual observation space.
+Choose replay capacity and placement from the resolved storage layout: storing
+the raw native F1/BOX K10 future window at 50 million float16 rows alone would
+require 149 GB, before the other replay fields. Do not disable compaction to
+bypass a missing reconstruction route.
+
 Backend dimensions and actuator/body/site ordering come from the compiled
 scene. FREE-root wrench drives remain separate from independent finger
 commands; object roots and hinges stay passive. Both ports retain achieved
