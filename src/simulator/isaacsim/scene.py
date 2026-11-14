@@ -9,7 +9,6 @@ from pathlib import Path
 import isaaclab.sim as sim_utils
 import numpy as np
 import torch
-import trimesh
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
@@ -18,7 +17,7 @@ from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from envs.scene._object_setup import object_park_position
 from envs.scene.native import NativeSceneCfg
 from simulator.mjcf_meta import RobotMjcfMeta
-from simulator.native.entity import NativeRobotAdapter, _FreshnessClock, _ObjIndexing
+from simulator.native.entity import NativeRobotAdapter, _FreshnessClock
 
 from .assets import IsaacRobotAsset, resolve_robot_asset
 from .convert_assets import colvis_enabled
@@ -28,7 +27,7 @@ from .entity import (
     RigidObjectAdapter,
 )
 from .sensors import build_tracking_contact_views
-from .sim import IsaacSimAdapter, principal_inertia
+from .sim import IsaacSimAdapter
 
 
 def _abl(name: str) -> bool:
@@ -609,7 +608,7 @@ def build_isaac_scene(
         robot, meta, clock, device, body_name_map=robot_asset.body_name_map
     )
     # 0.0 matches every run before the fix (resets cleared it); 0.8 is the MJCF gravcomp.
-    robot_adapter.init_gravcomp(float(cfg.sim.get("robot_gravcomp", 0.0)))
+    sim_adapter.add_gravity_compensator(robot_adapter, float(cfg.sim.get("robot_gravcomp", 0.0)))
 
     scene_adapter = IsaacSceneAdapter(scene, device)
     scene_adapter._clock = clock
@@ -617,77 +616,36 @@ def build_isaac_scene(
     for name in support_views:
         scene_adapter.entities[name] = SupportDiskAdapter(objects[name], device)
 
-    # Per-slot mass properties from the COACD hulls (mjwarp compile parity);
-    # written into PhysX below so pin feedforward == true sim inertia.
+    # Optional hull-derived INSTALLATION recipe. Execution/control consumers
+    # below read the installed PhysX properties, including the default USD path.
     from pathlib import Path as _P
 
     from .sim import hull_mass_props
 
     hull_mass, hull_com, hull_I = {s: [] for s in obj_sides}, {s: [] for s in obj_sides}, {s: [] for s in obj_sides}
-    gids = {s: [] for s in obj_sides}
-    for _si, spec in enumerate(object_slots):
-        for side in _slot_sides(spec):
-            _side_slot[(_si, side)] = len(gids[side])
-            m, c, I = hull_mass_props(
-                _P(_slot_val(spec, "mesh_path", side)).parent,
-                _slot_val(spec, "scale", side) if "scale" in spec else 1.0,
-                800.0,
-            )
-            # Measured mass wins over the density estimate, clamp included.
-            _tgt = float(_slot_val(spec, "mass", side)) if "mass" in spec else 0.0
-            if _tgt > 0.0 and m > 0.0:
-                I, m = I * (_tgt / m), _tgt
-            hull_mass[side].append(m)
-            hull_com[side].append(c)
-            hull_I[side].append(I)
-            evals, evecs = np.linalg.eigh(I)
-            if np.linalg.det(evecs) < 0:
-                evecs[:, 0] = -evecs[:, 0]
-            import trimesh.transformations as _tt
-
-            T = np.eye(4)
-            T[:3, :3] = evecs
-            gids[side].append(
-                sim_adapter.model.register_body(
-                    m, np.maximum(evals, 1e-7), _tt.quaternion_from_matrix(T)
+    _hull_props = os.environ.get("FDR_HULL_PROPS", "0") == "1"
+    if _hull_props:
+        for _si, spec in enumerate(object_slots):
+            for side in _slot_sides(spec):
+                _side_slot[(_si, side)] = len(hull_mass[side])
+                m, c, I = hull_mass_props(
+                    _P(_slot_val(spec, "mesh_path", side)).parent,
+                    _slot_val(spec, "scale", side) if "scale" in spec else 1.0,
+                    800.0,
                 )
-            )
-    import os as _os0
-
-    if _os0.environ.get("FDR_HULL_PROPS", "0") == "1":
-        scene_adapter.obj_inertia_stack = {
-            s: torch.tensor(np.stack(hull_I[s]), dtype=torch.float32, device=device)
-            for s in obj_sides
-        }  # side -> (S, 3, 3)
-    else:
-        # USD-authored (visual-mesh) inertia — what PhysX actually simulates.
-        from mjlab.utils.lab_api.math import matrix_from_quat as _mfq
-
-        stacks = {}
-        for side in obj_sides:
-            mats = []
-            for spec in object_slots:
-                mesh = trimesh.load(_slot_val(spec, "mesh_path", side), force="mesh")
-                scale = _slot_val(spec, "scale", side) if "scale" in spec else 1.0
-                if scale != 1.0:
-                    mesh = mesh.copy()
-                    mesh.apply_scale(float(scale))
-                _m, _diag, _iq = principal_inertia(mesh, density=800.0)
-                _t = float(_slot_val(spec, "mass", side)) if "mass" in spec else 0.0
-                if _t > 0.0 and _m > 0.0:
-                    _diag = _diag * (_t / _m)
-                R = _mfq(torch.tensor(_iq, dtype=torch.float32).unsqueeze(0))[0]
-                mats.append(
-                    R @ torch.diag(torch.tensor(_diag, dtype=torch.float32)) @ R.T
-                )
-            stacks[side] = torch.stack(mats).to(device)
-        scene_adapter.obj_inertia_stack = stacks
+                # Measured mass wins over the density estimate, clamp included.
+                _tgt = float(_slot_val(spec, "mass", side)) if "mass" in spec else 0.0
+                if _tgt > 0.0 and m > 0.0:
+                    I, m = I * (_tgt / m), _tgt
+                hull_mass[side].append(m)
+                hull_com[side].append(c)
+                hull_I[side].append(I)
 
     def _write_hull_props(view, slot_of_row: np.ndarray, side: str) -> None:
         """Overwrite PhysX mass/com/inertia with the hull-parity values (CPU)."""
         n = len(slot_of_row)
         view.set_masses(
-            torch.tensor([hull_mass[side][s] for s in slot_of_row]), torch.arange(n)
+            torch.tensor([hull_mass[side][s] for s in slot_of_row]).reshape(n, 1), torch.arange(n)
         )
         coms = view.get_coms().clone().reshape(n, 7)
         coms[:, :3] = torch.tensor(
@@ -696,15 +654,12 @@ def build_isaac_scene(
         view.set_coms(coms.reshape(*view.get_coms().shape), torch.arange(n))
         view.set_inertias(
             torch.tensor(
-                np.stack([hull_I[side][s].reshape(9) for s in slot_of_row]),
+                np.stack([hull_I[side][s].T.reshape(9) for s in slot_of_row]),
                 dtype=torch.float32,
             ),
             torch.arange(n),
         )
 
-    import os as _os
-
-    _hull_props = _os.environ.get("FDR_HULL_PROPS", "0") == "1"
     if per_env_mode:
         scene_adapter.assigned_obj_slot = assigned_obj_slot.to(device)
         for side in obj_sides:
@@ -721,14 +676,15 @@ def build_isaac_scene(
             )
             default_state[:, 3] = 1.0
             scene_adapter.entities[name] = RigidObjectAdapter(
-                objects[name], gids[side][0], clock, device, default_state
+                objects[name], clock, device, default_state,
+                body_name=objects[name].body_names[0],
             )
     else:
         for slot_idx, spec in enumerate(object_slots):
             if _hull_props:
                 _write_hull_props(
                     objects[spec["entity_name"]].root_physx_view,
-                    np.full(num_envs, slot_idx),
+                    np.full(num_envs, _side_slot[(slot_idx, _slot_sides(spec)[0])]),
                     _slot_sides(spec)[0],
                 )
             park = object_park_position(slot_idx)
@@ -739,9 +695,9 @@ def build_isaac_scene(
             default_state[:, 3] = 1.0
             scene_adapter.entities[spec["entity_name"]] = RigidObjectAdapter(
                 objects[spec["entity_name"]],
-                gids[_slot_sides(spec)[0]][_side_slot[(slot_idx, _slot_sides(spec)[0])]],
                 clock, device,
                 default_state,
+                body_name=objects[spec["entity_name"]].body_names[0],
             )
 
     # Scene-owned views bind after complete command/reference construction.
@@ -881,7 +837,6 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     scene.update(0.0)
     clock = _FreshnessClock()
     sim = IsaacSimAdapter(sim_ctx, device, render=not bool(cfg.get("headless", True)))
-    sim.model.opt.gravity = scene_meta.gravity.copy()
     sim._clock = clock
     adapter = IsaacSceneAdapter(scene, device)
     adapter._clock = clock
@@ -890,17 +845,11 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     for binding in layout.articulations:
         meta = metadata[binding.entity_name]
         asset = assets[binding.entity_name]
-        ids = [
-            sim.model.register_body(m, inertia, q)
-            for m, inertia, q in zip(
-                meta.body_mass, meta.body_inertia, meta.body_iquat, strict=True
-            )
-        ]
         if binding.entity_name in rigid:
             default = torch.zeros(asset.num_instances, 13, device=device)
             default[:, :7] = torch.as_tensor(meta.free_roots[0].default_pose, device=device)
             ent = RigidObjectAdapter(
-                asset, ids[0], clock, device, default, body_name=binding.root_body_name,
+                asset, clock, device, default, body_name=binding.root_body_name,
             )
             adapter.entities[binding.entity_name] = ent
             continue
@@ -927,8 +876,6 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         asset.write_joint_friction_coefficient_to_sim(
             torch.as_tensor(meta.joint_frictionloss, device=device), **scalar
         )
-        ent.indexing = _ObjIndexing(torch.tensor(ids, dtype=torch.long, device=device))
-        ent.data.indexing = ent.indexing
         adapter.entities[binding.entity_name] = ent
         if binding in layout.hands:
             hands[binding.side] = ent

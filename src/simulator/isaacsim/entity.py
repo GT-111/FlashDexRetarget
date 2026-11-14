@@ -15,11 +15,11 @@ from mjlab.utils.lab_api.math import (
 from simulator.mjcf_meta import RobotMjcfMeta, site_table
 from simulator.native.entity import (
     ArticulationData,
+    BodyInertialProperties,
     FloatingRootView,
     NamedArticulationView,
     _Cached,
     _FreshnessClock,
-    _ObjIndexing,
 )
 
 if TYPE_CHECKING:
@@ -28,6 +28,18 @@ if TYPE_CHECKING:
 
 def _xyzw_to_wxyz(q: torch.Tensor) -> torch.Tensor:
     return q[..., [3, 0, 1, 2]]
+
+
+def _installed_body_properties(view, body_names, body_ids, count, device):
+    """Read post-install PhysX values once; tensor inertia is body-frame already."""
+    mass = view.get_masses().reshape(count, -1).to(device)[:, body_ids]
+    com = view.get_coms().reshape(count, -1, 7).to(device)[:, body_ids, :3]
+    # PhysX stores the nine body-frame inertia entries in column-major order.
+    inertia = view.get_inertias().reshape(count, -1, 3, 3).transpose(-1, -2)
+    inertia = inertia.to(device)[:, body_ids]
+    return BodyInertialProperties(
+        tuple(body_names), mass.detach().clone(), com.detach().clone(), inertia.detach().clone(),
+    )
 
 
 class ArticulationAdapter(NamedArticulationView):
@@ -85,12 +97,10 @@ class ArticulationAdapter(NamedArticulationView):
         self._default_joint_pos = torch.zeros(B, self.num_joints, device=device)
         self._default_joint_vel = torch.zeros(B, self.num_joints, device=device)
 
-        # link-frame <- com offset (constant, physx link com in link frame)
-        view = articulation.root_physx_view
-        coms = view.get_coms()  # (B, nl, 7) or (B*nl, 7) depending on backend
-        coms = coms.reshape(B, -1, 7)[..., :3].to(device)
-        self._com_local = coms  # (B, nl, 3), isaac link order
-        self._gravcomp_full: torch.Tensor | None = None  # (B, nl, 3) world +z m*g per link
+        self._body_properties = _installed_body_properties(
+            articulation.root_physx_view, self.body_names, self._isaac_body_ids, B, device,
+        )
+        self._gravcomp_full: torch.Tensor | None = None  # named WORLD force at link COM
         self._gravcomp_scale = 0.0
 
         # A standalone MJCF spec factory so the command's CPU-FK reference
@@ -108,6 +118,10 @@ class ArticulationAdapter(NamedArticulationView):
     # ── name/index resolution (mjlab API) ──────────────────────────────────
 
     # ── raw fetches (freshness-cached) ─────────────────────────────────────
+
+    def body_inertial_properties(self):
+        """Installed fixed-recipe snapshot in the same order as body state."""
+        return self._body_properties
 
     def _joint_pos(self) -> torch.Tensor:
         def fetch():
@@ -143,21 +157,14 @@ class ArticulationAdapter(NamedArticulationView):
             return v.reshape(self._art.num_instances, -1, 6).to(self.device)
 
         v = self._cache.get("link_vel", fetch_vel)
-        tf = self._cache.get(
-            "link_tf",
-            lambda: self._art.root_physx_view.get_link_transforms()
-            .reshape(self._art.num_instances, -1, 7)
-            .to(self.device),
-        )
         # physx: linear velocity reported at link COM; shift to link origin.
-        quat_all = _xyzw_to_wxyz(tf[..., 3:7])
-        r_com = quat_apply(quat_all, self._com_local)  # link->world com offset
+        _, quat = self._body_pose()
+        r_com = quat_apply(quat, self._body_properties.com_position_body_m)
+        v = v[:, self._isaac_body_ids]
         lin_com = v[..., 0:3]
         ang = v[..., 3:6]
         lin_link = lin_com + torch.cross(ang, -r_com, dim=-1)
-        lin = lin_link[:, self._isaac_body_ids]
-        ang = ang[:, self._isaac_body_ids]
-        return lin, ang
+        return lin_link, ang
 
     # ── writes (mjlab API) ─────────────────────────────────────────────────
 
@@ -207,19 +214,22 @@ class ArticulationAdapter(NamedArticulationView):
         if self._gravcomp_full is not None:
             self._write_gravcomp()
 
-    def init_gravcomp(self, scale: float) -> None:
+    def init_gravcomp(self, scale: float, gravity_world_m_per_s2) -> None:
         """Per-link world-frame m*g lift at the COM, kept through resets (MJCF gravcomp)."""
-        masses = self._art.root_physx_view.get_masses().to(self.device)
-        masses = masses.reshape(self._art.num_instances, -1)
-        self._gravcomp_full = torch.zeros(*masses.shape, 3, device=self.device)
-        self._gravcomp_full[..., 2] = 9.81 * masses
         self._gravcomp_scale = float(scale)
+        self.update_gravcomp_gravity(gravity_world_m_per_s2)
+
+    def update_gravcomp_gravity(self, gravity_world_m_per_s2) -> None:
+        mass = self._body_properties.mass_kg
+        self._gravcomp_full = -mass[..., None] * mass.new_tensor(gravity_world_m_per_s2)
         self._write_gravcomp()
 
     def _write_gravcomp(self) -> None:
         # Always the full buffer: Isaac Lab derives has_external_wrench from the written slice only.
         f = self._gravcomp_full * self._gravcomp_scale
-        self._art.set_external_force_and_torque(f, torch.zeros_like(f), is_global=True)
+        self._art.set_external_force_and_torque(
+            f, torch.zeros_like(f), body_ids=self._isaac_body_ids.tolist(), is_global=True,
+        )
 
 
 class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
@@ -248,14 +258,6 @@ class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
         self._default_joint_pos[:] = torch.as_tensor(
             meta.joint_default, dtype=torch.float32, device=device
         )
-        self._mass = torch.as_tensor(meta.body_mass, dtype=torch.float32, device=device)
-        self._inertia = torch.as_tensor(
-            meta.body_inertia, dtype=torch.float32, device=device
-        )
-        self._inertia_quat = torch.as_tensor(
-            meta.body_iquat, dtype=torch.float32, device=device
-        )
-        self._ipos = torch.as_tensor(meta.body_ipos, dtype=torch.float32, device=device)
 
     def write_root_state_to_sim(self, root_state, env_ids=None) -> None:
         self._art.write_root_link_state_to_sim(root_state, env_ids=env_ids)
@@ -285,7 +287,6 @@ class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
 class RigidObjectData:
     def __init__(self, adapter: "RigidObjectAdapter") -> None:
         self._a = adapter
-        self.indexing = adapter.indexing
 
     @property
     def default_root_state(self) -> torch.Tensor:
@@ -324,31 +325,34 @@ class RigidObjectAdapter:
     def __init__(
         self,
         obj: "RigidObject",
-        global_body_id: int,
         clock: _FreshnessClock,
         device: str,
         default_root_state: torch.Tensor,
         *,
-        body_name: str | None = None,
+        body_name: str,
     ) -> None:
         self._obj = obj
         self._clock = clock
         self._cache = _Cached(clock)
         self.device = device
-        self.indexing = _ObjIndexing(
-            torch.tensor([global_body_id], dtype=torch.long, device=device)
-        )
         self._default_root_state = default_root_state  # (B, 13)
-        if body_name is not None:
-            self.body_names = [body_name]
-            self.joint_names = ()  # A physical rigid object has no scalar joints.
+        if list(obj.body_names) != [body_name]:
+            raise ValueError("rigid adapter requires its actual single named body")
+        self.body_names = [body_name]
+        self.root_body_name = body_name
+        self.joint_names = ()  # A physical rigid object has no scalar joints.
         view = obj.root_physx_view
-        com = view.get_coms().reshape(obj.num_instances, -1)[:, :3].to(device)
-        self._com_local = com  # (B, 3)
+        self._body_properties = _installed_body_properties(
+            view, self.body_names, [0], obj.num_instances, device,
+        )
+        self._com_local = self._body_properties.com_position_body_m[:, 0]
         self.data = RigidObjectData(self)
         # world-frame external wrench support probe (isaaclab >= is_global)
         sig = inspect.signature(obj.set_external_force_and_torque)
         self._has_is_global = "is_global" in sig.parameters
+
+    def body_inertial_properties(self):
+        return self._body_properties
 
     def _pose(self):
         def fetch():
@@ -402,6 +406,11 @@ class RigidObjectAdapter:
 
         if _os.environ.get("FDR_PIN_AT_COM", "0") == "1":
             com = self._com_local if env_ids is None else self._com_local[env_ids]
+            if self._has_is_global:
+                link_pos, quat = self._pose()
+                if env_ids is not None:
+                    link_pos, quat = link_pos[env_ids], quat[env_ids]
+                com = link_pos + quat_apply(quat, com)
             pos = com.reshape(-1, 1, 3)
         else:
             pos = None

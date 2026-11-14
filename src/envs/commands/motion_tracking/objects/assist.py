@@ -26,7 +26,6 @@ class ObjectAssistMixin:
         self._xfrc_force_range: float | None = None
         # Assist curriculum controller (set by xfrc_curriculum_adaptive).
         self._xfrc_curr_ctrl = None
-        self._obj_I_body_cache: dict[str, torch.Tensor] = {}
 
     def apply_substep(self) -> None:
         """Per-physics-substep hook (mjlab_ext._env): re-evaluate the assist PD."""
@@ -105,8 +104,6 @@ class ObjectAssistMixin:
 
                     # Both paths map an angular acceleration to torque via I_world.
                     I_body = self._obj_inertia_body(side).to(dtype=sim_quat.dtype)
-                    if I_body.dim() == 3:  # multi-object: (S, 3, 3) → (B, 3, 3)
-                        I_body = I_body[self.active_obj_slot(side)]
                     R_sim = matrix_from_quat(sim_quat)  # (B, 3, 3)
                     I_world = R_sim @ I_body @ R_sim.transpose(-1, -2)  # (B, 3, 3)
 
@@ -217,47 +214,11 @@ class ObjectAssistMixin:
         return force, torque
 
     def _obj_inertia_body(self, side: str) -> torch.Tensor:
-        cached = self._obj_I_body_cache.get(side)
-        if cached is not None:
-            return cached
-        mats = []
-        for name in self.obj_entity_names(side):
-            obj: Entity = self._env.scene[name]
-            body_id = int(obj.indexing.body_ids[0])
-            I_diag_p = self._env.sim.model.body_inertia[0, body_id].to(
-                self.device, dtype=torch.float32
-            )  # (3,) principal-frame diagonal
-            iquat = self._env.sim.model.body_iquat[0, body_id].to(
-                self.device, dtype=torch.float32
-            )  # (4,) principal→body
-            R_ip = matrix_from_quat(iquat.unsqueeze(0))[0]  # (3, 3)
-            mats.append(R_ip @ torch.diag(I_diag_p) @ R_ip.T)
-        out = mats[0] if len(mats) == 1 else torch.stack(mats)
-        self._obj_I_body_cache[side] = out
-        return out
+        """Selected installed COM inertia in each actual object's body frame."""
+        return self._obj_inertial_property(side, "inertia_com_body_kg_m2")
 
     def _obj_mass_env(self, side: str) -> torch.Tensor:
-        cache = getattr(self, "_perturb_mass_cache", None)
-        if cache is None:
-            cache = {}
-            self._perturb_mass_cache = cache
-        m = cache.get(side)
-        if m is None:
-            tables = getattr(self, "_swap_tables", None)
-            if tables is not None and "bmass" in tables:
-                m = tables["bmass"].to(self.device, dtype=torch.float32)
-            else:
-                vals = []
-                for name in self.obj_entity_names(side):
-                    obj: Entity = self._env.scene[name]
-                    bid = int(obj.indexing.body_ids[0])
-                    # Batched (1, nbody) table on both backends; isaac has no mj_model.
-                    vals.append(float(self._env.sim.model.body_mass[0, bid]))
-                m = torch.tensor(vals, device=self.device)
-            cache[side] = m
-        if m.numel() == 1:
-            return m.expand(self._env.num_envs)
-        return m[self.active_obj_slot(side)]
+        return self._obj_inertial_property(side, "mass_kg")
 
     def _perturb_gate_flat(self, side: str) -> torch.Tensor:
         """(F_total,) frames with the reference object lifted, eroded by gate_lag_s."""

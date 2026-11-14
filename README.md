@@ -176,6 +176,11 @@ solver times retain their own fields and reset origin, independently of the
 original source clock and nominal control elapsed time. Unmeasured reset contact
 samples stay unsupported. The
 author's Isaac net-force/SDF observation views retain their own meaning.
+Named installed mass, COM and body-frame inertia feed the shared root and
+object-control owners. Isaac gravity uses its real scene-global API; native
+MjWarp/Newton currently admit constant constructor gravity only. See
+[installed dynamics and gravity](docs/guide/flashdexretarget.md#installed-dynamics-and-gravity)
+for property frames, assistance selection and qualification limits.
 Configuration, software checks and an import alone do not qualify either port's
 physical tracking or task success. Each actual scene/backend needs the declared
 two-world native step, reset, contact, snapshot and SAC/replay continuation gates.

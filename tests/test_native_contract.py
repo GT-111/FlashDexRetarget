@@ -296,7 +296,9 @@ def test_native_free_root_wrench_is_root_only_and_recomputed_from_current_body_s
     transforms[:, 1:, 1] = 0.02
     calls = []
     view = SimpleNamespace(
+        get_masses=lambda: torch.as_tensor(meta.body_mass).float().unsqueeze(0),
         get_coms=lambda: torch.zeros_like(transforms),
+        get_inertias=lambda: torch.diag_embed(torch.as_tensor(meta.body_inertia).float()).reshape(1, len(meta.body_names), 9),
         get_link_transforms=lambda: transforms,
         get_link_velocities=lambda: torch.zeros(1, len(meta.body_names), 6),
     )

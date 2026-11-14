@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from mjlab.utils.lab_api.math import (
     matrix_from_quat,
@@ -11,6 +13,20 @@ from mjlab.utils.lab_api.math import (
 )
 
 from envs.scene.native import NativeRootControlCfg
+
+
+@dataclass(frozen=True)
+class BodyInertialProperties:
+    """Stopped installed dynamics in named body order, retaining every world.
+
+    Inertia is about each body's COM, expressed in its body frame, not its
+    principal frame. COM positions are relative to the body link origin.
+    """
+
+    body_names: tuple[str, ...]
+    mass_kg: torch.Tensor  # (world, body)
+    com_position_body_m: torch.Tensor  # (world, body, 3)
+    inertia_com_body_kg_m2: torch.Tensor  # (world, body, 3, 3)
 
 
 class _FreshnessClock:
@@ -212,20 +228,22 @@ class FloatingRootView:
         angular_acceleration = control.rotation_stiffness * quat_box_minus(
             target[:, 3:7], current[:, 3:7]
         ) + control.rotation_damping * (target[:, 10:13] - current[:, 10:13])
-        body_com = pos + quat_apply(quat, self._ipos.expand_as(pos))
-        total_mass = self._mass.sum()
-        center = (body_com * self._mass[None, :, None]).sum(1) / total_mass
+        properties = self.body_inertial_properties()
+        mass = properties.mass_kg
+        body_com = pos + quat_apply(quat, properties.com_position_body_m)
+        total_mass = mass.sum(1, keepdim=True)
+        center = (body_com * mass[..., None]).sum(1) / total_mass
         r = body_com - center[:, None]
-        rotation = matrix_from_quat(quat_mul(quat, self._inertia_quat.expand_as(quat)))
+        rotation = matrix_from_quat(quat)
         inertia = (
-            rotation @ torch.diag_embed(self._inertia) @ rotation.transpose(-1, -2)
+            rotation @ properties.inertia_com_body_kg_m2 @ rotation.transpose(-1, -2)
         )
         eye = torch.eye(3, device=self.device, dtype=pos.dtype)
         parallel = (
             r.square().sum(-1)[..., None, None] * eye
             - r[..., :, None] * r[..., None, :]
         )
-        inertia = (inertia + self._mass[None, :, None, None] * parallel).sum(1)
+        inertia = (inertia + mass[..., None, None] * parallel).sum(1)
         force = torch.where(support[:, None], total_mass * acceleration, 0.0)
         torque = torch.where(
             support[:, None],
@@ -357,11 +375,3 @@ class NativeRobotAdapter(NamedArticulationView):
         for part in self._parts:
             part.reset(env_ids)
         self._clock.bump()
-
-
-# ─── Object (single free rigid body) ─────────────────────────────────────────
-
-
-class _ObjIndexing:
-    def __init__(self, body_ids: torch.Tensor) -> None:
-        self.body_ids = body_ids

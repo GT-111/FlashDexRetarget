@@ -71,25 +71,6 @@ class IsaacMotionTrackingCommand(MotionTrackingCommand):
         finally:
             self._eval_mode = prev
 
-    def _obj_inertia_body(self, side: str) -> torch.Tensor:
-        """Per-slot inertia stack (S, 3, 3) for the xfrc pin; the single model
-        row can't describe per-env heterogeneous objects."""
-        stack = getattr(self._env.scene, "obj_inertia_stack", None)
-        if stack is not None and getattr(
-            self._env.scene, "assigned_obj_slot", None
-        ) is not None:
-            if not isinstance(stack, dict):
-                return stack
-            if side not in stack:
-                # shared-object pt: only one side was spawned, the other aliases its entity
-                names = self.cfg.object.entity_names
-                for s2 in stack:
-                    if names.get(s2) == names.get(side):
-                        return stack[s2]
-            return stack[side]
-        return super()._obj_inertia_body(side)
-
-
 @dataclass(kw_only=True)
 class IsaacMotionTrackingCommandCfg(MotionTrackingCommandCfg):
     def build(self, env) -> IsaacMotionTrackingCommand:

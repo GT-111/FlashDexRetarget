@@ -162,7 +162,9 @@ def test_articulation_joins_configured_bodies_and_permuted_joints(
     transforms[0, :, 0] = torch.arange(len(body_names)) + 4
     q = torch.tensor([[0.7, 0.2]])
     view = SimpleNamespace(
+        get_masses=lambda: torch.ones(1, len(body_names)),
         get_coms=lambda: torch.zeros_like(transforms),
+        get_inertias=lambda: torch.eye(3).reshape(1, 1, 9).expand(1, len(body_names), 9),
         get_link_transforms=lambda: transforms,
         get_dof_positions=lambda: q,
     )

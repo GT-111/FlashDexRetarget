@@ -164,6 +164,36 @@ reject signed-penetration requests. `NativeRolloutRecord` exports optional
 `native_contact_association_metadata_json` without turning unavailable pair
 forces into measured zero or original source contact labels.
 
+### Installed dynamics and gravity
+
+`entity.body_inertial_properties()` exposes named, stopped properties with an
+explicit world axis: mass `[world,body]`, body-local COM `[world,body,3]`, and
+COM inertia expressed in the body frame `[world,body,3,3]`. Isaac reads the
+installed PhysX views after reset and any selected property installation;
+it does not reconstruct execution inertia from a source mesh or USD estimate.
+PhysX's COM quaternion does not rotate this body-frame tensor a second time.
+The fixed native recipes use the actual compiled named body rows, shared
+across worlds. These snapshots do not add mid-run inertia randomization.
+
+Root control, assistance, implicit damping and perturbations consume these
+properties. Object selection follows the same world, active slot and shared
+alias as achieved state. The optional frequency-based assistance curriculum
+uses the mean selected object mass across configured sides in each world;
+scalar logging means do not replace those execution operands. Native BOX
+remains unassisted. In-place model swapping requires an executing model-field
+write route; an unsupported engine rejects it before harvesting swap data.
+
+Isaac's gravity curriculum calls the actual PhysX global setter, reads its
+vector back and refreshes robot gravity compensation. Resetting a subset does
+not create per-world gravity. Native MjWarp/Newton keep constructor gravity;
+a ramp or different requested vector is unsupported. Editing CPU metadata
+does not update executing dynamics. Actual SDK forwarding and finite gravity
+response are separate qualification gates from CPU adapter tests.
+
+The existing `FDR_PIN_AT_COM=1` option applies a global wrench at the installed
+COM transformed by the achieved world pose. Local wrench calls use the
+body-local point. The default application request is unchanged.
+
 **Viewer, logging and resume**
 
 | key | default | meaning |

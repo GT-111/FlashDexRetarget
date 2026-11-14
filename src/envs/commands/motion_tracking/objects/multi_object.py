@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 class MultiObjectMixin:
     def _init_object_swap(self, cfg: MotionTrackingCommandCfg) -> None:
         """Harvest swap rows + expand model fields (recaptures CUDA graphs)."""
+        if getattr(self._env.sim, "wp_model", None) is None:
+            raise NotImplementedError("object swapping requires executing per-world MuJoCo model-field writes")
         import numpy as np
         from omegaconf import OmegaConf
 

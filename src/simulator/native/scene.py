@@ -6,11 +6,13 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from mjlab.utils.lab_api.math import matrix_from_quat
 
 from simulator.mjcf_meta import site_table
 
 from .entity import (
     ArticulationData,
+    BodyInertialProperties,
     FloatingRootView,
     NamedArticulationView,
     NativeRobotAdapter,
@@ -50,11 +52,18 @@ class NativeArticulation(FloatingRootView, NamedArticulationView):
             bodies = model.jnt_bodyid[model.actuator_trnid[attached, 0]]
             if np.isin(bodies, self._body_ids).any():
                 raise ValueError("native object roots and scalar joints must remain passive")
-        self._mass = torch.as_tensor(meta.body_mass, device=self.device, dtype=torch.float32)
-        self._ipos = torch.as_tensor(meta.body_ipos, device=self.device, dtype=torch.float32)
-        self._inertia = torch.as_tensor(meta.body_inertia, device=self.device, dtype=torch.float32)
-        self._inertia_quat = torch.as_tensor(meta.body_iquat, device=self.device, dtype=torch.float32)
         count = sim.plant.num_envs
+        mass = torch.as_tensor(model.body_mass[self._body_ids], device=self.device, dtype=torch.float32)
+        com = torch.as_tensor(model.body_ipos[self._body_ids], device=self.device, dtype=torch.float32)
+        principal = torch.as_tensor(model.body_inertia[self._body_ids], device=self.device, dtype=torch.float32)
+        rotation = matrix_from_quat(torch.as_tensor(
+            model.body_iquat[self._body_ids], device=self.device, dtype=torch.float32,
+        ))
+        inertia = rotation @ torch.diag_embed(principal) @ rotation.transpose(-1, -2)
+        self._body_properties = BodyInertialProperties(
+            tuple(self.body_names), mass.expand(count, -1), com.expand(count, -1, -1),
+            inertia.expand(count, -1, -1, -1),
+        )
         self._default_joint_pos = torch.as_tensor(meta.joint_default, device=self.device, dtype=torch.float32).expand(count, -1)
         self._default_joint_vel = torch.zeros_like(self._default_joint_pos)
         self._joint_pos_target = self._default_joint_pos.clone()
@@ -71,6 +80,10 @@ class NativeArticulation(FloatingRootView, NamedArticulationView):
 
     def _joint_pos(self):
         return self._sim.plant.state()[0][:, self._qpos_ids]
+
+    def body_inertial_properties(self):
+        """Fixed compiled-model properties; this recipe does not mutate dynamics."""
+        return self._body_properties
 
     def _joint_vel(self):
         return self._sim.plant.state()[1][:, self._qvel_ids]
@@ -116,7 +129,9 @@ class NativeArticulation(FloatingRootView, NamedArticulationView):
         if not len(self._root_drives):
             raise ValueError("passive object has no root wrench authority")
         _, rotation = self._body_pose()
-        value = root_origin_wrench(force, torque, rotation[:, 0], self._ipos[0])
+        value = root_origin_wrench(
+            force, torque, rotation[:, 0], self._body_properties.com_position_body_m[:, 0],
+        )
         self._sim.plant.control[:, self._root_drives] = value
 
     def clear_external_wrenches(self, env_ids=None):
@@ -132,11 +147,24 @@ class NativeArticulation(FloatingRootView, NamedArticulationView):
 
 
 class NativeSim:
+    supports_dynamic_gravity = False
+
     def __init__(self, plant):
         self.plant, self.device = plant, plant.device
         self.mj_model = plant.model
+        self._gravity_world_m_per_s2 = tuple(float(value) for value in plant.model.opt.gravity)
         self._clock = _FreshnessClock()
         self._pending = None
+
+    def gravity_world_m_per_s2(self):
+        """Constructor gravity of the executing, nonrandomized native recipe."""
+        return self._gravity_world_m_per_s2
+
+    def set_gravity_world_m_per_s2(self, gravity):
+        actual = self.gravity_world_m_per_s2()
+        if tuple(float(value) for value in gravity) != actual:
+            raise NotImplementedError("native dynamic gravity is not implemented; keep constructor gravity")
+        return actual
 
     def rows(self, env_ids):
         return torch.arange(self.plant.num_envs, device=self.device) if env_ids is None else env_ids
