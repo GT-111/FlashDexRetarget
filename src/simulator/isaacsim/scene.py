@@ -18,17 +18,15 @@ from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from envs.commands.motion_tracking.reference.hand import ALLLINK_BODY_NAMES_BY_SIDE
 from envs.scene._object_setup import object_park_position
 from envs.scene.native import NativeSceneCfg
+from simulator.mjcf_meta import RobotMjcfMeta
+from simulator.native.entity import NativeRobotAdapter, _FreshnessClock, _ObjIndexing
 
 from .convert_assets import COLVIS_ROBOT_DIRNAME, colvis_enabled
 from .entity import (
     ArticulationAdapter,
     FreeArticulationAdapter,
-    NativeRobotAdapter,
     RigidObjectAdapter,
-    _FreshnessClock,
-    _ObjIndexing,
 )
-from .mjcf_meta import RobotMjcfMeta
 from .sensors import (
     AlllinkContactAdapter,
     AlllinkContactPosAdapter,
@@ -87,6 +85,11 @@ class IsaacSceneAdapter:
     """Duck-typed mjlab ``Scene``: name lookup, origins, step-loop hooks."""
 
     def __init__(self, scene: InteractiveScene, device: str) -> None:
+        self.backend_identity = {"backend": "isaacsim", "solver": "PhysX"}
+        self.root_wrench_application = {
+            "frame": "WORLD", "point": "root_link_COM",
+            "recorded_wrench_point": "root_link_COM",
+        }
         self._scene = scene
         self.device = device
         self.entities: dict[str, object] = {}
@@ -797,8 +800,9 @@ def build_isaac_scene(
 
 def _native_articulation_cfg(binding, meta, cfg) -> ArticulationCfg:
     """Native scalar drives only; no PD drive is created for a passive joint."""
-    if not Path(binding.usd_path).is_file():
-        raise FileNotFoundError(binding.usd_path)
+    usd_path = cfg.sim.native_assets.articulations[binding.entity_name]
+    if not Path(usd_path).is_file():
+        raise FileNotFoundError(usd_path)
     driven = meta.driven_joint_names
     actuators = {}
     if driven:
@@ -818,7 +822,7 @@ def _native_articulation_cfg(binding, meta, cfg) -> ArticulationCfg:
     return ArticulationCfg(
         prim_path=f"/World/envs/env_.*/{binding.entity_name}",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=binding.usd_path,
+            usd_path=usd_path,
             activate_contact_sensors=True,
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=bool(cfg.robot.get("self_collision", False)),
@@ -839,15 +843,15 @@ def _native_articulation_cfg(binding, meta, cfg) -> ArticulationCfg:
     )
 
 
-def _native_rigid_object_cfg(binding, meta) -> RigidObjectCfg:
+def _native_rigid_object_cfg(binding, meta, usd_path) -> RigidObjectCfg:
     """The rigid family has one actual FREE body and no scalar articulation."""
     if meta.body_names != [binding.root_body_name]:
         raise ValueError("native rigid object requires its one declared physical body")
-    if not Path(binding.usd_path).is_file():
-        raise FileNotFoundError(binding.usd_path)
+    if not Path(usd_path).is_file():
+        raise FileNotFoundError(usd_path)
     return RigidObjectCfg(
         prim_path=f"/World/envs/env_.*/{binding.entity_name}",
-        spawn=sim_utils.UsdFileCfg(usd_path=binding.usd_path),
+        spawn=sim_utils.UsdFileCfg(usd_path=usd_path),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=tuple(meta.free_roots[0].default_pose[:3]),
             rot=tuple(meta.free_roots[0].default_pose[3:]),
@@ -869,7 +873,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
             env_spacing=float(cfg.scene.env_spacing),
         )
     )
-    static_cfg = sim_utils.UsdFileCfg(usd_path=layout.static_usd_path)
+    static_cfg = sim_utils.UsdFileCfg(usd_path=cfg.sim.native_assets.static)
     static_cfg.func("/World/envs/env_0/NativeStatic", static_cfg)
     sim_utils.DomeLightCfg(intensity=2000.0).func(
         "/World/Light", sim_utils.DomeLightCfg(intensity=2000.0)
@@ -886,7 +890,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         if binding == layout.object and meta.actuator_names:
             raise ValueError("native object articulation must remain passive")
         if binding == layout.object and not meta.joint_names:
-            assets[binding.entity_name] = RigidObject(_native_rigid_object_cfg(binding, meta))
+            assets[binding.entity_name] = RigidObject(_native_rigid_object_cfg(binding, meta, cfg.sim.native_assets.articulations[binding.entity_name]))
             rigid.add(binding.entity_name)
         else:
             assets[binding.entity_name] = Articulation(

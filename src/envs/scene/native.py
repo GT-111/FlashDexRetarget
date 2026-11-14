@@ -1,7 +1,7 @@
 """Named native articulations shared by scene, action and reference owners.
 
-The MJCF is the mechanics authority. This configuration selects its subtrees
-and converted assets; it does not replace FREE roots with scalar wrist joints.
+The MJCF is the mechanics authority. This configuration selects its subtrees;
+engine-specific converted assets remain in the simulator configuration.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ class NativeArticulationCfg:
     entity_name: str
     root_body_name: str
     root_joint_name: str
-    usd_path: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -59,7 +58,6 @@ class NativeObjectCfg(NativeArticulationCfg):
 @dataclass(frozen=True, kw_only=True)
 class NativeSceneCfg:
     scene_xml_path: str
-    static_usd_path: str
     hands: tuple[NativeHandCfg, ...]
     object: NativeObjectCfg
 
@@ -74,7 +72,6 @@ class NativeSceneCfg:
                         "entity_name",
                         "root_body_name",
                         "root_joint_name",
-                        "usd_path",
                     )
                 },
                 command_actuator_names=tuple(h["command_actuator_names"]),
@@ -85,7 +82,6 @@ class NativeSceneCfg:
         obj = config["object"]
         return cls(
             scene_xml_path=str(config["scene_xml_path"]),
-            static_usd_path=str(config["static_usd_path"]),
             hands=hands,
             object=NativeObjectCfg(
                 **{
@@ -94,7 +90,6 @@ class NativeSceneCfg:
                         "entity_name",
                         "root_body_name",
                         "root_joint_name",
-                        "usd_path",
                     )
                 },
                 parts=tuple(NativeObjectPartCfg(**dict(p)) for p in obj["parts"]),
@@ -104,3 +99,20 @@ class NativeSceneCfg:
     @property
     def articulations(self) -> tuple[NativeArticulationCfg, ...]:
         return (*self.hands, self.object)
+
+
+def bind_native_scene_config(cfg) -> NativeSceneCfg:
+    """Bind mechanical names to reference/task selection, independently of engine."""
+    from omegaconf import open_dict
+
+    layout = NativeSceneCfg.from_mapping(cfg.robot.native_scene)
+    with open_dict(cfg.commands):
+        cfg.commands.native_scene = cfg.robot.native_scene
+        cfg.commands.object.entity_names = {
+            h.side: layout.object.entity_name for h in layout.hands
+        }
+    if cfg.commands.object.pin_objects:
+        raise ValueError("native object task requires pin_objects=false")
+    if cfg.commands.object.support_disks.enable:
+        raise ValueError("native scene uses its authored static support")
+    return layout

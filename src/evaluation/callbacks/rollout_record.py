@@ -141,6 +141,10 @@ _INSTALLED_ARRAYS = (
     "root_linear_velocity_support", "root_angular_velocity_support", "installed_valid",
     "reference_motion_ids", "reference_motion_steps", "root_force_n", "root_torque_nm",
 )
+_CONTACT_ARRAYS = (
+    "normal_force_n", "force_bearing_contact_present",
+    "force_bearing_distance_max_m", "measurement_support",
+)
 
 
 class NativeRolloutRecord(RolloutRecord):
@@ -216,6 +220,31 @@ class NativeRolloutRecord(RolloutRecord):
             self.object_joint_metadata = dict(entity_name=self.cmd.native_layout.object.entity_name,
                 joint_names=list(self.cmd.native_object.joint_names),
                 authority="observed simulator scalar state; independent from reference support")
+        self.backend_metadata = getattr(env.scene, "backend_identity", None)
+        self._physics_time_reader = getattr(env.scene, "physics_time_s", None)
+        self._contact_reader = getattr(env.scene, "hand_part_contact_facts", None)
+        self.contact_metadata = None
+        if self._contact_reader is not None:
+            facts = self._contact_reader()
+            self._contact_names = []
+            addresses = []
+            for side in _NATIVE_SIDES:
+                for part in self.binding["object_parts"].values():
+                    address = dict(hand_side=side, hand_body_name=self.binding["hands"][side]["body_name"],
+                                   part_entity_name=part["entity_name"], part_body_name=part["body_name"])
+                    names = [n for n, a in facts["addresses"].items() if a == address]
+                    if len(names) != 1:
+                        raise ValueError("native contact export requires the actual hand/part body pair")
+                    self._contact_names.append(names[0])
+                    addresses.append(address)
+            self.contact_metadata = dict(
+                schema="solver_hand_part_contact_v1", pairs=addresses,
+                clock=facts["clock"], normal_force_authority=facts["normal_force_authority"],
+                distance_authority=facts["distance_authority"],
+                absent_contact="measured zero normal force, false presence, unavailable separation",
+                unsupported="NaN normal force/separation and false measurement support",
+                provenance="derived target execution evidence, not original observed source contacts",
+            )
         self.native_frames = []
         phase = self.cmd.reference_phase
         self.valid_steps_per_env = (
@@ -234,6 +263,8 @@ class NativeRolloutRecord(RolloutRecord):
         pos = robot.data.body_link_pos_w[:, self.hand_indices] - self._env_origins[:, None]
         quat = robot.data.body_link_quat_w[:, self.hand_indices]
         hands = torch.cat((pos, quat), dim=-1).detach().to("cpu", torch.float32)
+        hand_twist = torch.cat((robot.data.body_link_lin_vel_w[:, self.hand_indices],
+                                robot.data.body_link_ang_vel_w[:, self.hand_indices]), dim=-1)
         part_position = torch.stack([entity.data.body_link_pos_w[:, body] for entity, body in self.object_parts], dim=1)
         part_position -= self._env_origins[:, None]
         part_quaternion = torch.stack([entity.data.body_link_quat_w[:, body] for entity, body in self.object_parts], dim=1)
@@ -242,7 +273,7 @@ class NativeRolloutRecord(RolloutRecord):
         curriculum = self.cmd._xfrc_curr_ctrl is not None
         phase = self.cmd.reference_phase
         frame = {
-            "hands": hands, "parts": parts,
+            "hands": hands, "hand_twist_w": hand_twist.detach().to("cpu", torch.float32), "parts": parts,
             # Metrics observe the achieved endpoint before compute advances the
             # next-target cursor. In particular, the final cursor is clamped.
             "motion_steps": phase["motion_steps"].detach().to("cpu", torch.int64).clone(),
@@ -259,12 +290,24 @@ class NativeRolloutRecord(RolloutRecord):
         if self.object_joint_metadata is not None:
             frame["object_joint_pos"] = self.cmd.native_object_joint_pos.detach().to("cpu").clone()
             frame["object_joint_vel"] = self.cmd.native_object_joint_vel.detach().to("cpu").clone()
+        if self._physics_time_reader is not None:
+            frame["physics_time_s"] = self._physics_time_reader().detach().cpu().clone()
+        if self.contact_metadata is not None:
+            facts = self._contact_reader()
+            frame["contact"] = {
+                key: torch.stack([facts["pairs"][n][key] for n in self._contact_names], -1).detach().cpu().clone()
+                for key in _CONTACT_ARRAYS if key != "measurement_support"
+            }
+            frame["contact"]["measurement_support"] = facts["measurement_support"][:, None].expand(
+                -1, len(self._contact_names)).detach().cpu().clone()
+            frame["contact_sample_time_s"] = facts["sample_time_s"].detach().cpu().clone()
         self.native_frames.append(frame)
 
     def collect_state(self, active_mask=None):
         state = super().collect_state(active_mask)
         select = slice(None) if active_mask is None else active_mask.cpu()
         state["native_frames"] = [{**frame, "hands": frame["hands"][select],
+                                   "hand_twist_w": frame["hand_twist_w"][select],
                                        "parts": frame["parts"][select],
                                    "motion_steps": frame["motion_steps"][select],
                                    "motion_ids": frame["motion_ids"][select],
@@ -277,6 +320,11 @@ class NativeRolloutRecord(RolloutRecord):
             if "object_joint_pos" in frame:
                 selected["object_joint_pos"] = frame["object_joint_pos"][select]
                 selected["object_joint_vel"] = frame["object_joint_vel"][select]
+            if "contact" in frame:
+                selected["contact"] = {key: value[select] for key, value in frame["contact"].items()}
+                selected["contact_sample_time_s"] = frame["contact_sample_time_s"][select]
+            if "physics_time_s" in frame:
+                selected["physics_time_s"] = frame["physics_time_s"][select]
         return state
 
     def rollout_arrays(self, states, env_index):
@@ -294,6 +342,8 @@ class NativeRolloutRecord(RolloutRecord):
                 binding = {**self.binding, "clips": {name: self.binding["clips"][name]}}
                 result.update(
                     native_hand_pose=np.stack([frame["hands"][row].numpy() for frame in frames]),
+                    native_hand_twist_w=np.stack([frame["hand_twist_w"][row].numpy() for frame in frames]),
+                    native_hand_twist_authority=np.asarray("observed WORLD link-origin linear then angular velocity"),
                     native_object_part_pose=np.stack([frame["parts"][row].numpy() for frame in frames]),
                     recorded_motion_steps=np.array([int(frame["motion_steps"][row]) for frame in frames], np.int64),
                     recorded_motion_ids=np.array([int(frame["motion_ids"][row]) for frame in frames], np.int64),
@@ -321,6 +371,22 @@ class NativeRolloutRecord(RolloutRecord):
                         result[field] = np.stack([frame[field][row].numpy() for frame in frames])
                     for field in ("object_joint_position_support", "object_joint_velocity_support"):
                         result[field] = np.ones_like(result["object_joint_pos"], dtype=bool)
+                if self.backend_metadata is not None:
+                    result["native_backend_metadata_json"] = np.asarray(json.dumps(self.backend_metadata))
+                if self._physics_time_reader is not None:
+                    result["native_physics_time_s"] = np.array([float(frame["physics_time_s"][row]) for frame in frames])
+                    result["native_physics_reset_time_s"] = np.asarray(float(frames[0]["physics_time_s"][row]))
+                    result["native_physics_clock_metadata_json"] = np.asarray(json.dumps(dict(
+                        authority="actual per-world solver floating-point time at achieved endpoint",
+                        origin="first recorded reset sample; absolute solver time retained",
+                        source_clock="independent original int64 source/reference clocks",
+                        elapsed_time_ns="nominal control elapsed time from recorded reset",
+                    )))
+                if self.contact_metadata is not None:
+                    result["hand_part_contact_metadata_json"] = np.asarray(json.dumps(self.contact_metadata))
+                    for field in _CONTACT_ARRAYS:
+                        result["hand_part_" + field] = np.stack([frame["contact"][field][row].numpy() for frame in frames])
+                    result["hand_part_sample_time_s"] = np.array([float(frame["contact_sample_time_s"][row]) for frame in frames])
                 return result
             offset += size
         raise IndexError(env_index)

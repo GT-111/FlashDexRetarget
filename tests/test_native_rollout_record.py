@@ -13,7 +13,7 @@ from evaluation.callbacks.rollout_record import NativeRolloutRecord
 from evaluation.callbacks.success_export import export_success
 
 
-def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False):
+def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, setup_scene=None):
     """Run actual command/action owners with explicit synthetic backend facts.
 
     The physical state is supplied by this protocol fixture; no dynamics model,
@@ -90,6 +90,8 @@ def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False):
             actuator_names={"wrist_trans": (), "wrist_rot": (), "finger": tuple(correspondence)},
             residual_scale={"wrist_trans": .1, "wrist_rot": 1., "finger": None}, clip={".*": (-1., 1.)})
     env.command_manager = SimpleNamespace(get_term=lambda name: command)
+    if setup_scene is not None:
+        setup_scene(env, command)
     env.action_manager = ActionManager({"actual": action_cfg}, env)
     env.action_manager.reset()
     CommandTerm.compute(command, dt=0.)
@@ -134,7 +136,9 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
         data=SimpleNamespace(joint_pos=torch.tensor([[.1, .2]]), joint_vel=torch.tensor([[4., 8.]]),
             root_link_pos_w=torch.full((1, 3), 999.), root_link_quat_w=torch.tensor([[1., 0., 0., 0.]]),
             body_link_pos_w=torch.tensor([[[999., 999., 999.], [3., 4., 5.], [6., 7., 8.]]]),
-            body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 3])))
+            body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 3]),
+            body_link_lin_vel_w=torch.tensor([[[999., 999., 999.], [1., 2., 3.], [4., 5., 6.]]]),
+            body_link_ang_vel_w=torch.tensor([[[999., 999., 999.], [.1, .2, .3], [.4, .5, .6]]])))
     command = SimpleNamespace(robot=robot, motion_steps=torch.ones(1, dtype=torch.int64),
         motion_ids=torch.zeros(1, dtype=torch.int64), _xfrc_curr_ctrl=None,
         reference_phase={"motion_ids": torch.zeros(1, dtype=torch.int64),
@@ -168,6 +172,7 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
     np.testing.assert_array_equal(output["native_hand_pose"][0, :, :3], ((5., 5., 5.), (2., 2., 2.)))
     np.testing.assert_array_equal(output["native_hand_pose"][1, :, :3], ((5.25, 5.25, 5.25), (2.25, 2.25, 2.25)))
     np.testing.assert_array_equal(output["joint_vel"], ((4., 8.), (4., 8.)))
+    np.testing.assert_allclose(output["native_hand_twist_w"][0], ((4., 5., 6., .4, .5, .6), (1., 2., 3., .1, .2, .3)))
     np.testing.assert_array_equal(output["native_object_part_pose"][:, 0, :3], ((7., 7., 7.), (7., 7., 7.)))
     np.testing.assert_array_equal(output["actions"], ((77., 88.), (77., 88.)))
     assert np.max(output["native_hand_pose"][..., :3]) < 999.

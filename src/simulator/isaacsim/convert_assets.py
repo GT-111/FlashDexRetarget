@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
                              "(e.g. _spec)")
     parser.add_argument(
         "--native-scene-config",
-        help="selected native_scene yaml: split its MJCF into named FREE articulations and statics",
+        help="resolved run yaml with robot.native_scene and sim.native_assets: split its named MJCF assets",
     )
     parser.add_argument(
         "--collision-visual", action="store_true",
@@ -79,7 +79,7 @@ def _up_to_date(usd_path: str, sources: list[str]) -> bool:
     return all(os.path.getmtime(s) <= usd_mtime for s in sources if os.path.exists(s))
 
 
-def write_native_mjcf_assets(layout) -> dict[str, str]:
+def write_native_mjcf_assets(layout, assets) -> dict[str, str]:
     """Write importer inputs from ONE authoritative composed scene.
 
     Explicit compiled inertials prevent importer density estimates from changing
@@ -125,9 +125,9 @@ def write_native_mjcf_assets(layout) -> dict[str, str]:
     roots = {b.root_body_name for b in layout.articulations}
     outputs = {}
     selected = [
-        (b.entity_name, b.root_body_name, b.usd_path) for b in layout.articulations
+        (b.entity_name, b.root_body_name, assets["articulations"][b.entity_name]) for b in layout.articulations
     ]
-    selected.append(("static", None, layout.static_usd_path))
+    selected.append(("static", None, assets["static"]))
     for name, root_name, usd in selected:
         document = copy.deepcopy(original)
         world = document.find("worldbody")
@@ -186,11 +186,11 @@ def convert_native_scene(config_path: str) -> None:
     from envs.scene.native import NativeSceneCfg
 
     config = OmegaConf.load(config_path)
-    mapping = config.robot.native_scene if "robot" in config else config
-    layout = NativeSceneCfg.from_mapping(mapping)
-    inputs = write_native_mjcf_assets(layout)
-    selected = [(b.entity_name, b.usd_path, False) for b in layout.articulations]
-    selected.append(("static", layout.static_usd_path, True))
+    layout = NativeSceneCfg.from_mapping(config.robot.native_scene)
+    assets = config.sim.native_assets
+    inputs = write_native_mjcf_assets(layout, assets)
+    selected = [(b.entity_name, assets.articulations[b.entity_name], False) for b in layout.articulations]
+    selected.append(("static", assets.static, True))
     for name, usd, fixed in selected:
         destination = Path(usd)
         MjcfConverter(

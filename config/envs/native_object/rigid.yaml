@@ -5,7 +5,6 @@
 entity_name: native_object
 root_body_name: ${oc.env:FDR_NATIVE_OBJECT_ROOT_BODY}
 root_joint_name: ${oc.env:FDR_NATIVE_OBJECT_ROOT_JOINT}
-usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/native_object.usd
 parts:
   - name: object
     body_name: ${oc.env:FDR_NATIVE_OBJECT_ROOT_BODY}

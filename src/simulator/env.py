@@ -1,4 +1,4 @@
-"""Manager-based RL env on Isaac: mirrors mjlab 1.3.0 step/reset semantics
+"""Shared manager-based RL env: mirrors mjlab 1.3.0 step/reset semantics
 plus the mjlab_ext deltas (auto_reset single pass, capture_final_obs)."""
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from mjlab.managers.action_manager import ActionManager, ActionTermCfg
 from mjlab.managers.command_manager import CommandManager, CommandTermCfg
 from mjlab.managers.curriculum_manager import (
@@ -21,8 +20,7 @@ from mjlab.managers.event_manager import EventManager, EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationManager
 from mjlab.managers.reward_manager import RewardManager, RewardTermCfg
 from mjlab.managers.termination_manager import TerminationManager, TerminationTermCfg
-from mjlab.utils.spaces import Box
-from mjlab.utils.spaces import Dict as DictSpace
+from mjlab.utils.spaces import Box, Dict as DictSpace
 
 
 def _install_compute_snapshot() -> None:
@@ -45,8 +43,8 @@ def _install_compute_snapshot() -> None:
 
 
 @dataclass(kw_only=True)
-class IsaacEnvCfg:
-    """Isaac twin of ``ManagerBasedRlEnvCfg`` (manager cfg dicts + timing)."""
+class ManagerEnvCfg:
+    """Shared manager configuration (manager cfg dicts + timing)."""
 
     decimation: int
     physics_dt: float
@@ -92,13 +90,13 @@ class _NullManager:
         pass
 
 
-class IsaacManagerBasedRlEnv:
-    """mjlab-compatible manager env driven by Isaac Lab physics."""
+class ManagerBasedRlEnv:
+    """One manager loop driven by the selected native scene/simulator."""
 
     is_vector_env = True
-    cfg: IsaacEnvCfg
+    cfg: ManagerEnvCfg
 
-    def __init__(self, cfg: IsaacEnvCfg, scene, sim, device: str) -> None:
+    def __init__(self, cfg: ManagerEnvCfg, scene, sim, device: str) -> None:
         _install_compute_snapshot()
         self.cfg = cfg
         self.scene = scene
@@ -147,7 +145,7 @@ class IsaacManagerBasedRlEnv:
         return math.ceil(self.max_episode_length_s / self.step_dt)
 
     @property
-    def unwrapped(self) -> "IsaacManagerBasedRlEnv":
+    def unwrapped(self) -> "ManagerBasedRlEnv":
         return self
 
     # ── managers ───────────────────────────────────────────────────────────

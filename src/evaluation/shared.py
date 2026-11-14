@@ -1,4 +1,4 @@
-"""Isaac eval on the train env: SharedEvalEnv, and the object-aware sweep for per-env-object
+"""Eval on the train env: SharedEvalEnv, and the object-aware sweep for per-env-object
 mode (each motion's replicas run only on envs that physically host that motion's object)."""
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import torch
 from evaluation.callbacks.motion_tracking_eval_setup import MotionTrackingEvalSetup
 
 if TYPE_CHECKING:
-    from simulator.isaacsim.env import IsaacManagerBasedRlEnv
+    from simulator.env import ManagerBasedRlEnv
 
 
 def build_eval_plan(
@@ -57,11 +57,11 @@ def build_eval_plan(
     return plan
 
 
-class IsaacMotionTrackingEvalSetup(MotionTrackingEvalSetup):
+class ObjectSlotMotionTrackingEvalSetup(MotionTrackingEvalSetup):
     """Reads the precomputed object-aware plan off the env (per-env mode)."""
 
     def on_eval_setup(self, env: Any) -> None:
-        plan = getattr(env, "_isaac_eval_plan", None)
+        plan = getattr(env, "_object_eval_plan", None)
         if plan is None:
             return super().on_eval_setup(env)
         cmd = env.command_manager.get_term(self.command_name)
@@ -99,7 +99,7 @@ class SharedEvalEnv:
     """Eval facade over the single train env: enter_eval() pauses training
     semantics (terminations/pin/curriculum), exit_eval() restores them."""
 
-    def __init__(self, env: IsaacManagerBasedRlEnv, eval_cfg) -> None:
+    def __init__(self, env: ManagerBasedRlEnv, eval_cfg) -> None:
         self.env = env
         self._eval_cfg = eval_cfg
         self._in_eval = False
@@ -109,7 +109,7 @@ class SharedEvalEnv:
         cmd = env.command_manager.get_term(eval_cfg.command_name)
         num_motions = int(cmd.motion_lib.num_trajectories)
         num_per_motion = int(eval_cfg.num_per_motion)
-        plan = getattr(env, "_isaac_eval_plan", None)
+        plan = getattr(env, "_object_eval_plan", None)
         if plan is not None:
             env.eval_k = 0
             env.eval_num_batches = len(plan)
@@ -120,7 +120,7 @@ class SharedEvalEnv:
         env.eval_num_motions = num_motions
 
     @property
-    def unwrapped(self) -> IsaacManagerBasedRlEnv:
+    def unwrapped(self) -> ManagerBasedRlEnv:
         return self.env
 
     @property
@@ -148,7 +148,7 @@ class SharedEvalEnv:
             "pin": cmd.cfg.object.pin_objects,
         }
         env.termination_manager = _NullTerminationManager(env.num_envs, env.device)
-        from simulator.isaacsim.env import _NullManager
+        from simulator.env import _NullManager
 
         env.curriculum_manager = _NullManager()
         cmd._xfrc_curr_ctrl = None

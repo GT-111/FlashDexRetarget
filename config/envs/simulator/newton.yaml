@@ -1,0 +1,10 @@
+# @package _global_
+sim:
+  _target_: simulator.native.create.create_native_envs
+  runtime_launcher: null
+  backend: newton
+  dt: 0.005
+  plant:
+    _target_: simulator.native.newton.NewtonPlant
+    collision_generation: null
+    cuda_graph: true

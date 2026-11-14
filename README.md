@@ -69,8 +69,10 @@ frozen final-policy evaluation or a qualification of a different physics backend
 The native Isaac interface uses `NativeSceneCfg` to select actual floating hand
 articulations and one object articulation from an authored MJCF. Each hand keeps
 its FREE root and declared independent actuators; an articulated object keeps
-its passive joints. `convert_assets.py --native-scene-config <resolved.yaml>`
-splits those named assets for conversion. Select
+its passive joints. `convert_assets.py --native-scene-config <resolved-run.yaml>`
+reads the resolved run configuration: `robot.native_scene` owns mechanics and
+`sim.native_assets` owns named USD destinations. It splits those named assets
+for conversion. Select
 `envs.actions.native.NativeResidualActionCfg` for world-frame wrist residuals
 and absolute or reference-relative fingers. Action dimensions and side ownership
 come from the named bindings. The root PD law recomputes mass, inertia and the
@@ -109,6 +111,40 @@ composition, command clocks, part/joint ordering, action and support routing,
 reset, wrench cleanup, complete endpoint selection and finite-state admission.
 Offline reference generation, USD/PhysX import and physical response remain
 unqualified.
+
+The native task also has config-selected direct MuJoCo Warp and Newton ports.
+Select `envs/simulator@simulator=mjwarp` or `envs/simulator@simulator=newton` with the native profile;
+neither launches Kit nor requires USD conversion. These ports reuse the same
+manager loop, native actions, reference phase, observations, reward, evaluator,
+FlashSAC and recorder. Newton delegates to the installed DexForge native engine;
+direct MuJoCo Warp loads the authored MJCF itself. Newton's selected
+`SolverMuJoCo` also uses MuJoCo Warp: these are different import/contact routes,
+not two independent dynamics solvers. The default Newton contact route is
+MuJoCo; original-triangle BVH requires an explicit `collision_generation` recipe.
+
+Backend dimensions and actuator/body/site ordering come from the compiled
+scene. FREE-root wrench drives remain separate from independent finger
+commands; object roots and hinges stay passive. Both ports retain achieved
+state, installed targets and source reference clocks separately. Native contact
+outcomes use solved, body-pair-filtered normal forces and collider separation,
+with each sample's actual solver time at the beginning of the last solved
+substep. These are derived target-execution facts, separate from the original
+source contact availability. Achieved named-hand WORLD twists and actual endpoint
+solver times retain their own fields and reset origin, independently of the
+original source clock and nominal control elapsed time. Unmeasured reset contact
+samples stay unsupported. The
+author's Isaac net-force/SDF observation views retain their own meaning.
+Configuration, software checks and an import alone do not qualify either port's
+physical tracking or task success. Each actual scene/backend needs the declared
+two-world native step, reset, contact, snapshot and SAC/replay continuation gates.
+The author Isaac freeze remains Python 3.11. This native campaign selects an
+existing Python 3.12 environment; the fork's package metadata allows both.
+Install this repository with `--no-deps` in the selected environment so its
+author-stack dependency list does not resolve or replace the native runtime.
+`requirements/native_cu128.txt` is a separate candidate constraint set. Actual
+installed engine versions and physical qualification come from the selected
+runtime receipt; that file does not establish them or authorize environment
+replacement. `scripts/setup.sh` continues to create the author Isaac environment.
 
 ## Setup
 

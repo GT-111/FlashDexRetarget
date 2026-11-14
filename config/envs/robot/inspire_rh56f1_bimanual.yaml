@@ -52,13 +52,11 @@ robot:
 
   native_scene:
     scene_xml_path: ${oc.env:FDR_NATIVE_SCENE_XML}
-    static_usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/static.usd
     hands:
       - side: left
         entity_name: hand_left
         root_body_name: left_wrist
         root_joint_name: left_tracking_wrist_free
-        usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/hand_left.usd
         command_actuator_names:
           - left_ctrl_thumb_1_joint
           - left_ctrl_thumb_2_joint
@@ -79,7 +77,6 @@ robot:
         entity_name: hand_right
         root_body_name: right_wrist
         root_joint_name: right_tracking_wrist_free
-        usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/hand_right.usd
         command_actuator_names:
           - right_ctrl_thumb_1_joint
           - right_ctrl_thumb_2_joint
@@ -92,7 +89,6 @@ robot:
       entity_name: articulated_object
       root_body_name: object_0
       root_joint_name: object_0_free
-      usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/articulated_object.usd
       parts:
         - name: base
           body_name: object_0

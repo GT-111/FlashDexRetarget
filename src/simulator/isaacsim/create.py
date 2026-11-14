@@ -8,21 +8,13 @@ from pathlib import Path
 import torch
 from mjlab.rl import RslRlVecEnvWrapper
 
-from envs import (  # builders only; mujoco-specific side effects are gated
-    build_actions,
-    build_commands,
-    build_curriculum,
-    build_events,
-    build_observations,
-    build_rewards,
-    build_terminations,
-)
+from envs import build_manager_cfgs
 from envs.scene._object_setup import object_pool_dir
-from envs.scene.native import NativeSceneCfg
+from envs.scene.native import bind_native_scene_config
+from simulator.env import ManagerBasedRlEnv, ManagerEnvCfg
+from simulator.mjcf_meta import load_robot_mjcf_meta
 
 from .convert_assets import COLVIS_OBJ_DIRNAME, colvis_enabled
-from .env import IsaacEnvCfg, IsaacManagerBasedRlEnv
-from .mjcf_meta import load_robot_mjcf_meta
 
 _SIM_DIR = Path(__file__).resolve().parents[3]  # simulation/
 
@@ -241,51 +233,6 @@ def _discover_single_object_sides(
     return slots
 
 
-def _make_manager_cfgs(cfg) -> dict:
-    entity_name = cfg.robot.entity_name
-    command_name = cfg.commands.name
-    # Route the command through the Isaac subclass (sensor-wiring delta only).
-    cfg.commands._target_ = (
-        "simulator.isaacsim.commands_isaac.IsaacNativeMotionTrackingCommandCfg"
-        if cfg.robot.get("native_scene") is not None
-        else "simulator.isaacsim.commands_isaac.IsaacMotionTrackingCommandCfg"
-    )
-    return dict(
-        observations=build_observations(
-            cfg.obs, command_name=command_name, entity_name=entity_name
-        ),
-        rewards=build_rewards(
-            cfg.rewards, command_name=command_name, entity_name=entity_name
-        ),
-        commands=build_commands(cfg.commands),
-        actions=build_actions(cfg.actions),
-        terminations=build_terminations(
-            cfg.terminations, command_name=command_name, entity_name=entity_name
-        ),
-        curriculum=build_curriculum(
-            cfg.curriculum, command_name=command_name, entity_name=entity_name
-        ),
-        events=build_events(cfg.events),
-    )
-
-
-def _bind_native_scene_config(cfg) -> NativeSceneCfg:
-    """Bind the selected named scene to its existing command configuration."""
-    from omegaconf import open_dict
-
-    layout = NativeSceneCfg.from_mapping(cfg.robot.native_scene)
-    with open_dict(cfg.commands):
-        cfg.commands.native_scene = cfg.robot.native_scene
-        cfg.commands.object.entity_names = {
-            h.side: layout.object.entity_name for h in layout.hands
-        }
-    if cfg.commands.object.pin_objects:
-        raise ValueError("native object task requires pin_objects=false")
-    if cfg.commands.object.support_disks.enable:
-        raise ValueError("native scene uses its authored static support")
-    return layout
-
-
 def create_envs_isaac(cfg, device: str = "cuda"):
     """Build the Isaac train env (+ shared-eval facade), wrapper-compatible
     with the mujoco ``create_envs`` return signature."""
@@ -302,7 +249,7 @@ def create_envs_isaac(cfg, device: str = "cuda"):
         per_env_mode = per_env_mode and assigned is not None
         xml_path = _SIM_DIR / str(cfg.robot.xml_path)
     else:
-        layout = _bind_native_scene_config(cfg)
+        layout = bind_native_scene_config(cfg)
         per_env_mode, object_slots, assigned = False, [], None
         xml_path = Path(layout.scene_xml_path)
     meta = load_robot_mjcf_meta(xml_path)
@@ -359,8 +306,12 @@ def create_envs_isaac(cfg, device: str = "cuda"):
         cfg, sim_ctx, device, meta, object_slots, assigned_obj_slot=assigned
     )
 
-    managers = _make_manager_cfgs(cfg)
-    env_cfg = IsaacEnvCfg(
+    if native is None:
+        cfg.commands._target_ = (
+            "simulator.isaacsim.commands_isaac.IsaacMotionTrackingCommandCfg"
+        )
+    managers = build_manager_cfgs(cfg)
+    env_cfg = ManagerEnvCfg(
         decimation=decimation,
         physics_dt=timestep,
         episode_length_s=float(cfg.get("episode_length_s", 20.0)),
@@ -368,30 +319,30 @@ def create_envs_isaac(cfg, device: str = "cuda"):
         num_envs=int(cfg.scene.num_envs),
         **managers,
     )
-    env = IsaacManagerBasedRlEnv(env_cfg, scene_adapter, sim_adapter, device=device)
+    env = ManagerBasedRlEnv(env_cfg, scene_adapter, sim_adapter, device=device)
 
     if per_env_mode:
         # Object-aware eval: each motion's replicas run on envs hosting its
         # object; the sweep plan + isaac setup callback replace the defaults.
-        from evaluation.isaac import build_eval_plan
+        from evaluation.shared import build_eval_plan
 
         cmd = env.command_manager.get_term(cfg.eval.command_name)
         tos = cmd.motion_lib.traj_obj_slot
-        env._isaac_eval_plan = build_eval_plan(
+        env._object_eval_plan = build_eval_plan(
             scene_adapter.assigned_obj_slot,
             tos["right"] if "right" in tos else tos["left"],
             int(cfg.eval.num_per_motion),
         )
         cfg.eval.callbacks[0]._target_ = (
-            "evaluation.isaac.IsaacMotionTrackingEvalSetup"
+            "evaluation.shared.ObjectSlotMotionTrackingEvalSetup"
         )
         # Shared-env eval pauses training for one pass per batch; the configured
         # cadence stands either way, so just report the sweep cost.
-        n_batches = max(1, len(env._isaac_eval_plan))
+        n_batches = max(1, len(env._object_eval_plan))
         every = cfg.eval.get("interval", "?")
         print(f"[isaac] eval sweep: {n_batches} batches, every {every} steps")
 
-    from evaluation.isaac import SharedEvalEnv
+    from evaluation.shared import SharedEvalEnv
 
     train_env = RslRlVecEnvWrapper(env)
     # SharedEvalEnv already speaks the rsl_rl 4-tuple surface evaluation.evaluate needs;

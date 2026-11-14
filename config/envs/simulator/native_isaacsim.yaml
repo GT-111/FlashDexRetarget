@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - isaacsim
+  - _self_
+
+sim:
+  native_assets:
+    static: ${oc.env:FDR_NATIVE_USD_DIR}/static.usd
+    articulations:
+      hand_left: ${oc.env:FDR_NATIVE_USD_DIR}/hand_left.usd
+      hand_right: ${oc.env:FDR_NATIVE_USD_DIR}/hand_right.usd
+      articulated_object: ${oc.env:FDR_NATIVE_USD_DIR}/articulated_object.usd

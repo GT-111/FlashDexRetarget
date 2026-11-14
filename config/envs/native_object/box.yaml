@@ -5,7 +5,6 @@
 entity_name: articulated_object
 root_body_name: object_0
 root_joint_name: object_0_free
-usd_path: ${oc.env:FDR_NATIVE_USD_DIR}/articulated_object.usd
 parts:
   - name: base
     body_name: object_0

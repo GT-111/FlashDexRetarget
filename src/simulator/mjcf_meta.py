@@ -182,7 +182,9 @@ def load_robot_mjcf_meta(xml_path: str | Path) -> RobotMjcfMeta:
     scalar_joints = [
         j
         for j in range(m.njnt)
-        if m.jnt_type[j] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)
+        if int(m.jnt_type[j]) in (
+            int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)
+        )
     ]
     joint_names = [_name(mujoco.mjtObj.mjOBJ_JOINT, j) for j in scalar_joints]
     dof = [int(m.jnt_dofadr[j]) for j in scalar_joints]

@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import torch
 
+from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
 from envs.observations.native import NativeMotionTrackingObs
 from envs.rewards.native import NativeMotionTrackingRewards
 from envs.scene.native import NativeSceneCfg
@@ -14,7 +15,6 @@ from envs.terminations.native import NativeMotionTrackingTerminations
 from evaluation.callbacks.tracking_performance import NativeReferenceTrackingPerformance
 from simulator.isaacsim.commands_isaac import (
     IsaacMotionTrackingCommand,
-    IsaacNativeMotionTrackingCommand,
 )
 from simulator.isaacsim.entity import FreeArticulationAdapter
 
@@ -43,14 +43,12 @@ def _command(*, rigid=False):
     layout = NativeSceneCfg.from_mapping(
         dict(
             scene_xml_path="synthetic-not-a-model.xml",
-            static_usd_path="synthetic.usd",
             hands=[
                 dict(
                     side=s,
                     entity_name=s,
                     root_body_name=s + "_root",
                     root_joint_name=s + "_free",
-                    usd_path=s + ".usd",
                     command_actuator_names=["command_" + s],
                     root_control=control,
                 )
@@ -60,7 +58,6 @@ def _command(*, rigid=False):
                 entity_name="object",
                 root_body_name="object_root",
                 root_joint_name="object_free",
-                usd_path="object.usd",
                 parts=parts,
             ),
         )
@@ -169,7 +166,7 @@ def _command(*, rigid=False):
         scene=Scene(robot=robot, object=obj),
         episode_length_buf=torch.tensor([20]),
     )
-    command = object.__new__(IsaacNativeMotionTrackingCommand)
+    command = object.__new__(NativeMotionTrackingCommand)
     command.native_layout, command.motion_lib, command.robot = layout, ml, robot
     command._env = env
     command._side_list = ["left", "right"]
@@ -193,7 +190,8 @@ def test_native_profile_builds_real_box_and_rigid_managers(tmp_path):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
-    from simulator.isaacsim.create import _bind_native_scene_config, _make_manager_cfgs
+    from envs import build_manager_cfgs
+    from envs.scene.native import bind_native_scene_config
 
     environment = {
         "FDR_NATIVE_SCENE_XML": str(tmp_path / "synthetic.xml"),
@@ -235,9 +233,9 @@ def test_native_profile_builds_real_box_and_rigid_managers(tmp_path):
             OmegaConf.resolve(
                 cfg
             )  # Same public composition step as train.run, without AppLauncher.
-            layout = _bind_native_scene_config(cfg)
+            layout = bind_native_scene_config(cfg)
             assert len(layout.object.parts) == count
-            managers = _make_manager_cfgs(cfg)
+            managers = build_manager_cfgs(cfg)
             assert not managers["curriculum"]
             assert "native_command_bc" in managers["rewards"]
             assert "tracking_joint_pos_bc_exp" not in managers["rewards"]
@@ -363,7 +361,7 @@ def test_native_reset_preserves_named_states_and_real_zero_width_rigid(tmp_path)
 def test_native_selection_requires_all_part_support_and_finite_actual_state(tmp_path):
     from mjlab.managers import CommandTerm
 
-    from evaluation.isaac import _NullTerminationManager
+    from evaluation.shared import _NullTerminationManager
 
     del tmp_path
     command, env, _ = _command()

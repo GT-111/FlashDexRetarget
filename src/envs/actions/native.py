@@ -134,6 +134,7 @@ class NativeResidualAction(ActionTerm):
             },
             "effort_authority": "hand_roots_only_no_object_assistance",
             "main_tracker_numeric_parity": False,
+            "application": getattr(env.scene, "root_wrench_application", None),
         }
         self._action_recipe = {
             "action_names": self.action_names,
@@ -151,7 +152,8 @@ class NativeResidualAction(ActionTerm):
             "cutoff_hz": dict(cfg.cutoff_hz),
             "filter_alpha": self._alpha.cpu().tolist(),
             "control_period_s": float(env.step_dt),
-            "condition": "external_physx_producer_not_main_tracker_numeric_parity",
+            "condition": "external_native_producer_not_main_tracker_numeric_parity",
+            "backend": getattr(env.scene, "backend_identity", None),
         }
         self.ref_joint_pos_used = None
 

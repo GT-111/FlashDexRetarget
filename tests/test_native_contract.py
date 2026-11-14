@@ -11,7 +11,7 @@ from envs.actions.native import NativeResidualAction, NativeResidualActionCfg
 from envs.scene.native import NativeSceneCfg
 from simulator.isaacsim.convert_assets import write_native_mjcf_assets
 from simulator.isaacsim.entity import FreeArticulationAdapter, _FreshnessClock
-from simulator.isaacsim.mjcf_meta import load_robot_mjcf_meta
+from simulator.mjcf_meta import load_robot_mjcf_meta
 
 
 def _scene(tmp_path):
@@ -64,14 +64,12 @@ def _scene(tmp_path):
     )
     mapping = dict(
         scene_xml_path=str(source),
-        static_usd_path=str(tmp_path / "static.usd"),
         hands=[
             dict(
                 side=side,
                 entity_name=f"hand_{side}",
                 root_body_name=f"{side}_root",
                 root_joint_name=f"{side}_free",
-                usd_path=str(tmp_path / f"{side}.usd"),
                 command_actuator_names=commands,
                 root_control=control,
             )
@@ -84,7 +82,6 @@ def _scene(tmp_path):
             entity_name="object",
             root_body_name="base",
             root_joint_name="base_free",
-            usd_path=str(tmp_path / "object.usd"),
             parts=[
                 dict(name=n, body_name=n, mesh_path=f"{n}.obj") for n in ("base", "lid")
             ],
@@ -124,7 +121,11 @@ def test_native_conversion_inputs_preserve_subtree_inertials_and_one_articulated
 ):
     layout, _ = _scene(tmp_path)
     original = load_robot_mjcf_meta(layout.scene_xml_path)
-    paths = write_native_mjcf_assets(layout)
+    paths = write_native_mjcf_assets(layout, {
+        "static": str(tmp_path / "static.usd"),
+        "articulations": {b.entity_name: str(tmp_path / (b.entity_name + ".usd"))
+                          for b in layout.articulations},
+    })
     for binding in layout.articulations:
         saved = load_robot_mjcf_meta(paths[binding.entity_name])
         expected = original.subtree(binding.root_body_name)

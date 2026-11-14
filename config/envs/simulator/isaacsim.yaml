@@ -1,6 +1,8 @@
 # @package _global_
 
 sim:
+  _target_: simulator.isaacsim.create.create_envs_isaac
+  runtime_launcher: simulator.isaacsim.runtime.launch
   backend: isaacsim
   dt: 0.0041666667
   robot_gravcomp: 0.0   # fraction of robot link weight lifted at the COM (MJCF uses 0.8)
