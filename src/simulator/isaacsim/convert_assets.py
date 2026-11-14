@@ -418,30 +418,47 @@ def convert_robot(force: bool, collision_visual: bool = False, variant: str = "r
 
 
 def _block_empty_robot_visual_references(usd_path: str, urdf_path: str) -> list[str]:
-    """Block importer references for URDF links that have no visual geometry.
+    """Remove generated importer references for URDF links without visuals.
 
     Isaac Sim 5.1 creates a reference to ``/visuals/<link>`` even for empty
-    wrist-chain and tip frames. The target does not exist, so every cloned hand
-    repeats a composition warning. A stronger empty reference list removes only
-    that arc; physical link, joint, tip and collision prims are left untouched.
+    wrist-chain and tip frames. Root-layer list edits cannot remove arcs inside
+    a referenced layer stack. Edit their introducing generated PrimSpecs instead;
+    physical links, joints, tips, collisions and real visual assets stay intact.
     """
-    from pxr import Usd
+    from pathlib import Path
+
+    from pxr import Sdf, Usd
 
     stage = Usd.Stage.Open(usd_path)
     root_path = stage.GetDefaultPrim().GetPath()
+    output_dir = Path(usd_path).resolve().parent
     blocked = []
-    with Usd.EditContext(stage, stage.GetRootLayer()):
-        for link in ET.parse(urdf_path).getroot().findall("link"):
-            if link.find("visual") is not None:
-                continue
-            path = root_path.AppendChild(link.attrib["name"]).AppendChild("visuals")
-            prim = stage.GetPrimAtPath(path)
-            if prim:
-                # ClearReferences would expose the same weaker importer arc.
-                prim.GetReferences().SetReferences([])
-                blocked.append(str(path))
-    stage.GetRootLayer().Save()
-    _log(f"blocked {len(blocked)} empty URDF visual reference paths")
+    edits = {}
+    layers = {}
+    for link in ET.parse(urdf_path).getroot().findall("link"):
+        if link.find("visual") is not None:
+            continue
+        path = root_path.AppendChild(link.attrib["name"]).AppendChild("visuals")
+        prim = stage.GetPrimAtPath(path)
+        if not prim:
+            continue
+        changed = False
+        for spec in prim.GetPrimStack():
+            layer = spec.layer
+            if (layer.realPath and Path(layer.realPath).resolve().is_relative_to(output_dir)
+                    and spec.HasInfo("references")):
+                edits[(layer.identifier, str(spec.path))] = spec
+                layers[layer.identifier] = layer
+                changed = True
+        if changed:
+            blocked.append(str(path))
+    # Collect USD opinions first; query no composed prims during Sdf changes.
+    with Sdf.ChangeBlock():
+        for spec in edits.values():
+            spec.ClearInfo("references")
+    for identifier in sorted(layers):
+        layers[identifier].Save()
+    _log(f"removed {len(blocked)} empty URDF visual reference paths in {len(layers)} generated layers")
     return blocked
 
 

@@ -56,6 +56,12 @@ ordinal 1 and its masked physics device is `cuda:0`. An empty string preserves
 AppLauncher's default mapping. A CUDA mask alone does not isolate graphics
 contexts; include any auxiliary context in the owning allocation's budget.
 
+Robot conversion removes importer-created visual references for URDF links
+without visual geometry from their introducing layers inside the generated
+USD directory. An empty reference list on an outer assembly cannot remove
+those nested arcs. Keep the generated configuration layers with the robot USD;
+real visuals, source meshes, colliders, inertials and joints are preserved.
+
 **Learner** (`config/runner/flashsac.yaml`)
 
 | key | default | meaning |
