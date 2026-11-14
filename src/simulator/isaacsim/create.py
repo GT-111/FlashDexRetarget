@@ -238,10 +238,6 @@ def create_envs_isaac(cfg, device: str = "cuda"):
     with the mujoco ``create_envs`` return signature."""
     import os
 
-    from isaaclab.sim import PhysxCfg, SimulationCfg, SimulationContext
-
-    from .scene import build_isaac_scene
-
     native = cfg.robot.get("native_scene")
     if native is None:
         per_env_mode = os.environ.get("FDR_SLOTS", "0") != "1"
@@ -249,10 +245,15 @@ def create_envs_isaac(cfg, device: str = "cuda"):
         per_env_mode = per_env_mode and assigned is not None
         xml_path = _SIM_DIR / str(cfg.robot.xml_path)
     else:
-        layout = bind_native_scene_config(cfg)
         per_env_mode, object_slots, assigned = False, [], None
-        xml_path = Path(layout.scene_xml_path)
+        xml_path = Path(native.scene_xml_path)
     meta = load_robot_mjcf_meta(xml_path)
+    if native is not None:
+        bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=meta.gravity)
+
+    from isaaclab.sim import PhysxCfg, SimulationCfg, SimulationContext
+
+    from .scene import build_isaac_scene
 
     px = cfg.sim.physx
     timestep = float(cfg.sim.dt)

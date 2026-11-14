@@ -242,6 +242,14 @@ a ramp or different requested vector is unsupported. Editing CPU metadata
 does not update executing dynamics. Actual SDK forwarding and finite gravity
 response are separate qualification gates from CPU adapter tests.
 
+All prepared-native profiles, including native Isaac, use the same static,
+unassisted task admission. A nonempty curriculum is rejected before engine/SDK
+scene construction; the stock Isaac task retains its real global-gravity
+curriculum. Each hand with nonzero root gravity compensation must declare the
+same WORLD vector as the compiled MJCF constructor. A mismatched vector is
+rejected; a zero-compensation hand does not consume its unused vector. This is
+static constructor admission, without adding dynamic native gravity support.
+
 The existing `FDR_PIN_AT_COM=1` option applies a global wrench at the installed
 COM transformed by the achieved world pose. Local wrench calls use the
 body-local point. The default application request is unchanged.

@@ -16,12 +16,10 @@ from .scene import NativeScene, NativeSim
 
 
 def create_native_envs(cfg, device="cuda"):
-    layout = bind_native_scene_config(cfg)
-    meta = load_robot_mjcf_meta(layout.scene_xml_path)
+    meta = load_robot_mjcf_meta(cfg.robot.native_scene.scene_xml_path)
+    layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=meta.gravity)
     if {r.body_name for r in meta.free_roots} != {b.root_body_name for b in layout.articulations}:
         raise ValueError("native scene binding must declare every actual FREE articulation")
-    if cfg.curriculum:
-        raise ValueError("native producer uses the declared unassisted task recipe")
     config = OmegaConf.to_container(cfg.sim.plant, resolve=True)
     plant_class = get_class(config.pop("_target_"))
     # Resolve actual body addresses from the same authored scene used by the plant.

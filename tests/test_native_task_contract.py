@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
@@ -233,7 +234,7 @@ def test_native_profile_builds_real_box_and_rigid_managers(tmp_path):
             OmegaConf.resolve(
                 cfg
             )  # Same public composition step as train.run, without AppLauncher.
-            layout = bind_native_scene_config(cfg)
+            layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=(0.0, 0.0, -9.81))
             assert len(layout.object.parts) == count
             managers = build_manager_cfgs(cfg)
             assert not managers["curriculum"]
@@ -503,3 +504,97 @@ if __name__ == "__main__":
         f"{len(cases)} passed; synthetic software contracts only, no model/FK/Kit/physics",
         flush=True,
     )
+
+
+
+def _native_static_gravity_config(tmp_path, backend="native_isaacsim"):
+    """Ordinary selected configs and compiled MJCF, without constructing a plant."""
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf, open_dict
+    from test_native_contract import _scene
+
+    _, mapping = _scene(tmp_path)
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / "config"), version_base=None):
+        OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
+        cfg = compose(config_name="native", overrides=[f"envs/simulator@simulator={backend}"])
+    with open_dict(cfg):
+        cfg.robot.native_scene = mapping
+    return cfg
+
+
+@pytest.mark.parametrize("backend", ("native_isaacsim", "mjwarp", "newton"))
+def test_native_static_gravity_rejects_curriculum_and_vector_mismatch_before_engine(tmp_path, backend):
+    import sys
+
+    from omegaconf import open_dict
+
+    from envs import create_envs
+
+    cfg = _native_static_gravity_config(tmp_path, backend)
+    before = set(sys.modules)
+    # Both direct constructors are real selected code owners, never invoked.
+    # Isaac SDK imports occur after common native admission, so a wrong order
+    # also fails this test in the normal native environment without the SDK.
+    with patch("simulator.native.mjwarp.MjWarpPlant") as warp, patch("simulator.native.newton.NewtonPlant") as newton:
+        with open_dict(cfg):
+            cfg.curriculum = {"gravity_curriculum": {"params": {"schedule_steps": 10}}}
+        with pytest.raises(ValueError, match="static unassisted recipe; curriculum must be empty"):
+            create_envs(cfg, device="cpu")
+        with open_dict(cfg):
+            cfg.curriculum = {}
+            cfg.robot.native_scene.hands[0].root_control.gravity_world_m_per_s2 = [0., 0., -3.]
+        with pytest.raises(ValueError, match="hand 'left'.*compiled constructor gravity"):
+            create_envs(cfg, device="cpu")
+        warp.assert_not_called()
+        newton.assert_not_called()
+    assert not any(name.startswith(("isaaclab", "isaacsim", "omni.")) for name in set(sys.modules) - before)
+
+
+def test_native_static_gravity_matches_actual_compiled_xml_and_allows_zero_compensation(tmp_path):
+    import xml.etree.ElementTree as ET
+
+    from omegaconf import open_dict
+
+    from envs.scene.native import bind_native_scene_config
+    from simulator.mjcf_meta import load_robot_mjcf_meta
+
+    cfg = _native_static_gravity_config(tmp_path)
+    path = Path(cfg.robot.native_scene.scene_xml_path)
+    tree = ET.parse(path)
+    ET.SubElement(tree.getroot(), "option", gravity="-2 1 -3")
+    tree.write(path)
+    constructor = load_robot_mjcf_meta(path).gravity
+    assert tuple(constructor) == (-2., 1., -3.)
+    # A configured hand vector cannot silently remain at the old -9.81 recipe.
+    with pytest.raises(ValueError, match="compiled constructor gravity"):
+        bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=constructor)
+    for hand in cfg.robot.native_scene.hands:
+        with open_dict(hand.root_control):
+            hand.root_control.gravity_world_m_per_s2 = constructor.tolist()
+    layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=constructor)
+    assert all(tuple(hand.root_control.gravity_world_m_per_s2) == tuple(constructor) for hand in layout.hands)
+    with open_dict(cfg.robot.native_scene.hands[0].root_control):
+        cfg.robot.native_scene.hands[0].root_control.gravity_compensation = 0.
+        cfg.robot.native_scene.hands[0].root_control.gravity_world_m_per_s2 = [0., 0., -9.81]
+    layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=constructor)
+    assert layout.hands[0].root_control.gravity_compensation == 0.
+    assert layout.hands[1].root_control.gravity_compensation == 1.
+
+
+def test_stock_isaac_curriculum_does_not_enter_native_static_admission():
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    from envs import create_envs
+
+    class ReachedStockDiscovery(Exception):
+        pass
+
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / "config"), version_base=None):
+        OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
+        cfg = compose(config_name="flashdexretarget")
+    assert cfg.curriculum and cfg.robot.get("native_scene") is None
+    with patch("simulator.isaacsim.create._discover_object_slots", side_effect=ReachedStockDiscovery) as discover, \
+            pytest.raises(ReachedStockDiscovery):
+        create_envs(cfg, device="cpu")
+    discover.assert_called_once()

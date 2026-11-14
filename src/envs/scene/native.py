@@ -101,11 +101,21 @@ class NativeSceneCfg:
         return (*self.hands, self.object)
 
 
-def bind_native_scene_config(cfg) -> NativeSceneCfg:
-    """Bind mechanical names to reference/task selection, independently of engine."""
+def bind_native_scene_config(cfg, *, constructor_gravity_world_m_per_s2) -> NativeSceneCfg:
+    """Admit one static native recipe against its compiled constructor gravity."""
     from omegaconf import open_dict
 
     layout = NativeSceneCfg.from_mapping(cfg.robot.native_scene)
+    if cfg.curriculum:
+        raise ValueError("native producer uses the declared static unassisted recipe; curriculum must be empty")
+    gravity = tuple(float(value) for value in constructor_gravity_world_m_per_s2)
+    for hand in layout.hands:
+        control = hand.root_control
+        if (control.gravity_compensation != 0.0
+                and tuple(control.gravity_world_m_per_s2) != gravity):
+            raise ValueError(
+                f"native hand {hand.side!r} compensation gravity differs from compiled constructor gravity {gravity}"
+            )
     with open_dict(cfg.commands):
         cfg.commands.native_scene = cfg.robot.native_scene
         cfg.commands.object.entity_names = {
