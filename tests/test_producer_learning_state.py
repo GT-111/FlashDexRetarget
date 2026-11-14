@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 import random
+import signal
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +23,54 @@ from agents.storage.replay_buffer import ReplayBuffer
 from common.utils import capture_rng_state, restore_rng_state
 from envs.curriculum.assist import XfrcAssistCurriculum
 from runner.off_policy_runner import LEARNING_STATE_FILE, OffPolicyRunner
+
+
+def test_stop_signal_authority_and_installation_failure(monkeypatch, capsys, tmp_path):
+    runner = OffPolicyRunner.__new__(OffPolicyRunner)
+
+    def reject_install(*_args):
+        raise ValueError("signal only works in main thread")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(signal, "signal", reject_install)
+        with pytest.raises(ValueError, match="main thread"):
+            runner._install_stop_signal()
+
+    previous = signal.getsignal(signal.SIGUSR1)
+    assert signal.SIGUSR1 not in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    try:
+        runner._agent = SimpleNamespace(ready=lambda: True, update=lambda: {})
+        runner._n_envs = 2
+        runner._step_offset = 0
+        runner._updates_per_step = 1
+        runner._log_every = 0
+        runner._eval_stride = runner._save_stride = 0
+        runner._start_clock = runner._finish = lambda: None
+        runner._collect = lambda *_args: None
+        runner._crossed = lambda *_args: False
+        runner._eval_supported = lambda: False
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        for timing in (False, True):
+            if timing:
+                monkeypatch.setenv("FDR_ITER_TIMING_FILE", str(tmp_path / "timing.csv"))
+            else:
+                monkeypatch.delenv("FDR_ITER_TIMING_FILE", raising=False)
+            runner.learn(3)
+        records = [json.loads(line) for line in capsys.readouterr().out.splitlines()
+                   if line.startswith('{"kind": "runner_stop_signal_authority"')]
+        assert [record["phase"] for record in records] == [
+            "installed", "first_completed_update", "installed", "first_completed_update",
+        ]
+        installed, completed = records[-2:]
+        assert installed["PID"] == os.getpid()
+        assert installed["main_thread"] and installed["python_handler_is_runner_callback"]
+        assert not installed["USR1_blocked"] and not installed["USR1_pending"]
+        assert int(installed["linux_masks"]["SigCgt"], 16) & (1 << (signal.SIGUSR1 - 1))
+        os.kill(installed["PID"], signal.SIGUSR1)
+        assert runner._stop_requested
+        assert completed["python_handler_is_runner_callback"] and not completed["USR1_pending"]
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
 
 
 def _buffer(capacity=64):

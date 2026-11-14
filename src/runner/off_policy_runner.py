@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import signal
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -133,6 +134,7 @@ class OffPolicyRunner:
         meter = AverageMeter()
         update_budget = 0.0
         solved_stop = False
+        stop_authority_recorded = False
 
         for step in tqdm.tqdm(range(1, n_steps + 1), smoothing=0.1, mininterval=0.5):
             env_step = self._step_offset + step * n_envs
@@ -145,12 +147,18 @@ class OffPolicyRunner:
                 continue
 
             update_budget += self._updates_per_step
+            did_update = False
             while update_budget >= 1:
                 train_info = agent.update()
+                did_update = True
                 meter.update(train_info)
                 update_budget -= 1
             if timing_f:
                 torch.cuda.synchronize()
+            if did_update and not stop_authority_recorded:
+                self._record_stop_signal_authority("first_completed_update")
+                stop_authority_recorded = True
+            if timing_f:
                 timing_f.write(f"{step},{env_step},{time.perf_counter() - iter_t0:.6f},1\n")
                 timing_f.flush()
 
@@ -339,7 +347,7 @@ class OffPolicyRunner:
                 except OSError as exc:
                     print(f"[runner] could not drop {old}: {exc}")
 
-    def _install_stop_signal(self) -> None:
+    def _install_stop_signal(self) -> dict[str, Any]:
         """`kill -USR1 <pid>`: finish the current iteration, checkpoint WITH the replay
         buffer and exit, so a resume does not refill the buffer."""
         self._stop_requested = False
@@ -348,10 +356,34 @@ class OffPolicyRunner:
             self._stop_requested = True
             print("[runner] SIGUSR1: stopping after this iteration (saving buffer)", flush=True)
 
-        try:
-            signal.signal(signal.SIGUSR1, _request_stop)
-        except ValueError:  # not the main thread
-            pass
+        self._stop_signal_handler = _request_stop
+        signal.signal(signal.SIGUSR1, _request_stop)
+        return self._record_stop_signal_authority("installed")
+
+    def _record_stop_signal_authority(self, phase: str) -> dict[str, Any]:
+        handler = signal.getsignal(signal.SIGUSR1)
+        masks = {}
+        for line in Path("/proc/self/status").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key in {"SigBlk", "SigIgn", "SigCgt", "SigPnd", "ShdPnd"}:
+                masks[key] = value.strip()
+        record = {
+            "kind": "runner_stop_signal_authority",
+            "phase": phase,
+            "PID": os.getpid(),
+            "thread_id": threading.get_ident(),
+            "native_thread_id": threading.get_native_id(),
+            "main_thread": threading.current_thread() is threading.main_thread(),
+            "signal": "SIGUSR1",
+            "signal_number": int(signal.SIGUSR1),
+            "python_handler": getattr(handler, "__qualname__", str(handler)),
+            "python_handler_is_runner_callback": handler is self._stop_signal_handler,
+            "USR1_blocked": signal.SIGUSR1 in signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            "USR1_pending": signal.SIGUSR1 in signal.sigpending(),
+            "linux_masks": masks,
+        }
+        print(json.dumps(record), flush=True)
+        return record
 
     def _graceful_stop(self, env_step: int) -> None:
         ckpt = self._save_path_base / f"stop{env_step}"

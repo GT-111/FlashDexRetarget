@@ -137,6 +137,13 @@ gather), so a GPU with less memory can run the same config. The buffer scales wi
 `kill -USR1 <pid>` finishes the iteration, saves `stop<N>/` and exits. A full learning
 checkpoint contains networks and target critics, Adam and LR-scheduler states, the AMP scaler,
 reward-normalizer statistics, `replay_buffer.pt`, `learning_state.pt` and `resume_state.json`.
+
+The runner registers this handler on the main thread; registration failure now
+stops startup. It logs one JSON signal-authority record at installation and one
+after the first completed update, including the actual PID, current handler and
+blocked/pending signal state. These records diagnose signal ownership; they do
+not establish that a later request produced a full checkpoint. Confirm the
+`graceful stop` message and complete `stop<N>/` before resuming.
 A periodic `step<N>/` includes replay and learning state only with `save_replay_buffer=true`.
 Weights-only checkpoints remain usable for evaluation and policy initialization.
 
