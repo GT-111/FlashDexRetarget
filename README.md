@@ -51,6 +51,10 @@ For factual native export, select
 and supply its `binding` JSON. The binding names the actual bilateral hand
 bodies, native joint correspondence, ordered object parts, source-to-scene
 transform, prepared source clocks and assistance receipt. The recorder captures
+prepared-native source identity and placement from the motion library's
+`native_reference_provenance`, with requested-reference authority. Human imports
+retain their own capture identity and source-to-scene placement. Neither route
+can substitute achieved state for reference provenance. The recorder captures
 reset before subsequent achieved states, preserving measured Q/Qvel and raw
 action validity. Source rows come from the actual pre-advance command reference
 phase; the next-target cursor is retained separately, including its clamped

@@ -196,12 +196,24 @@ class NativeRolloutRecord(RolloutRecord):
             ordinal = self.cmd.motion_lib.source_query_ordinal[index]
             elapsed = self.cmd.motion_lib.source_import_elapsed_ns[index]
             if (lineage is None or ordinal is None or elapsed is None
-                    or lineage["capture_id"] != clip["source_unit_id"]
-                    or not np.array_equal(lineage["selected_source_frame_index"], clip["selected_source_frame_index"])
                     or not np.array_equal(ordinal, clip["prepared_source_ordinal"])
-                    or not np.array_equal(elapsed - elapsed[0], clip["prepared_elapsed_time_ns"])
-                    or not np.allclose(lineage["scene_from_source_world"], self.binding["scene_from_source_world"],
-                                       atol=1e-9, rtol=0)):
+                    or not np.array_equal(elapsed - elapsed[0], clip["prepared_elapsed_time_ns"])):
+                raise ValueError("FlashDex native binding differs from the actual imported frame/scene lineage")
+            native_provenance = getattr(self.cmd.motion_lib, "native_reference_provenance", None)
+            if native_provenance is not None:
+                provenance = native_provenance[index]
+                # Prepared native references own placement separately from their
+                # canonical source mapping; neither is an achieved-state claim.
+                matches = (lineage == clip and provenance.get("source") == clip
+                    and provenance.get("authority") == "requested_reference_not_achieved_state"
+                    and np.array_equal(provenance.get("scene_from_source_world"),
+                                       self.binding["scene_from_source_world"]))
+            else:
+                matches = (lineage.get("capture_id") == clip["source_unit_id"]
+                    and np.array_equal(lineage["selected_source_frame_index"], clip["selected_source_frame_index"])
+                    and np.allclose(lineage["scene_from_source_world"], self.binding["scene_from_source_world"],
+                                    atol=1e-9, rtol=0))
+            if not matches:
                 raise ValueError("FlashDex native binding differs from the actual imported frame/scene lineage")
         installed = [(name, env.action_manager.get_term(name)) for name in env.action_manager.active_terms
                      if hasattr(env.action_manager.get_term(name), "installed_control")]

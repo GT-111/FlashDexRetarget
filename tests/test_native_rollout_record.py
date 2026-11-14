@@ -7,6 +7,7 @@ from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from evaluation.callbacks.rollout_record import NativeRolloutRecord
@@ -49,9 +50,15 @@ def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, se
         hand.apply_root_pose_target = lambda target, support, control: (torch.ones((1, 3)), torch.full((1, 3), 2.))
     name, source = next(iter(binding["clips"].items()))
     library.motion_files = ["synthetic#" + name]
-    library.source_lineage = [{"capture_id": source["source_unit_id"],
-        "selected_source_frame_index": source["selected_source_frame_index"],
-        "scene_from_source_world": binding["scene_from_source_world"]}]
+    if native:
+        library.source_lineage = [dict(source)]
+        library.native_reference_provenance = [dict(
+            authority="requested_reference_not_achieved_state", source=dict(source),
+            scene_from_source_world=binding["scene_from_source_world"])]
+    else:
+        library.source_lineage = [{"capture_id": source["source_unit_id"],
+            "selected_source_frame_index": source["selected_source_frame_index"],
+            "scene_from_source_world": binding["scene_from_source_world"]}]
     library.source_query_ordinal = [np.asarray(source["prepared_source_ordinal"])]
     library.source_import_elapsed_ns = [np.asarray(source["prepared_elapsed_time_ns"], np.int64) + 1_000_000_000]
     env.scene.env_origins = torch.tensor([[1., 2., 3.]])
@@ -305,3 +312,98 @@ def test_frozen_attempt_npz_keeps_actual_native_schema_clocks_interval_and_first
     assert export_success(success_manifest.parent, recorder, [], torch.tensor([True]), torch.tensor([0]),
         99999, "fixture", motion_names=["fixture"]) == 0
     assert success_manifest.read_bytes() == original_manifest
+
+
+def _prepared_native_recorder_fixture(tmp_path):
+    """Real prepared-input/pack/library admission; only achieved state is synthetic."""
+    from dexforge_adaptation.flashdex_retarget import flashdex_source_mapping
+    from test_native_reference import _pipeline_config, _prepared_native_dataset
+
+    from envs.commands.common.motion_library import MotionLibrary
+    from retarget.human_demo import clips as C
+    from retarget.kinematic_retargeting import PreparedNativeInput
+
+    dataset, clip = _prepared_native_dataset(tmp_path)
+    elapsed = np.arange(3, dtype=np.int64) * 20_000_000
+    origin = 2**60 + 37
+    source = flashdex_source_mapping(source_id="arctic", source_revision="synthetic-fixture",
+        source_unit_id="episode-000174", source_episode_index=174, fold="train",
+        source_frame_index=(0, 1, 2), source_time_ns=origin + elapsed,
+        selected_source_frame_index=(0, 1, 2), prepared_source_ordinal=(0., 1., 2.),
+        prepared_elapsed_time_ns=elapsed, clock_authority="synthetic exact source clock",
+        processing={"fixture": "recorder software admission, not physical execution"})
+    placement = np.eye(4)
+    placement[:3, 3] = (1., -2., .3)
+    native = clip["native_reference"]
+    native["time_ns"] = elapsed.copy()
+    native["provenance"] = dict(authority="requested_reference_not_achieved_state",
+        source=dict(source), scene_from_source_world=placement.tolist())
+    clip["source_lineage_json"] = np.asarray(json.dumps(source))
+    clip["source_query_ordinal"] = np.asarray(source["prepared_source_ordinal"])
+    clip["source_import_elapsed_ns"] = elapsed.copy()
+    C.save_clip(dataset / "native_reference/synthetic-stage.npz", clip)
+    cfg = _pipeline_config(dataset)
+    prepared = PreparedNativeInput(dataset, cfg, workers=1, manifest="native-reference.json")
+    prepared.pack()
+
+    joint_names = ("left_a", "left_mimic", "right_b")
+    robot = SimpleNamespace(num_joints=len(joint_names), joint_names=joint_names,
+        body_names=("left_root", "right_root"), data=SimpleNamespace(
+            joint_pos=torch.zeros(1, 3), joint_vel=torch.zeros(1, 3),
+            root_link_pos_w=torch.zeros(1, 3), root_link_quat_w=torch.tensor([[1., 0., 0., 0.]]),
+            body_link_pos_w=torch.zeros(1, 2, 3),
+            body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2]),
+            body_link_lin_vel_w=torch.zeros(1, 2, 3), body_link_ang_vel_w=torch.zeros(1, 2, 3)))
+    library = MotionLibrary(str(dataset / "motion.pt"), robot, finger_names=C.FINGERS, device="cpu")
+    command = SimpleNamespace(robot=robot, motion_lib=library,
+        motion_ids=torch.zeros(1, dtype=torch.int64), motion_steps=torch.ones(1, dtype=torch.int64),
+        reference_phase={"motion_ids": torch.zeros(1, dtype=torch.int64),
+                         "motion_steps": torch.zeros(1, dtype=torch.int64)},
+        cfg=SimpleNamespace(object=SimpleNamespace(pin_objects=False)), _xfrc_curr_ctrl=None,
+        sim_obj_trans_w=torch.zeros(1, 2, 3),
+        sim_obj_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2]))
+
+    class Scene(dict):
+        env_origins = torch.zeros(1, 3)
+
+    scene = Scene(articulated_object=SimpleNamespace(body_names=("lid", "base"),
+        data=SimpleNamespace(body_link_pos_w=torch.zeros(1, 2, 3),
+            body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2]))))
+    env = SimpleNamespace(step_dt=.02, num_envs=1, scene=scene,
+        action_manager=SimpleNamespace(action=torch.zeros(1, 3), active_terms=[]),
+        command_manager=SimpleNamespace(get_term=lambda name: command))
+    binding = dict(scene_from_source_world=placement.tolist(),
+        hands={"left": dict(body_name="left_root", physical_joint_names={"driver": "left_a", "mimic": "left_mimic"}),
+               "right": dict(body_name="right_root", physical_joint_names={"driver": "right_b"})},
+        object_part_names=["lid", "base"], object_parts={name: dict(entity_name="articulated_object", body_name=name)
+            for name in ("lid", "base")}, clips={"synthetic-stage": source})
+    return env, binding
+
+
+def test_prepared_native_input_pack_library_recorder_keeps_canonical_source_and_placement(tmp_path):
+    env, binding = _prepared_native_recorder_fixture(tmp_path)
+    library = env.command_manager.get_term("motion").motion_lib
+    assert "capture_id" not in library.source_lineage[0]
+    assert "scene_from_source_world" not in library.source_lineage[0]
+    assert library.source_lineage[0] == binding["clips"]["synthetic-stage"]
+    assert library.native_reference_provenance[0]["source"] == library.source_lineage[0]
+    recorder = NativeRolloutRecord(binding=binding)
+    recorder.on_start(env)
+    assert recorder.rollout_steps == 2
+    arrays = recorder.rollout_arrays([recorder.collect_state()], 0)
+    np.testing.assert_array_equal(arrays["recorded_motion_steps"], [0])
+    assert json.loads(str(arrays["native_binding_json"])) == binding
+
+
+@pytest.mark.parametrize("mismatch", ["source", "placement", "authority"])
+def test_prepared_native_recorder_rejects_different_reference_source_or_placement(tmp_path, mismatch):
+    env, binding = _prepared_native_recorder_fixture(tmp_path)
+    provenance = env.command_manager.get_term("motion").motion_lib.native_reference_provenance[0]
+    if mismatch == "source":
+        provenance["source"] = {**provenance["source"], "source_revision": "another-release"}
+    elif mismatch == "placement":
+        provenance["scene_from_source_world"][0][3] += .01
+    else:
+        provenance["authority"] = "achieved_state"
+    with pytest.raises(ValueError, match="imported frame/scene lineage"):
+        NativeRolloutRecord(binding=binding).on_start(env)
