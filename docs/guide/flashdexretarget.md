@@ -216,6 +216,15 @@ durations and full-horizon outcomes retain their separate source/task authority.
 
 ### Installed dynamics and gravity
 
+The shared MJCF metadata loader requires a built-in scalar actuator roster:
+fixed gain, no or affine bias, and no plugin force implementation. Scalar
+position actuators must implement `force = kp * (target - q) - kv * qvel`, with
+finite positive `kp`, nonnegative `kv`, unit scalar gear, no activation filter
+and no control delay. Equivalent `<general>` servos and `dampratio`-authored
+damping are supported. FREE-root WORLD-wrench motors keep their separate
+control contract. An unsupported actuator chart fails at this common input
+boundary before it can be mistaken for a native position request.
+
 `entity.body_inertial_properties()` exposes named, stopped properties with an
 explicit world axis: mass `[world,body]`, body-local COM `[world,body,3]`, and
 COM inertia expressed in the body frame `[world,body,3,3]`. Isaac reads the

@@ -335,6 +335,93 @@ def test_native_free_root_wrench_is_root_only_and_recomputed_from_current_body_s
         assert float(torques[:, 0].norm()) <= 1.0
 
 
+def test_native_metadata_admits_position_and_equivalent_general_charts(tmp_path):
+    layout, _ = _scene(tmp_path)
+    tree = ET.parse(layout.scene_xml_path)
+    actuators = tree.getroot().find("actuator")
+    a, b, c = list(actuators)
+    # XHand's explicit damping, F1's saved general form and Sharpa's dampratio.
+    a.set("kv", "1.5")
+    b.tag = "general"
+    b.attrib.clear()
+    b.attrib.update(name="command_B", joint="right_joint", gaintype="fixed",
+                    biastype="affine", gainprm="20", biasprm="0 -20")
+    c.set("kp", "6.95")
+    c.set("dampratio", ".9")
+    actuators[:] = [c, a, b]
+    ET.SubElement(actuators, "motor", name="world_wrench_x", jointinparent="left_free",
+                  gear="1 0 0 0 0 0")
+    tree.write(layout.scene_xml_path)
+
+    meta = load_robot_mjcf_meta(layout.scene_xml_path)
+    assert meta.actuator_names == ["command_C", "command_A", "command_B"]
+    assert meta.actuator_joint == {
+        "command_C": "right_other", "command_A": "left_joint", "command_B": "right_joint",
+    }
+    np.testing.assert_array_equal(meta.actuator_kp, [6.95, 20., 20.])
+    assert np.isfinite(meta.actuator_kv[0]) and meta.actuator_kv[0] > 0
+    np.testing.assert_array_equal(meta.actuator_kv[1:], [1.5, 0.])
+    assert [r.name for r in meta.free_roots] == ["left_free", "right_free", "base_free"]
+    assert meta.subtree("base").actuator_names == []
+    np.testing.assert_allclose(meta.command_limits(("command_A",)), [[0., .4]])
+
+
+def test_native_metadata_rejects_motor_and_nonunit_gear_position_targets(tmp_path):
+    import pytest
+
+    for name, tag, attrs in (
+        ("motor", "motor", {}),
+        ("geared", "position", {"kp": "20", "gear": "2"}),
+        ("reversed", "position", {"kp": "20", "gear": "-1"}),
+    ):
+        directory = tmp_path / name
+        directory.mkdir()
+        layout, _ = _scene(directory)
+        tree = ET.parse(layout.scene_xml_path)
+        actuator = tree.getroot().find("actuator")[0]
+        actuator.tag = tag
+        actuator.attrib.clear()
+        actuator.attrib.update(name="command_A", joint="left_joint", **attrs)
+        tree.write(layout.scene_xml_path)
+        with pytest.raises(ValueError, match="actuator 'command_A'.*memoryless unit-gear position servo"):
+            load_robot_mjcf_meta(layout.scene_xml_path)
+
+
+def test_native_metadata_rejects_changed_bias_filtered_and_delayed_targets(tmp_path):
+    import pytest
+
+    for name, tag, attrs in (
+        ("changed_gain_bias", "general", {"gainprm": "20", "biastype": "affine", "biasprm": "0 -10"}),
+        ("target_offset", "general", {"gainprm": "20", "biastype": "affine", "biasprm": "1 -20"}),
+        ("filtered", "position", {"kp": "20", "timeconst": ".01"}),
+        ("delayed", "position", {"kp": "20", "delay": ".01", "nsample": "8"}),
+    ):
+        directory = tmp_path / name
+        directory.mkdir()
+        layout, _ = _scene(directory)
+        tree = ET.parse(layout.scene_xml_path)
+        actuator = tree.getroot().find("actuator")[0]
+        actuator.tag = tag
+        actuator.attrib.clear()
+        actuator.attrib.update(name="command_A", joint="left_joint", **attrs)
+        tree.write(layout.scene_xml_path)
+        with pytest.raises(ValueError, match="actuator 'command_A'.*memoryless unit-gear position servo"):
+            load_robot_mjcf_meta(layout.scene_xml_path)
+
+
+def test_native_metadata_rejects_nonbuiltin_roster_before_position_indexing(tmp_path):
+    import pytest
+
+    layout, _ = _scene(tmp_path)
+    tree = ET.parse(layout.scene_xml_path)
+    actuators = tree.getroot().find("actuator")
+    ET.SubElement(actuators, "general", name="changed_root_gain", jointinparent="left_free",
+                  gaintype="affine", gainprm="1 1 0", gear="1 0 0 0 0 0")
+    tree.write(layout.scene_xml_path)
+    with pytest.raises(ValueError, match="actuator 'changed_root_gain'.*builtin scalar fixed-gain"):
+        load_robot_mjcf_meta(layout.scene_xml_path)
+
+
 if __name__ == "__main__":
     # The pinned author environment need not install a separate test runner.
     from pathlib import Path

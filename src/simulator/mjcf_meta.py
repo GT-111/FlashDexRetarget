@@ -189,12 +189,43 @@ def load_robot_mjcf_meta(xml_path: str | Path) -> RobotMjcfMeta:
     joint_names = [_name(mujoco.mjtObj.mjOBJ_JOINT, j) for j in scalar_joints]
     dof = [int(m.jnt_dofadr[j]) for j in scalar_joints]
     joint_ids = set(scalar_joints)
+    # Newer MuJoCo has multi-input actuator blocks; our named control slots
+    # require the builtin scalar roster on both supported MuJoCo profiles.
+    for a in range(len(m.actuator_trntype)):
+        if (
+            int(m.actuator_gaintype[a]) != int(mujoco.mjtGain.mjGAIN_FIXED)
+            or int(m.actuator_biastype[a]) not in (
+                int(mujoco.mjtBias.mjBIAS_NONE), int(mujoco.mjtBias.mjBIAS_AFFINE)
+            )
+            or m.actuator_plugin[a] >= 0
+        ):
+            raise ValueError(
+                f"actuator {_name(mujoco.mjtObj.mjOBJ_ACTUATOR, a)!r} requires "
+                "a builtin scalar fixed-gain control roster with no or affine bias"
+            )
     position_actuators = [
         i
         for i in range(m.nu)
         if m.actuator_trntype[i] == mujoco.mjtTrn.mjTRN_JOINT
         and int(m.actuator_trnid[i, 0]) in joint_ids
     ]
+    for a in position_actuators:
+        kp = m.actuator_gainprm[a, 0]
+        bias = m.actuator_biasprm[a]
+        if not (
+            int(m.actuator_biastype[a]) == int(mujoco.mjtBias.mjBIAS_AFFINE)
+            and int(m.actuator_dyntype[a]) == int(mujoco.mjtDyn.mjDYN_NONE)
+            and m.actuator_delay[a] == 0
+            and m.actuator_gear[a, 0] == 1
+            and np.isfinite(kp) and kp > 0
+            and bias[0] == 0 and bias[1] == -kp
+            and np.isfinite(bias[2]) and bias[2] <= 0
+        ):
+            raise ValueError(
+                f"actuator {_name(mujoco.mjtObj.mjOBJ_ACTUATOR, a)!r} requires "
+                "a memoryless unit-gear position servo: "
+                "force = kp * (target - q) - kv * qvel, kp > 0, kv >= 0, no delay"
+            )
     actuator_names = [
         _name(mujoco.mjtObj.mjOBJ_ACTUATOR, i) for i in position_actuators
     ]
