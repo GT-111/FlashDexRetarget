@@ -1,4 +1,5 @@
 defaults:
+  - input: human_demo   # human_demo | prepared_native
   - convex: coacd   # coacd | cuacd
   - override hydra/job_logging: none
   - override hydra/hydra_logging: none

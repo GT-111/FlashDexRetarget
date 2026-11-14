@@ -6,9 +6,12 @@ from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
+from unittest.mock import patch
 
 import numpy as np
 import torch
+from hydra import compose, initialize_config_dir
+from hydra.errors import InstantiationException
 
 from retarget.build_motion_pt import build
 from retarget.human_demo import clips as C
@@ -77,16 +80,134 @@ def _reader(path, *, joint_names=("left_a", "left_mimic", "right_b")):
     return module.MotionLibrary(str(path), robot, finger_names=C.FINGERS, device="cpu")
 
 
+def _mesh(dataset):
+    mesh = dataset / "objects/synthetic-mesh/visual.obj"
+    mesh.parent.mkdir(parents=True)
+    mesh.write_text("v 0 0 0\nv .01 0 0\nv 0 .01 0\nv 0 0 .01\nf 1 3 2\nf 1 2 4\nf 1 4 3\nf 2 3 4\n")
+
+
 def _pack(tmp_path, clip):
     prepared = tmp_path / "prepared"
     prepared.mkdir()
     dataset = tmp_path / "dataset"
-    mesh = dataset / "objects/synthetic-mesh/visual.obj"
-    mesh.parent.mkdir(parents=True)
-    mesh.write_text("v 0 0 0\nv .01 0 0\nv 0 .01 0\nv 0 0 .01\nf 1 3 2\nf 1 2 4\nf 1 4 3\nf 2 3 4\n")
+    _mesh(dataset)
     C.save_clip(prepared / "synthetic-stage.npz", clip)
     build(prepared, dataset, 60., SimpleNamespace(vel_sigma=2., contact_threshold=.015))
     return dataset / "motion.pt"
+
+
+def _prepared_native_dataset(tmp_path):
+    dataset = tmp_path / "dataset"
+    prepared = dataset / "native_reference"
+    prepared.mkdir(parents=True)
+    _mesh(dataset)
+    clip = _clip()
+    clip["fps"] = np.float32(50)
+    time_ns = 2**60 + np.arange(3, dtype=np.int64) * 20_000_000
+    clip["native_reference"]["time_ns"] = time_ns
+    clip["source_import_elapsed_ns"] = time_ns.copy()
+    C.save_clip(prepared / "synthetic-stage.npz", clip)
+    (dataset / "native-reference.json").write_text(json.dumps(dict(
+        clip_directory="native_reference", clips=["synthetic-stage"], fps=50., control_period_ns=20_000_000)))
+    return dataset, clip
+
+
+def _pipeline_config(dataset, *, prepared=True):
+    overrides = ["dataset=" + str(dataset), "workers=1", "steps.convex=false", "steps.usd=false", "steps.sdf=false"]
+    if prepared:
+        overrides.append("input=prepared_native")
+    with initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "config/retarget"), version_base=None,
+    ):
+        return compose(config_name="kinematic_retargeting", overrides=overrides)
+
+
+def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_command(tmp_path):
+    from envs.commands.common.motion_library import MotionLibrary
+    from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
+    from envs.scene.native import NativeSceneCfg
+    from retarget import kinematic_retargeting as pipeline
+
+    dataset, clip = _prepared_native_dataset(tmp_path)
+    # A stale human-demo directory and an unselected carrier must not choose the route or population.
+    (dataset / "human_demo").mkdir()
+    (dataset / "human_demo/rejected-by-stock-route.npz").write_text("unselected human demo")
+    (dataset / "native_reference/unselected.npz").write_text("unselected native carrier")
+    cfg = _pipeline_config(dataset)
+    assert cfg.steps.retarget  # Prepared input itself owns the bypass; no redundant flag is required.
+    pipeline.main.__wrapped__(cfg)
+
+    joint_names = ("left_a", "left_mimic", "right_b")
+    library = MotionLibrary(str(dataset / "motion.pt"),
+        SimpleNamespace(num_joints=len(joint_names), joint_names=joint_names), finger_names=C.FINGERS, device="cpu")
+    native = clip["native_reference"]
+    assert library.motion_files == [str(dataset / "motion.pt") + "#synthetic-stage"]
+    assert library.support_disks.shape == (1, 0, 5)
+    assert not (dataset / "report.csv").exists()
+    assert not (dataset / "retargeted").exists()
+    np.testing.assert_array_equal(library.native_time_ns, native["time_ns"])
+    np.testing.assert_array_equal(library.native_joint_velocity_support, native["joint_velocity_support"][:, [2, 1, 0]])
+    assert library.native_reference_provenance == [native["provenance"]]
+
+    # Exercise the actual native command's reader admission, without constructing a physical model.
+    layout = NativeSceneCfg.from_mapping(dict(
+        scene_xml_path="synthetic-not-a-model.xml",
+        hands=[dict(side=side, entity_name=side, root_body_name=body, root_joint_name=side + "_free",
+            command_actuator_names=["command_" + side], root_control=dict(position_stiffness=0,
+                position_damping=0, rotation_stiffness=0, rotation_damping=0, force_limit_n=None,
+                torque_limit_nm=None)) for side, body in native["root_body_names"].items()],
+        object=dict(entity_name=native["object_entity_name"], root_body_name=native["object_root_body_name"],
+            root_joint_name="synthetic_object_free", parts=[dict(name=body, body_name=body, mesh_path="synthetic.obj")
+                for body in native["object_part_body_names"]])))
+    obj = SimpleNamespace(joint_names=("hinge_a", "hinge_b"), body_names=("base", "lid"))
+    command = object.__new__(NativeMotionTrackingCommand)
+    command.native_layout, command.motion_lib = layout, library
+    command._env = SimpleNamespace(device="cpu", num_envs=1, step_dt=0.02,
+        scene={native["object_entity_name"]: obj})
+    command._finger_joint_ids = torch.tensor([0, 2])
+    command.motion_ids, command.motion_steps = torch.tensor([0]), torch.tensor([1])
+    command._bind_native_reference()
+    torch.testing.assert_close(command.object_joint_reference()["position"], torch.tensor([[.15, .1]]))
+    torch.testing.assert_close(command.command_reference()["position"], torch.tensor([[.5, .3]]))
+    assert command.command_reference()["position_support"].tolist() == [[True, False]]
+    assert not command.motion_lib.native_root_pose_support["left"][1]
+    assert command.motion_lib.native_root_angular_velocity_support["left"][1]
+
+
+def test_prepared_native_entry_rejects_stock_carrier_or_support_before_packing(tmp_path):
+    from retarget import kinematic_retargeting as pipeline
+
+    for invalid in ("missing_native", "stock_support"):
+        dataset, clip = _prepared_native_dataset(tmp_path / invalid)
+        if invalid == "missing_native":
+            del clip["native_reference"]
+            message = "requires native_reference"
+        else:
+            clip["support_disks"] = np.zeros((0, 5), np.float32)
+            message = "support belongs to its authored scene"
+        C.save_clip(dataset / "native_reference/synthetic-stage.npz", clip)
+        with TestCase().assertRaisesRegex(InstantiationException, message):
+            pipeline.main.__wrapped__(_pipeline_config(dataset))
+        assert not (dataset / "motion.pt").exists()
+
+
+def test_default_human_entry_retains_preprocess_retarget_and_report(tmp_path):
+    from retarget import kinematic_retargeting as pipeline
+
+    dataset = tmp_path / "dataset"
+    demo = dataset / "human_demo"
+    demo.mkdir(parents=True)
+    path = demo / "human-stage.npz"
+    C.save_clip(path, _clip())
+    cfg = _pipeline_config(dataset, prepared=False)
+    cfg.steps.pack = False
+    rows, kept = [{"clip": path.stem, "reject": ""}], {path: None}
+    with patch("retarget.human_demo.preprocess.preprocess_clips", return_value=(rows, kept)) as preprocess:
+        with patch("retarget.robot_hand.hand_retarget.retarget_clips", return_value=[{"clip": path.stem, "source": "ik"}]) as ik:
+            pipeline.main.__wrapped__(cfg)
+    preprocess.assert_called_once_with(demo, dataset, cfg, 60., 1)
+    ik.assert_called_once_with([(path, None)], dataset, dataset / "retargeted", cfg.robot, cfg.retarget, 60., 1)
+    assert "source" in (dataset / "report.csv").read_text()
 
 
 def test_actual_native_pack_and_reader_keep_names_independent_support_and_exact_clock(tmp_path):
@@ -163,6 +284,9 @@ if __name__ == "__main__":
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     cases = (
+        test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_command,
+        test_prepared_native_entry_rejects_stock_carrier_or_support_before_packing,
+        test_default_human_entry_retains_preprocess_retarget_and_report,
         test_actual_native_pack_and_reader_keep_names_independent_support_and_exact_clock,
         test_actual_crop_pack_and_reopen_keep_native_rows_static_names_and_source_inventory,
         test_native_boundary_rejects_clock_row_support_and_actual_joint_identity_mismatch,

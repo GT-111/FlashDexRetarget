@@ -32,6 +32,61 @@ any key is overridden as `key=value`, and each run's config is kept under `.hydr
 `workers=` sets the CPU parallelism (default: half the cores), `steps.<name>=false` skips a step (e.g.
 `steps.retarget=false steps.pack=false` to review `report.csv` first).
 
+## Prepared native input
+
+`input=human_demo` is the default input constructor. It retains the preprocessing,
+physics IK and report flow above, including object preparation from an existing
+`motion.pt` when `human_demo/` is absent.
+
+For an already prepared native dataset, select its own input constructor:
+
+```sh
+bash scripts/retarget/kinematic_retargeting.sh dataset=<prepared_dataset> \
+  input=prepared_native steps.convex=false steps.usd=false steps.sdf=false
+```
+
+The default manifest is `<prepared_dataset>/native-reference.json`; select a
+different dataset-relative manifest with `input.manifest=...`. It declares the
+actual selection and cadence:
+
+```json
+{
+  "clip_directory": "native_reference",
+  "clips": ["prepared-stage"],
+  "fps": 50.0,
+  "control_period_ns": 20000000
+}
+```
+
+`clip_directory` is relative to the dataset. `clips` contains NPZ stems without
+the suffix; only those clips enter `motion.pt`, even if the directory contains
+other preparations. Each selected clip must carry the existing explicit
+`native_reference`, genuine MANO/object fields and its own matching `fps`.
+The manifest does not replace the native carrier's names, independent support,
+exact query clock or source lineage.
+
+Prepared input bypasses human-demo desk estimation, rejection filters and rigid
+physics IK. It is already retargeted, so `steps.retarget` performs no additional
+operation on this route. A leftover `human_demo/` directory does not select the
+input or change its population. Native support belongs to the authored scene;
+clips carrying stock `support_disks` are rejected rather than converted into a
+second support authority.
+
+The selected clips use the unchanged `build_motion_pt.build` packer. Ordinary
+`MotionLibrary` reading retains named physical scalar joints (including passive
+hand followers), FREE hand roots, object parts and passive object joints, with
+their independent pose/rate support and original prepared clock phase.
+`NativeMotionTrackingCommand` remains responsible for matching those names and
+the cadence to the selected physical scene and actual control period. Unknown
+rates remain zero with false support; they are not filled by this entry point.
+
+Supply the original `objects/<id>/visual.obj` files needed by the normal packer.
+Native MJCF mechanics, per-part meshes and static support still come from the
+configured native scene. The existing convex/USD/SDF steps are independently
+selectable object preparation; they do not qualify a native articulation or
+replace its scene bindings. Packing and reading a requested reference alone do
+not establish physical contact, task success or a successful Flash policy.
+
 ## Dataset layout
 
 ```

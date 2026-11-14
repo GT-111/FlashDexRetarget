@@ -98,6 +98,16 @@ origin and complete source frame inventory. Three CPU cases qualify this
 pack/reader contract. Actual native reference generation and physical admission
 remain required.
 
+Use the existing retarget entry with `input=prepared_native` to pack an explicit
+prepared population. Its default `<dataset>/native-reference.json` names the
+dataset-relative clip directory, NPZ stems, fps and control period. This route
+bypasses human-demo desk/filter processing and rigid IK, then uses the same
+`build_motion_pt` and `MotionLibrary`; it requires an actual `native_reference`
+and leaves native scene support with the authored mechanics. The default
+`input=human_demo` route and motion.pt-only object preparation remain available.
+See [prepared native input](docs/guide/kinematic_retargeting.md#prepared-native-input)
+for the command, manifest and qualification boundary.
+
 Select the existing trainer's native task with `--config_name native`. Supply
 `native_recording_binding` and all six `native_tracking_tolerances` explicitly;
 the latter select reference-tracking archives, independently of contact or task

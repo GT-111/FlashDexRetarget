@@ -1,0 +1,2 @@
+_target_: retarget.kinematic_retargeting.PreparedNativeInput
+manifest: native-reference.json
