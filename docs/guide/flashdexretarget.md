@@ -365,6 +365,16 @@ recover the factual input and are rejected. Q/Qvel must observe the command's
 actual robot entity; a different entity with matching scalar names cannot supply
 its physical facts.
 
+With FP32 storage, retained factual columns must preserve their original bits.
+Integer addresses, source support, unavailable queries and int64-clock semantics
+remain exact. Recomputed quaternion, rotation-vector and body-relative geometry
+must be finite and satisfy the pinned runtime's public
+`torch.testing.assert_close` FP32 dtype defaults, including under row permutation.
+Record the runtime version and resolved defaults with that qualification. This
+criterion applies to derived observation geometry; physical snapshot/replay and
+task criteria retain their separately declared requirements. Preserve the result
+of an earlier bit-exact gate when reporting a new numerical criterion.
+
 The native profiles use 5 ms physics and four substeps per 20 ms control endpoint;
 the prepared carrier must match the actual clock. The stock Isaac author profile
 uses the full-precision reciprocal of 240 Hz. Isaac Sim 5.1 stores
@@ -374,8 +384,13 @@ historical runtime clock. Record the installed scene frequency and actual dt
 when qualifying physics. Configure `n_future`, replay capacity, storage dtype and
 device in `runner.agent` and admit memory for the resulting layout. Float16 replay
 quantizes stored factual observations; it does not quantize the integer phase,
-source clocks or library support. Reconstructed geometric values inherit that
-existing factual-storage precision rather than recovering discarded precision.
+source clocks or library support. The ordinary sampler casts non-aux storage
+groups back to FP32 before geometry reconstruction and keeps integer aux
+unchanged. Qualify this storage condition separately: require finite values and
+exact support, phase, query and clock semantics, and report factual-term and
+derived-field quantization errors. Reconstructed geometry inherits the stored
+facts' precision. These errors alone do not establish physical tracking quality
+or task success.
 
 ## Other algorithms
 

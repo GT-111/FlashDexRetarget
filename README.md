@@ -166,7 +166,9 @@ their authority. Resolved entity and joint names route Q/Qvel columns into the
 native command order; their stored column order may differ. Required named
 columns must be present and observe the command's actual robot entity.
 Reconstruction sources must remain unclipped with nonzero scales. Network
-widths still follow the actual observation space.
+widths still follow the actual observation space. Retained FP32 facts and
+clock/support authority stay exact; derived geometry has a separately declared
+[numerical reconstruction criterion](docs/guide/flashdexretarget.md#stop--resume).
 Choose replay capacity and placement from the resolved storage layout: storing
 the raw native F1/BOX K10 future window at 50 million float16 rows alone would
 require 149 GB, before the other replay fields. Do not disable compaction to
