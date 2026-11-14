@@ -47,6 +47,7 @@ def build_rewards(
     reward_params = cfg.get("reward_params", {}) or {}
 
     split = bool(cfg.get("split_sides", False))
+    shared = set(cfg.get("shared_terms", ()))
 
     out: dict[str, RewardTermCfg] = {}
     for name, weight in weights.items():
@@ -60,7 +61,7 @@ def build_rewards(
         if name in scales:
             params["scale"] = scales[name]
 
-        twins = split_sides(cls, name, weight) if split else None
+        twins = split_sides(cls, name, weight) if split and name not in shared else None
         for tname, method, tweight, extra in twins or [(name, name, weight, {})]:
             fn = getattr(cls, method)
             tparams = dict(params, **extra)

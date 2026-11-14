@@ -238,7 +238,10 @@ def test_native_profile_builds_real_box_and_rigid_managers(tmp_path):
             assert len(layout.object.parts) == count
             managers = build_manager_cfgs(cfg)
             assert not managers["curriculum"]
-            assert "native_command_bc" in managers["rewards"]
+            assert {"native_command_bc_r", "native_command_bc_l"} <= set(managers["rewards"])
+            for name in cfg.rewards.shared_terms:
+                assert name in managers["rewards"]
+                assert "side" not in managers["rewards"][name].params
             assert "tracking_joint_pos_bc_exp" not in managers["rewards"]
             assert set(managers["observations"]) == {"actor", "critic", "future_traj"}
             assert "robot_links_obj_sdf" not in managers["observations"]["actor"].terms
@@ -660,8 +663,17 @@ def _configured_native_runner(tmp_path, monkeypatch, command_name):
             joint_pos_target=torch.zeros(1, 3), body_link_pos_w=torch.zeros(1, 2, 3),
             body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2]),
             body_link_lin_vel_w=torch.zeros(1, 2, 3), body_link_ang_vel_w=torch.zeros(1, 2, 3)))
-    obj = SimpleNamespace(joint_names=("hinge_a", "hinge_b"), body_names=("base", "lid"),
-                         data=SimpleNamespace(joint_pos=torch.zeros(1, 2), joint_vel=torch.zeros(1, 2)))
+    object_body_names = ("base", "lid")
+    # The native getter reads WORLD body-link origins in entity order; the
+    # prepared part order is deliberately lid/base rather than base/lid.
+    part_columns = [native["object_part_body_names"].index(name) for name in object_body_names]
+    object_state = torch.as_tensor(
+        native["object_part_state_w"][:1, part_columns], dtype=torch.float32,
+    ).clone()
+    obj = SimpleNamespace(joint_names=("hinge_a", "hinge_b"), body_names=object_body_names,
+        data=SimpleNamespace(joint_pos=torch.zeros(1, 2), joint_vel=torch.zeros(1, 2),
+            body_link_pos_w=object_state[..., :3], body_link_quat_w=object_state[..., 3:7],
+            body_link_lin_vel_w=object_state[..., 7:10], body_link_ang_vel_w=object_state[..., 10:13]))
 
     class Scene(dict):
         env_origins = torch.zeros(1, 3)
@@ -676,6 +688,7 @@ def _configured_native_runner(tmp_path, monkeypatch, command_name):
     assert type(command) is NativeMotionTrackingCommand
     assert env.command_manager.active_terms == [command_name]
     env.action_manager = ActionManager(build_actions(cfg.actions), env)
+    env.reward_recipe = cfg.rewards
     env.reward_manager = RewardManager(build_rewards(cfg.rewards, command_name=command_name,
         entity_name=cfg.robot.entity_name), env)
     observations = {name: torch.zeros(1, 2) for name in ("actor", "critic")}
@@ -723,11 +736,167 @@ def test_configured_native_command_routes_real_runner_heads_and_early_reset(tmp_
     )), command_name=command_name, entity_name="robot")
     term = terms["task_reward_early_reset"]
     assert term.params["command_name"] == command_name
-    index = env.reward_manager.active_terms.index("native_root_pose")
-    weight = env.reward_manager._term_cfgs[index].weight
+    from envs.rewards import side_twin_name
+    indices = [env.reward_manager.active_terms.index(side_twin_name("native_root_pose", side[0]))
+               for side in command._side_list]
+    weights = torch.tensor([env.reward_manager.get_term_cfg(env.reward_manager.active_terms[index]).weight
+                            for index in indices])
     for rate, expected in ((.7, False), (.1, True)):
-        env.reward_manager._step_reward[:, index] = rate * weight
+        env.reward_manager._step_reward[:, indices] = rate * weights
         for step in range(1, 7):
             env.episode_length_buf[:] = step
             fired = term.func(env, **term.params)
             assert fired.tolist() == [expected and step == 6]
+
+
+@pytest.mark.parametrize("sides", [("right", "left"), ("left", "right")])
+def test_reward_head_ownership_uses_metadata_not_term_spelling(sides):
+    from mjlab.managers import RewardManager
+    from mjlab.managers.reward_manager import RewardTermCfg
+
+    from envs.vec_env import FlatObsVecEnv
+
+    def local(env, side):
+        del side
+        return torch.ones(env.num_envs)
+
+    def shared(env):
+        return torch.ones(env.num_envs)
+
+    # Deliberately misleading names must not override the builder's real side.
+    terms = {
+        "misleading_l_name": RewardTermCfg(func=local, weight=1., params={"side": "right"}),
+        "no_side_token": RewardTermCfg(func=local, weight=1., params={"side": "left"}),
+        "shared_r_name": RewardTermCfg(func=shared, weight=1., params={}),
+    }
+    action = SimpleNamespace(action_names=("l_command", "r_command"),
+                             action_sides=("left", "right"), action_dim=2)
+    env = SimpleNamespace(num_envs=1, device="cpu", step_dt=.02,
+                          action_manager=SimpleNamespace(_terms={"native": action}))
+    env.reward_manager = RewardManager(terms, env)
+    wrapper = object.__new__(FlatObsVecEnv)
+    wrapper._env, wrapper._device = env, "cpu"
+    wrapper._setup_reward_heads({}, SimpleNamespace(_side_list=list(sides)))
+    env.reward_manager._step_reward[:] = torch.tensor([2., 6., 10.])
+    total = env.reward_manager._step_reward.sum(-1) * env.step_dt
+    heads = wrapper._head_rewards(total)
+    expected = {"right": 7., "left": 11.}
+    torch.testing.assert_close(heads, torch.tensor([[expected[side] * env.step_dt for side in sides]]))
+    torch.testing.assert_close(heads.sum(-1), total)
+    # The existing explicit shared override is still authoritative.
+    wrapper._setup_reward_heads({"misleading_l_name": "both"}, SimpleNamespace(_side_list=list(sides)))
+    torch.testing.assert_close(wrapper._head_rewards(total).sum(-1), total)
+
+
+def test_native_reward_routing_preserves_scalar_under_support_and_single_hand_changes(tmp_path, monkeypatch):
+    from mjlab.managers import RewardManager
+    from omegaconf import OmegaConf
+
+    from envs import build_rewards
+
+    runner, command, env, _ = _configured_native_runner(tmp_path, monkeypatch, "native_credit")
+    flat = runner._train_env
+    action = next(iter(env.action_manager._terms.values()))
+    env.reset_terminated = torch.zeros(env.num_envs, dtype=torch.bool)
+    scalar_cfg = OmegaConf.create(OmegaConf.to_container(env.reward_recipe, resolve=True))
+    scalar_cfg.split_sides = False
+    scalar_manager = RewardManager(build_rewards(scalar_cfg, command_name="native_credit", entity_name="robot"), env)
+    assert set(scalar_manager.active_terms) == set(env.reward_recipe.reward_weights)
+    installed = action.installed_control
+    action.ref_joint_pos_used = command.ref_joint_pos.clone()
+    installed["finger_target_rad"][:] = action.ref_joint_pos_used[:, command.native_command_joint_ids]
+    installed["finger_source_support"][:] = True
+    installed["installed_valid"][:] = True
+    for side in command._side_list:
+        body = command.robot.body_names.index(side + "_root")
+        slot = command._side_list.index(side)
+        command.robot.data.body_link_pos_w[:, body] = command.ref_native_root_state_w[:, slot, :3]
+        command.robot.data.body_link_quat_w[:, body] = command.ref_native_root_state_w[:, slot, 3:7]
+
+    def read():
+        total = env.reward_manager.compute(env.step_dt).clone()
+        expected = scalar_manager.compute(env.step_dt).clone()
+        heads = flat._head_rewards(total).clone()
+        torch.testing.assert_close(total, expected)
+        torch.testing.assert_close(heads.sum(-1), expected)
+        return heads
+
+    before = read()
+    moved, other = command._side_list
+    body = command.robot.body_names.index(moved + "_root")
+    command.robot.data.body_link_pos_w[:, body, 0] += .1
+    after = read()
+    torch.testing.assert_close(after[:, flat.reward_head_names.index(other)], before[:, flat.reward_head_names.index(other)])
+    assert bool((after[:, flat.reward_head_names.index(moved)] < before[:, flat.reward_head_names.index(moved)]).all())
+
+    # A missing root and unequal finger support must not silently halve global reward.
+    command.motion_lib.native_root_pose_support[moved][command._motion_flat_ids] = False
+    owners = dict(zip(action.action_names, action.action_sides, strict=True))
+    finger_columns = [i for i, name in enumerate(action.finger_actuator_names) if owners[name] == moved]
+    installed["finger_source_support"][:, finger_columns] = False
+    before = read()
+    supported_columns = [i for i, name in enumerate(action.finger_actuator_names) if owners[name] == other]
+    installed["finger_target_rad"][:, supported_columns] += .1
+    after = read()
+    torch.testing.assert_close(after[:, flat.reward_head_names.index(moved)], before[:, flat.reward_head_names.index(moved)])
+    assert bool((after[:, flat.reward_head_names.index(other)] < before[:, flat.reward_head_names.index(other)]).all())
+
+    # A shared global failure remains one penalty, divided across heads once.
+    before = read()
+    env.reset_terminated[:] = True
+    after = read()
+    penalty = env.reward_recipe.reward_weights.termination_penalty * env.step_dt / len(command._side_list)
+    torch.testing.assert_close(after - before, torch.full_like(after, penalty))
+
+
+@pytest.mark.parametrize("sides", [("right", "left"), ("left", "right")])
+def test_native_action_credit_conserves_total_with_unequal_hand_widths(sides):
+    # A supported native chart with different declared finger counts per hand.
+    root_names = [f"{side}_{kind}_{axis}" for kind in ("translation", "rotation")
+                  for side in sides for axis in "xyz"]
+    root_sides = [side for _kind in ("translation", "rotation") for side in sides for _axis in "xyz"]
+    fingers = ("left_a", "right_a", "right_b")
+    names = (*root_names, *fingers)
+    owners = (*root_sides, "left", "right", "right")
+    action = SimpleNamespace(action_names=names, action_sides=owners)
+    values = torch.arange(1, len(names) + 1, dtype=torch.float32)[None]
+    env = SimpleNamespace(device="cpu", action_manager=SimpleNamespace(action=values, _terms={"native": action}),
+                          command_manager=SimpleNamespace(get_term=lambda _name: SimpleNamespace(_side_list=list(sides))))
+    global_value = NativeMotionTrackingRewards.action_penalty(env, "native_credit")
+    local = [NativeMotionTrackingRewards.action_penalty(env, "native_credit", side) / len(sides) for side in sides]
+    torch.testing.assert_close(sum(local), global_value)
+    for side, value in zip(sides, local, strict=True):
+        expected = sum(values[:, i].square() for i, owner in enumerate(owners) if owner == side) / len(names)
+        torch.testing.assert_close(value, expected)
+
+
+def test_stock_reward_twins_keep_metadata_and_full_termination_weights():
+    from hydra import compose, initialize_config_dir
+
+    from envs import build_rewards
+    from envs.rewards import side_twin_name
+
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / "config"), version_base=None):
+        cfg = compose(config_name="flashdexretarget", overrides=["commands.motion_file=synthetic-not-read.pt"])
+        terms = build_rewards(cfg.rewards)
+        ordinary = "tracking_ref_mano_wrist_trans_error_exp"
+        for side in ("left", "right"):
+            twin = terms[side_twin_name(ordinary, side[0])]
+            assert twin.params["side"] == side
+            assert twin.weight == cfg.rewards.reward_weights[ordinary] / 2
+            failure = terms[side_twin_name("termination_penalty", side[0])]
+            assert failure.params["side"] == side
+            assert failure.weight == cfg.rewards.reward_weights.termination_penalty
+
+    command, env, _ = _command()
+    env.reset_terminated = torch.ones(env.num_envs, dtype=torch.bool)
+    env._side_fail = {"actual_failure_owner": torch.tensor([[True, False]])}
+    for side, expected in zip(command._side_list, (1., 0.), strict=True):
+        term = terms[side_twin_name("termination_penalty", side[0])]
+        torch.testing.assert_close(term.func(env, **term.params), torch.tensor([expected]))
+    # Original author semantics charge both full weights for an unattributed failure.
+    env._side_fail = {}
+    weighted = sum(terms[side_twin_name("termination_penalty", side[0])].func(
+        env, **terms[side_twin_name("termination_penalty", side[0])].params
+    ) * terms[side_twin_name("termination_penalty", side[0])].weight for side in command._side_list)
+    torch.testing.assert_close(weighted, torch.tensor([2 * cfg.rewards.reward_weights.termination_penalty]))

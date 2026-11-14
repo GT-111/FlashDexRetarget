@@ -15,7 +15,7 @@ def _supported_mean(value, support):
 
 class NativeMotionTrackingRewards(MotionTrackingRewards):
     @staticmethod
-    def native_command_bc(env, command_name, scale):
+    def native_command_bc(env, command_name, scale, side=None):
         command = env.command_manager.get_term(command_name)
         term = action_term(env)
         installed = term.installed_control
@@ -28,13 +28,18 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
             * (installed["finger_target_rad"] - reference).square()
             / (limits[:, 1] - limits[:, 0])
         )
-        return _supported_mean(
-            torch.exp(-scale * error),
-            installed["finger_source_support"] & installed["installed_valid"][:, None],
-        )
+        value = torch.exp(-scale * error)
+        support = installed["finger_source_support"] & installed["installed_valid"][:, None]
+        if side is None:
+            return _supported_mean(value, support)
+        # Existing split_sides divides the term weight across declared hands.
+        # Retain the global support denominator, including unequal/missing support.
+        own = NativeMotionTrackingRewards._side_action_mask(env, side)[term._finger_slice]
+        contribution = torch.where(support & own, value, 0.0).sum(-1)
+        return len(command._side_list) * contribution / support.sum(-1).clamp_min(1)
 
     @staticmethod
-    def native_root_pose(env, command_name, position_scale_m, rotation_scale_rad):
+    def native_root_pose(env, command_name, position_scale_m, rotation_scale_rad, side=None):
         command = env.command_manager.get_term(command_name)
         ref = command.ref_native_root_state_w
         position = (ref[..., :3] - command.robot_wrist_trans_w).square().sum(-1)
@@ -48,7 +53,21 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         support = torch.stack(
             [ml.native_root_pose_support[s][ids] for s in command._side_list], -1
         )
-        return _supported_mean(value, support)
+        if side is None:
+            return _supported_mean(value, support)
+        own = command._side_list.index(side)
+        contribution = torch.where(support[:, own], value[:, own], 0.0)
+        return len(command._side_list) * contribution / support.sum(-1).clamp_min(1)
+
+    @staticmethod
+    def action_penalty(env, command_name, side=None):
+        actions = env.action_manager.action
+        if side is None:
+            return actions.square().mean(-1)
+        command = env.command_manager.get_term(command_name)
+        own = NativeMotionTrackingRewards._side_action_mask(env, side)
+        # Use the full action-count denominator even when hand widths differ.
+        return len(command._side_list) * actions[:, own].square().sum(-1) / actions.shape[-1]
 
     @staticmethod
     def native_object_part_pose(

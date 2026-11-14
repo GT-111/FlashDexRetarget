@@ -3,7 +3,6 @@ obs, auto_reset single-pass stepping, final_obs truncation bootstrap, share_obs 
 
 from __future__ import annotations
 
-import re
 from typing import Any, Union
 
 import gymnasium as gym
@@ -103,8 +102,11 @@ class FlatObsVecEnv(VectorEnv):
         return self._aux_now()
 
     def _setup_reward_heads(self, overrides: dict[str, str], command: Any) -> None:
-        """Map every active reward term to a hand side by its `_r_`/`_l_` name token (or an
-        explicit override: right|left|both); untagged terms are split evenly across heads."""
+        """Route actual term-side metadata to the command's declared heads.
+
+        Explicit overrides win; terms without a side are shared across heads.
+        Every routing row sums to one, preserving the manager's global reward.
+        """
         sides = list(command._side_list)
         if len(sides) < 2:
             raise ValueError(f"reward_heads needs a bimanual command, got sides {sides}.")
@@ -114,14 +116,15 @@ class FlatObsVecEnv(VectorEnv):
         for name in names:
             tag = overrides.get(name)
             if tag is None:
-                m = re.search(r"(^|_)([rl])(_|$)", name)
-                tag = {"r": "right", "l": "left"}.get(m.group(2)) if m else "both"
+                tag = rm.get_term_cfg(name).params.get("side")
+            if tag is None:
+                tag = "both"
             if tag == "both":
                 row = [1.0 / len(sides)] * len(sides)
             elif tag in sides:
                 row = [1.0 if s_ == tag else 0.0 for s_ in sides]
             else:
-                raise ValueError(f"reward_heads: term {name!r} tagged {tag!r}, expected right|left|both.")
+                raise ValueError(f"reward_heads: term {name!r} tagged {tag!r}, expected one of {sides} or 'both'.")
             rows.append(row)
             table.append(f"  {name:<44s} -> {tag}")
         self._head_names = sides

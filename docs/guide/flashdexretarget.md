@@ -166,6 +166,20 @@ command to the flat observation/reward-head wrapper, so hand ownership follows
 its declared sides. Task-reward early reset uses the same injected command name.
 The default `motion` and a configured rename share the same rewards and thresholds.
 
+Reward heads use each `RewardTermCfg.params.side`, not a letter inferred from
+its name; `runner.agent.reward_heads.overrides` remains an explicit override.
+Terms without a side are shared equally, so head rewards sum to the manager's
+global reward. `rewards.split_sides` expands supported side terms through the
+existing builder; `rewards.shared_terms` keeps declared scalar terms whole.
+The native recipe assigns root tracking, supported independent-finger BC and
+action cost to their actual hand. It retains the original global support/action
+normalization, including missing support and unequal action widths. Passive
+object part/articulation tracking and global termination remain single shared
+terms; they are divided among heads once. Native currently has no contact reward:
+contact observations/measurement do not create contact credit or task success.
+This changes reward-head targets and requires its own declared learning condition;
+an unchanged FULL continuation must retain its original reward configuration.
+
 **Run length and checkpoints** (`config/runner/base.yaml`)
 
 | key | default | meaning |

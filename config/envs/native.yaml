@@ -72,7 +72,9 @@ obs:
 
 rewards:
   _target_: envs.rewards.native.NativeMotionTrackingRewards
-  split_sides: false
+  split_sides: ${per_hand_actor_critic}
+  # One passive object and global failure: retain each scalar term once.
+  shared_terms: [native_object_part_pose, native_object_articulation, termination_penalty]
   reward_weights:
     native_root_pose: 0.3
     native_object_part_pose: 1.0
