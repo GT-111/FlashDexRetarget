@@ -159,10 +159,10 @@ class ObjectAssistMixin:
                             torques=torque.unsqueeze(1),
                         )
                     else:
-                        # xfrc persists: zero inactive slots (sleep: active envs only).
+                        # xfrc persists: ground-resting slots receive only active-row writes.
                         slot = self.active_obj_slot(side)
                         for s, name in enumerate(obj_names):
-                            if self._sleep_mode:
+                            if self._park_inactive_on_ground:
                                 ids = torch.where(slot == s)[0]
                                 if ids.numel() == 0:
                                     continue

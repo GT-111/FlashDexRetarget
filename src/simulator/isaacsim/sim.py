@@ -122,20 +122,6 @@ class IsaacSimAdapter:
         self.device = device
         self.render = render
         self.model = _ModelTables(device)
-        # Advertise MuJoCo's sleep flag: parked slots settle on the ground and
-        # auto-sleep (no per-step repark). FDR_SLEEP_PARK=0 disables.
-        import os
-
-        enableflags = 0
-        if os.environ.get("FDR_SLEEP_PARK", "1") != "0":
-            import mujoco as _mj
-
-            if hasattr(_mj.mjtEnableBit, "mjENBL_SLEEP"):
-                enableflags = int(_mj.mjtEnableBit.mjENBL_SLEEP)
-        self.mj_model = SimpleNamespace(opt=SimpleNamespace(enableflags=enableflags))
-        # bare namespace: attribute misses steer terms onto fallback paths
-        # (tree_awake / qpos direct writes are mjwarp-only).
-        self.data = SimpleNamespace()
 
     def step(self) -> None:
         self._sim.step(render=self.render)

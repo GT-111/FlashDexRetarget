@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import TYPE_CHECKING
 
 import torch
 from mjlab.utils.lab_api.math import quat_apply_inverse, quat_mul
 
 from ..common.motion_library import MotionLibrary
-from ..common.raw_contact import register_raw_contact_views
-from ..common.sensor_multiplex import register_multi_object_sensor_views
-from .reference.noise import _quat_from_rotvec
 from .motion_tracking_base import MotionTrackingCommandBase
 from .motion_tracking_cfg import MotionTrackingCommandCfg
+from .reference.noise import _quat_from_rotvec
 
 if TYPE_CHECKING:
     from mjlab.entity import Entity
@@ -49,26 +46,13 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
         self._init_metrics()
         self._init_object_assist()
 
-        # ── Objects: sensor views, sleep mode, swap ────────────────────────────────
-        # Sleep mode: parked objects rest asleep; xfrc must touch only active envs.
-        import mujoco as _mj
-
-        self._sleep_mode = bool(
-            env.sim.mj_model.opt.enableflags & _mj.mjtEnableBit.mjENBL_SLEEP
-        ) if hasattr(_mj.mjtEnableBit, "mjENBL_SLEEP") else False
+        # Parking is a task recipe, not a claim about a backend's sleep flags.
+        # Scene-owned contact views bind after complete command construction.
+        self._park_inactive_on_ground = cfg.object.park_inactive_on_ground
         if self.multi_object or getattr(cfg.object, "swap_spec", None) is not None:
             if len(self._side_list) > 1:
                 raise NotImplementedError(
                     "multi-object motion tracking supports a single hand side"
-                )
-            if cfg.object.raw_sensor_specs:
-                # Raw mode: one reader re-exposes the dropped object sensors.
-                register_raw_contact_views(
-                    env, self, self._side_list[0], cfg.object.raw_sensor_specs
-                )
-            elif self.multi_object:
-                register_multi_object_sensor_views(
-                    env, lambda: self.active_obj_slot(self._side_list[0])
                 )
         # FDR_OBJ_SWAP: per-world model rows select each env's object.
         self._swap_tables: dict[str, torch.Tensor] | None = None
@@ -92,6 +76,11 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
     @property
     def command(self) -> torch.Tensor:
         return torch.cat([self.ref_joint_pos, self.ref_joint_vel], dim=1)
+
+    @property
+    def object_distance_sign(self) -> str:
+        """The stock object SDF uses the authored mesh's winding-number sign."""
+        return "winding"
 
     # ══ Reset: clip draw, start frame, warm start, object seeding ══════════════════
 
@@ -278,9 +267,6 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
                                 mask_p[..., None], torch.zeros_like(cur_w), cur_w
                             )
                         )
-                    if self._sleep_mode:
-                        # keep the awake-DOF cap valid (see _sleep_park_trees)
-                        self._sleep_park_trees(side, env_ids, slot)
 
         # ── Scene bookkeeping: support disks, caches, island Newton ────────────────
         self._write_support_disks(env_ids)
@@ -303,8 +289,8 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
             if wrap_ids.numel() > 0:
                 self._resample_command(wrap_ids)
 
-        # Sleep mode leaves parked objects asleep; re-teleporting would wake them.
-        if self.has_objects and self.multi_object and not self._sleep_mode:
+        # Ground-resting parked objects are left to the actual physics engine.
+        if self.has_objects and self.multi_object and not self._park_inactive_on_ground:
             self._repark_inactive_objects()
 
         # Curricula fire only on resets; step the assist controller per env step.

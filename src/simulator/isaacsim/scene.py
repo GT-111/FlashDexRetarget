@@ -27,13 +27,7 @@ from .entity import (
     FreeArticulationAdapter,
     RigidObjectAdapter,
 )
-from .sensors import (
-    AlllinkContactAdapter,
-    AlllinkContactPosAdapter,
-    FingertipContactAdapter,
-    FingertipPenetrationAdapter,
-    LinkContactBank,
-)
+from .sensors import build_tracking_contact_views
 from .sim import IsaacSimAdapter, principal_inertia
 
 
@@ -71,6 +65,19 @@ class IsaacSceneAdapter:
         self.sensors: dict[str, object] = {}
         self.sensor_context = None
         self._reset_entities = None
+        self._tracking_banks = {}
+
+    def bind_tracking_command(self, command) -> None:
+        """Bind this scene's views after the command has admitted its references."""
+        for bank in self._tracking_banks.values():
+            bank.bind_command(command)
+
+    def tracking_contact_metadata(self):
+        return {side: bank.measurement_metadata for side, bank in self._tracking_banks.items()}
+
+    def hand_part_contact_facts(self):
+        """Net-link forces and SDF association do not provide exact pair forces."""
+        return None
 
     @property
     def num_envs(self) -> int:
@@ -737,40 +744,21 @@ def build_isaac_scene(
                 default_state,
             )
 
-    # sensor adapters (command callback bound after command-term creation);
+    # Scene-owned views bind after complete command/reference construction.
     # one bank per hand side, each SDF-gated against its own side's object.
-    banks: dict[str, LinkContactBank] = {}
     for side in robot_sides:
         names = alllink[side]
-        bank = LinkContactBank(link_sensors[side], clock, device)
-        bank.side = side
-        bank.margins = torch.tensor(
+        margins = torch.tensor(
             [meta.body_bound.get(b, 0.03) + 0.015 for b in names],
             dtype=torch.float32, device=device,
         )
-        # fingertip rows = the links carrying contact_<side>_<finger>_tip (xhand: 3,6,8,10,12; sharpa: 3,7,11,15,20)
-        tip_sites = [meta.sites.get(f"contact_{side}_{f}_tip") for f in ("thumb", "index", "middle", "ring", "pinky")]
-        if all(t is not None and t.body_name in names for t in tip_sites):
-            bank.tip_rows = tuple(names.index(t.body_name) for t in tip_sites)
-        ids, _ = robot_adapter.find_bodies(names, preserve_order=True)
-        bank.link_pos_fn = (
-            lambda ids=tuple(ids): robot_adapter.data.body_link_pos_w[:, list(ids)]
+        bank, views = build_tracking_contact_views(
+            link_sensors[side], clock, device, side=side, body_names=names,
+            contact_site_names=cfg.robot.site_names.contact[side], metadata=meta,
+            robot=robot_adapter, margins=margins,
         )
-        p = side[0]
-        scene_adapter.sensors[f"{p}_alllink_contact"] = AlllinkContactAdapter(bank)
-        scene_adapter.sensors[f"{p}_alllink_contact_pos"] = AlllinkContactPosAdapter(bank)
-        scene_adapter.sensors[f"{p}_fingertip_contact"] = FingertipContactAdapter(bank)
-        scene_adapter.sensors[f"{p}_fingertip_penetration"] = FingertipPenetrationAdapter(
-            bank, side=side
-        )
-        banks[side] = bank
-
-    def _bind(slot_fn, cmd_fn) -> None:
-        del slot_fn  # slot attribution is SDF-side now
-        for bank in banks.values():
-            bank.command_fn = cmd_fn
-
-    scene_adapter._bind_sensor_callbacks = _bind
+        scene_adapter.sensors.update(views)
+        scene_adapter._tracking_banks[side] = bank
 
     return scene_adapter, sim_adapter, robot_adapter
 
@@ -955,37 +943,19 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         p.name: {"entity_name": layout.object.entity_name, "body_name": p.body_name}
         for p in layout.object.parts
     }
-    banks = {}
     for hand in layout.hands:
         names = list(cfg.robot.contact_links[hand.side])
-        bank = LinkContactBank([contacts[n] for n in names], clock, device)
-        bank.side = hand.side
-        bank.margins = torch.tensor(
+        margins = torch.tensor(
             [scene_meta.body_bound[n] + 0.015 for n in names],
             device=device,
         )
-        tip_sites = cfg.robot.site_names.contact[hand.side]
-        bank.tip_rows = tuple(
-            names.index(scene_meta.sites[n].body_name) for n in tip_sites
+        bank, views = build_tracking_contact_views(
+            [contacts[n] for n in names], clock, device, side=hand.side,
+            body_names=names, contact_site_names=cfg.robot.site_names.contact[hand.side],
+            metadata=scene_meta, robot=robot, margins=margins,
         )
-        ids, _ = robot.find_bodies(names, preserve_order=True)
-        bank.link_pos_fn = lambda ids=ids: robot.data.body_link_pos_w[:, ids]
-        prefix = hand.side[0]
-        adapter.sensors[f"{prefix}_alllink_contact"] = AlllinkContactAdapter(bank)
-        adapter.sensors[f"{prefix}_alllink_contact_pos"] = AlllinkContactPosAdapter(
-            bank
-        )
-        adapter.sensors[f"{prefix}_fingertip_contact"] = FingertipContactAdapter(bank)
-        adapter.sensors[f"{prefix}_fingertip_penetration"] = (
-            FingertipPenetrationAdapter(bank, side=hand.side)
-        )
-        banks[hand.side] = bank
-
-    def bind(_slot_fn, command_fn):
-        for bank in banks.values():
-            bank.command_fn = command_fn
-
-    adapter._bind_sensor_callbacks = bind
+        adapter.sensors.update(views)
+        adapter._tracking_banks[hand.side] = bank
     # TODO(Isaac gate): verify the imported passive mimic constraints, exact
     # collision shapes/filter pairs/materials/inertials and named link paths.
     # MJCF solver contact-pair semantics are not presumed equal to PhysX.

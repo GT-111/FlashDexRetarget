@@ -223,9 +223,11 @@ class NativeRolloutRecord(RolloutRecord):
         self.backend_metadata = getattr(env.scene, "backend_identity", None)
         self._physics_time_reader = getattr(env.scene, "physics_time_s", None)
         self._contact_reader = getattr(env.scene, "hand_part_contact_facts", None)
+        association_reader = getattr(env.scene, "tracking_contact_metadata", None)
+        self.contact_association_metadata = None if association_reader is None else association_reader()
         self.contact_metadata = None
-        if self._contact_reader is not None:
-            facts = self._contact_reader()
+        facts = None if self._contact_reader is None else self._contact_reader()
+        if facts is not None:
             self._contact_names = []
             addresses = []
             for side in _NATIVE_SIDES:
@@ -373,6 +375,10 @@ class NativeRolloutRecord(RolloutRecord):
                         result[field] = np.ones_like(result["object_joint_pos"], dtype=bool)
                 if self.backend_metadata is not None:
                     result["native_backend_metadata_json"] = np.asarray(json.dumps(self.backend_metadata))
+                if self.contact_association_metadata is not None:
+                    result["native_contact_association_metadata_json"] = np.asarray(
+                        json.dumps(self.contact_association_metadata)
+                    )
                 if self._physics_time_reader is not None:
                     result["native_physics_time_s"] = np.array([float(frame["physics_time_s"][row]) for frame in frames])
                     result["native_physics_reset_time_s"] = np.asarray(float(frames[0]["physics_time_s"][row]))

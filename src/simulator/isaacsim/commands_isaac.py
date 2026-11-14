@@ -1,5 +1,4 @@
-"""Isaac motion-tracking command: neutralizes mjwarp sensor registration,
-binds the Isaac sensor adapters, restricts sampling in per-env-object mode."""
+"""Stock Isaac command sampling for the scene's fixed per-environment objects."""
 
 from __future__ import annotations
 
@@ -7,27 +6,13 @@ from dataclasses import dataclass
 
 import torch
 
-from envs.commands.motion_tracking import motion_tracking as _mt
 from envs.commands.motion_tracking.motion_tracking import MotionTrackingCommand
 from envs.commands.motion_tracking.motion_tracking_cfg import MotionTrackingCommandCfg
 
 
 class IsaacMotionTrackingCommand(MotionTrackingCommand):
     def __init__(self, cfg: MotionTrackingCommandCfg, env) -> None:
-        orig_raw = _mt.register_raw_contact_views
-        orig_mux = _mt.register_multi_object_sensor_views
-        _mt.register_raw_contact_views = lambda *a, **k: None
-        _mt.register_multi_object_sensor_views = lambda *a, **k: None
-        try:
-            super().__init__(cfg, env)
-        finally:
-            _mt.register_raw_contact_views = orig_raw
-            _mt.register_multi_object_sensor_views = orig_mux
-
-        bind = getattr(env.scene, "_bind_sensor_callbacks", None)
-        if bind is not None:
-            side = self._side_list[0]
-            bind(lambda: self.active_obj_slot(side), lambda: self)
+        super().__init__(cfg, env)
 
         # Per-env-object mode: resampling must stay within the env's fixed
         # object; build a padded (S, maxM) per-slot motion table once.

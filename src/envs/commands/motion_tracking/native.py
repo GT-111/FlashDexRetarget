@@ -27,10 +27,12 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                 "native task uses its explicit registered scene references"
             )
         super().__init__(cfg, env)
-        bind = getattr(env.scene, "_bind_sensor_callbacks", None)
-        if bind is not None:
-            bind(lambda: self.active_obj_slot(self._side_list[0]), lambda: self)
         self._bind_native_reference()
+
+    @property
+    def object_distance_sign(self) -> str:
+        signs = {part.distance_sign for part in self.native_layout.object.parts}
+        return next(iter(signs)) if len(signs) == 1 else "mixed"
 
     def _bind_native_reference(self):
         """Admit the prepared clock and bind declared columns to the actual scene."""

@@ -66,6 +66,18 @@ remains available.
 Success archives retain their first-success selection meaning; they are not a
 frozen final-policy evaluation or a qualification of a different physics backend.
 
+The shared manager binds scene-owned tracking views after command/reference
+admission and before observations or rewards are constructed. Contact rows follow
+the configured sites and named bodies. Isaac's existing observations associate
+WORLD net link force with the active object's SDF; they are not measured
+hand–part pair forces. `tracking_contact_metadata()` records that authority,
+distance sign and force availability. NOREPORT zeros remain a feature ablation,
+not observed zero force. Unsigned geometry does not provide signed penetration.
+Native `hand_part_contact_facts()` supplies solved pair facts; Isaac reports them
+unavailable. The ordinary recorder preserves this distinction, including supported
+measured-zero force, in exports. These interfaces have eight focused CPU passes;
+they do not establish successful physical interaction.
+
 The native Isaac interface uses `NativeSceneCfg` to select actual floating hand
 articulations and one object articulation from an authored MJCF. Each hand keeps
 its FREE root and declared independent actuators; an articulated object keeps

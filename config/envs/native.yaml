@@ -25,6 +25,7 @@ commands:
     noise_to_initial_level: 0.0
     zero_init_vel: false
   object:
+    park_inactive_on_ground: false  # one declared object; no inactive stock slots
     pin_objects: false
     pin_mode: none
     zero_init_vel: false

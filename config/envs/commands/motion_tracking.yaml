@@ -47,6 +47,7 @@ commands:
       finger_vel: 0.1   # replaces the reference finger velocity
 
   object:
+    park_inactive_on_ground: true
     entity_names: null
     mesh_paths: null
     mesh_scales: null

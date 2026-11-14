@@ -152,6 +152,17 @@ real visuals, source meshes, colliders, inertials and joints are preserved.
 |---|---|---|
 | `rewards.reward_weights.<term>` | see `config/envs/rewards/flashdexretarget.yaml` | per-term reward weight; `0.0` turns a term off |
 | `commands.sampling.mode` | `uniform` | episode start: `uniform` over clip frames, or `start` (first frame) |
+| `commands.object.park_inactive_on_ground` | stock `true`, native `false` | leave inactive stock objects resting on the ground, or repeat their parking; native has one declared object |
+
+Parking is an explicit task recipe; it replaces `FDR_SLEEP_PARK` and makes no
+claim about a backend exposing MuJoCo's sleep flag. Scene-owned contact views
+bind after command admission and use the robot's configured site/body order.
+Isaac net-link force plus SDF association remains distinct from native solved
+hand–part force. `tracking_contact_metadata()` declares this authority and
+availability; NOREPORT feature zeros are not measurements. Unsigned surfaces
+reject signed-penetration requests. `NativeRolloutRecord` exports optional
+`native_contact_association_metadata_json` without turning unavailable pair
+forces into measured zero or original source contact labels.
 
 **Viewer, logging and resume**
 

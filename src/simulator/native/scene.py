@@ -203,6 +203,15 @@ class NativeScene:
         self.object_parts = {p.name: {"entity_name": layout.object.entity_name, "body_name": p.body_name}
                              for p in layout.object.parts}
 
+    def bind_tracking_command(self, command):
+        # Native task geometry reads admitted references directly; actual pair
+        # facts belong to the coupled plant, independently of reference intent.
+        del command
+
+    def tracking_contact_metadata(self):
+        # No Isaac net-link/SDF force association is installed on this scene.
+        return None
+
     def __getitem__(self, name):
         return self.entities[name]
 

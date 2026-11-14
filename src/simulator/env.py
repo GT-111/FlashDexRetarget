@@ -155,6 +155,10 @@ class ManagerBasedRlEnv:
         self.sim.expand_model_fields(self.event_manager.domain_randomization_fields)
 
         self.command_manager = CommandManager(self.cfg.commands, self)
+        # Commands finish their reference admission before scene-owned views
+        # can read them; observations/rewards are constructed only afterwards.
+        for name in self.command_manager.active_terms:
+            self.scene.bind_tracking_command(self.command_manager.get_term(name))
         self.action_manager = ActionManager(self.cfg.actions, self)
         self.observation_manager = ObservationManager(self.cfg.observations, self)
         self.termination_manager = TerminationManager(self.cfg.terminations, self)
