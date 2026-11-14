@@ -89,6 +89,18 @@ Native FREE-root scenes instead use `robot.native_scene` and named
 floating hands and passive articulated objects; the stock fixed-root URDF
 binding does not replace it.
 
+### Native Isaac articulated assets
+
+The native Isaac profile converts the configured MJCF subtrees through the existing `convert_assets.py --native-scene-config <resolved-native-config>` entry. It retains separate FREE hand articulations and one FREE object articulation with its original passive hinge. The scene's named body, actuator and part bindings remain the source of the dimensions and addresses.
+
+The currently supported scalar import chart is hinge/slide joints with zero authored joint references. Supported mimic constraints are active affine joint equalities between limited revolute joints in the same FREE articulation, with one passive follower and a nonzero driver coefficient. Nonlinear, constant-only, cross-articulation, inactive and other equality constraints are rejected before conversion. Nonzero scalar references are also rejected; the current F1/BOX recipe uses zero references. This boundary does not claim that the importer preserves a nonzero-reference joint frame.
+
+For a supported equality `q_f - q_f0 = p0 + p1 * (q_d - q_d0)`, the USD mimic equation is `q_f + gearing * q_d + offset = 0`: `gearing = -p1`, and `offset` is the negative affine offset in degrees. Source limits are retained instead of expanded to accommodate the constraint. Mimic followers have zero own position-drive stiffness/damping. Their original passive damping is authored as the PhysX angular viscous coefficient in torque-seconds per degree (`D * pi / 180`), and runtime joint-property installation preserves this separation. This is an explicit PhysX realization; it is not a claim of numerical equivalence to MuJoCo's soft equality solver.
+
+Inline native MJCF meshes are materialized with the actual compiled triangle faces and their compiled geom chart. This retains the authored convex envelope, local placement and scale without applying mesh recentering twice. It does not convert the original object task surface into a collision mesh or replace the original part/SDF surface with the compiled hull. The object remains one articulation, with its source passive hinge, gravity and authored support; no object motion assistance is added.
+
+Converted and externally supplied native USDs pass the same read-only named-body/joint, FREE-root, limit, mimic instance/reference-axis and follower-drive admission before the first physics parse. An absent own DriveAPI adds no position-drive authority; present passive drives must have zero stiffness, and present mimic drives must have zero stiffness and damping. The pinned normal BOX import itself authors its source zero-stiffness drive. USD admission and software forwarding tests are separate from actual installed property/constraint response, which needs a pinned-Isaac F1/BOX qualification; stock XHand SAC results do not qualify these native assets. Isaac net-link force and SDF proximity remain distinct from native solved hand-part pair forces.
+
 Stock USD collision overrides are installed after the scene owner makes nested
 references editable, before material binding and the first physics reset.
 Robot and parked-object edits precede environment cloning; per-world objects,

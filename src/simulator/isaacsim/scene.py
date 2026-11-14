@@ -20,7 +20,7 @@ from simulator.mjcf_meta import RobotMjcfMeta
 from simulator.native.entity import NativeRobotAdapter, _FreshnessClock
 
 from .assets import IsaacRobotAsset, resolve_robot_asset
-from .convert_assets import colvis_enabled
+from .convert_assets import colvis_enabled, validate_native_usd
 from .entity import (
     ArticulationAdapter,
     FreeArticulationAdapter,
@@ -736,6 +736,7 @@ def _native_articulation_cfg(binding, meta, cfg) -> ArticulationCfg:
     usd_path = cfg.sim.native_assets.articulations[binding.entity_name]
     if not Path(usd_path).is_file():
         raise FileNotFoundError(usd_path)
+    validate_native_usd(usd_path, meta)
     driven = meta.driven_joint_names
     actuators = {}
     if driven:
@@ -789,6 +790,27 @@ def _native_rigid_object_cfg(binding, meta, usd_path) -> RigidObjectCfg:
             pos=tuple(meta.free_roots[0].default_pose[:3]),
             rot=tuple(meta.free_roots[0].default_pose[3:]),
         ),
+    )
+
+
+def _install_native_joint_properties(asset, meta, joint_ids, device) -> None:
+    """Keep mimic drive gains zero; its intrinsic viscous term is in the USD."""
+    scalar = dict(joint_ids=joint_ids)
+    damping = meta.joint_damping.copy()
+    followers = [meta.joint_names.index(m.joint_name) for m in meta.mimics]
+    damping[followers] = 0.0
+    if followers:
+        asset.write_joint_stiffness_to_sim(
+            0.0, joint_ids=[joint_ids[i] for i in followers],
+        )
+    for joint in meta.driven_joint_names:
+        damping[meta.joint_names.index(joint)] += meta.kp_kv_for_joint(joint)[1]
+    asset.write_joint_damping_to_sim(torch.as_tensor(damping, device=device), **scalar)
+    asset.write_joint_armature_to_sim(
+        torch.as_tensor(meta.joint_armature, device=device), **scalar,
+    )
+    asset.write_joint_friction_coefficient_to_sim(
+        torch.as_tensor(meta.joint_frictionloss, device=device), **scalar,
     )
 
 
@@ -872,21 +894,8 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
             device,
             root_body_name=binding.root_body_name,
         )
-        # Passive damping/armature/friction are physical properties, not extra
-        # position actuators. A BOX hinge is never put in the drive roster.
-        joint_ids = ent._isaac_joint_ids.tolist()
-        scalar = dict(joint_ids=joint_ids)
-        damping = meta.joint_damping.copy()
-        for joint in meta.driven_joint_names:
-            damping[meta.joint_names.index(joint)] += meta.kp_kv_for_joint(joint)[1]
-        asset.write_joint_damping_to_sim(
-            torch.as_tensor(damping, device=device), **scalar
-        )
-        asset.write_joint_armature_to_sim(
-            torch.as_tensor(meta.joint_armature, device=device), **scalar
-        )
-        asset.write_joint_friction_coefficient_to_sim(
-            torch.as_tensor(meta.joint_frictionloss, device=device), **scalar
+        _install_native_joint_properties(
+            asset, meta, ent._isaac_joint_ids.tolist(), device,
         )
         adapter.entities[binding.entity_name] = ent
         if binding in layout.hands:
@@ -915,7 +924,6 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         )
         adapter.sensors.update(views)
         adapter._tracking_banks[hand.side] = bank
-    # TODO(Isaac gate): verify the imported passive mimic constraints, exact
-    # collision shapes/filter pairs/materials/inertials and named link paths.
-    # MJCF solver contact-pair semantics are not presumed equal to PhysX.
+    # TODO(Isaac gate): qualify constraint response and installed collision,
+    # filter, material and inertia facts; USD admission does not prove parity.
     return adapter, sim, robot

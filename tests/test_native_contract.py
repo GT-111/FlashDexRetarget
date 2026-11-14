@@ -9,7 +9,11 @@ import torch
 
 from envs.actions.native import NativeResidualAction, NativeResidualActionCfg
 from envs.scene.native import NativeSceneCfg
-from simulator.isaacsim.convert_assets import write_native_mjcf_assets
+from simulator.isaacsim.convert_assets import (
+    native_mimic_imports,
+    validate_native_mjcf_import,
+    write_native_mjcf_assets,
+)
 from simulator.isaacsim.entity import FreeArticulationAdapter, _FreshnessClock
 from simulator.mjcf_meta import load_robot_mjcf_meta
 
@@ -145,6 +149,206 @@ def test_native_conversion_inputs_preserve_subtree_inertials_and_one_articulated
     static = ET.parse(paths["static"]).getroot()
     assert static.find(".//geom[@name='support']") is not None
     assert not static.findall(".//freejoint") + static.findall(".//joint[@type='free']")
+
+
+def test_native_inline_mesh_roundtrip_keeps_body_local_convex_envelope(tmp_path):
+    import mujoco
+
+    layout, _ = _scene(tmp_path)
+    tree = ET.parse(layout.scene_xml_path)
+    asset = ET.SubElement(tree.getroot(), "asset")
+    points = np.array([
+        [.3 + x, -.2 + y, .4 + z]
+        for x in (0, .04) for y in (0, .06) for z in (0, .09)
+    ])
+    ET.SubElement(
+        asset, "mesh", name="inline_hull", vertex=" ".join(map(str, points.flat)),
+        scale="1.3 .7 1.1", refpos=".2 -.1 .3",
+        refquat=".9238795325112867 0 0 .3826834323650898",
+    )
+    geom = tree.getroot().find(".//body[@name='base']/geom")
+    geom.attrib.clear()  # An unnamed real mesh geom also follows its body's order.
+    geom.attrib.update(type="mesh", mesh="inline_hull", mass=".075",
+                       pos=".07 .02 -.04", quat=".9659258262890683 0 .25881904510252074 0")
+    tree.write(layout.scene_xml_path)
+    original = mujoco.MjModel.from_xml_path(layout.scene_xml_path)
+    paths = write_native_mjcf_assets(layout, {
+        "static": str(tmp_path / "converted/static.usd"),
+        "articulations": {b.entity_name: str(tmp_path / "converted" / (b.entity_name + ".usd"))
+                          for b in layout.articulations},
+    })
+    saved_xml = ET.parse(paths["object"]).getroot()
+    mesh = saved_xml.find("asset/mesh[@name='inline_hull']")
+    assert mesh.get("vertex") is None and mesh.get("scale") == "1 1 1"
+    from pathlib import Path
+
+    obj = Path(mesh.get("file")).read_text().splitlines()
+    assert any(line.startswith("f ") for line in obj)
+    saved = mujoco.MjModel.from_xml_path(paths["object"])
+
+    def body_vertices(model):
+        gid = int(model.body_geomadr[model.body("base").id])
+        mid = int(model.geom_dataid[gid])
+        va, vn = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
+        rotation = np.empty(9)
+        mujoco.mju_quat2Mat(rotation, model.geom_quat[gid])
+        return model.mesh_vert[va:va + vn] @ rotation.reshape(3, 3).T + model.geom_pos[gid]
+
+    before, after = body_vertices(original), body_vertices(saved)
+    # Support in all source face normals plus oblique directions tests the
+    # actual envelope, independently of triangle/vertex ordering and winding.
+    from scipy.spatial import ConvexHull
+
+    directions = np.concatenate((ConvexHull(before).equations[:, :3], np.eye(3), -np.eye(3),
+                                 np.array([[1., 2., 3.], [-3., 2., -1.]])), axis=0)
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    np.testing.assert_allclose((before @ directions.T).max(0),
+                               (after @ directions.T).max(0), atol=1e-7, rtol=0)
+    for name in ("base", "lid"):
+        a, b = original.body(name).id, saved.body(name).id
+        np.testing.assert_array_equal(original.body_mass[a], saved.body_mass[b])
+        np.testing.assert_array_equal(original.body_ipos[a], saved.body_ipos[b])
+        inertias = []
+        for model, bid in ((original, a), (saved, b)):
+            rotation = np.empty(9)
+            mujoco.mju_quat2Mat(rotation, model.body_iquat[bid])
+            rotation = rotation.reshape(3, 3)
+            inertias.append(rotation @ np.diag(model.body_inertia[bid]) @ rotation.T)
+        np.testing.assert_allclose(inertias[0], inertias[1], rtol=1e-14, atol=1e-16)
+
+
+def test_native_affine_import_units_admission_and_normal_conversion_caller(monkeypatch, tmp_path):
+    import sys
+    from types import ModuleType
+    from unittest.mock import Mock
+
+    import mujoco
+    import pytest
+    from omegaconf import OmegaConf
+
+    from simulator.isaacsim import convert_assets
+
+    layout, mapping = _scene(tmp_path)
+    tree = ET.parse(layout.scene_xml_path)
+    follower = tree.getroot().find(".//joint[@name='left_mimic']")
+    follower.set("damping", ".1")
+    follower.set("ref", ".2")
+    tree.getroot().find(".//joint[@name='left_joint']").set("ref", ".3")
+    tree.getroot().find("equality/joint").set("polycoef", ".1 -1.5 0 0 0")
+    tree.write(layout.scene_xml_path)
+    meta = load_robot_mjcf_meta(layout.scene_xml_path).subtree("left_root")
+    fact, = native_mimic_imports(meta)
+    assert (fact.joint_name, fact.reference_joint_name) == ("left_mimic", "left_joint")
+    assert fact.gearing == 1.5
+    assert fact.offset_degrees == pytest.approx(-np.degrees(.2 + .1 + 1.5 * .3))
+    assert fact.viscous_friction_per_degree == pytest.approx(.1 * np.pi / 180)
+    with pytest.raises(ValueError, match="zero scalar joint references"):
+        validate_native_mjcf_import(mujoco.MjModel.from_xml_path(layout.scene_xml_path))
+    # The actual admitted input has a known raw joint chart. Nonlinear and
+    # cross-articulation equality requests fail before USD/SDK construction.
+    for joint in tree.getroot().findall(".//joint[@ref]"):
+        joint.attrib.pop("ref")
+    tree.write(layout.scene_xml_path)
+    model = mujoco.MjModel.from_xml_path(layout.scene_xml_path)
+    validate_native_mjcf_import(model)
+    model.eq_data[0, 2] = .01
+    with pytest.raises(ValueError, match="active affine limited-revolute"):
+        validate_native_mjcf_import(model)
+    model.eq_data[0, 2] = 0
+    model.eq_obj2id[0] = model.joint("right_joint").id
+    with pytest.raises(ValueError, match="same FREE articulation"):
+        validate_native_mjcf_import(model)
+    assets = {
+        "static": str(tmp_path / "static.usd"),
+        "articulations": {b.entity_name: str(tmp_path / (b.entity_name + ".usd"))
+                          for b in layout.articulations},
+    }
+    config = tmp_path / "run.yaml"
+    OmegaConf.save(OmegaConf.create({"robot": {"native_scene": mapping},
+                                    "sim": {"native_assets": assets}}), config)
+    events = []
+    converters = ModuleType("isaaclab.sim.converters")
+    converters.MjcfConverterCfg = lambda **kwargs: SimpleNamespace(**kwargs)
+    converters.MjcfConverter = lambda cfg: events.append(("convert", cfg))
+    for name in ("isaaclab", "isaaclab.sim"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    monkeypatch.setitem(sys.modules, "isaaclab.sim.converters", converters)
+    complete = Mock(side_effect=lambda path, meta: events.append(("complete", meta)))
+    monkeypatch.setattr(convert_assets, "complete_native_usd", complete)
+    convert_assets.convert_native_scene(str(config))
+    assert [kind for kind, _ in events] == ["convert", "complete"] * 3 + ["convert"]
+    assert [meta.free_roots[0].body_name for kind, meta in events if kind == "complete"] == [
+        b.root_body_name for b in layout.articulations
+    ]
+    configs = [cfg for kind, cfg in events if kind == "convert"]
+    assert [cfg.fix_base for cfg in configs] == [False, False, False, True]
+    assert all(cfg.import_inertia_tensor and not cfg.make_instanceable for cfg in configs)
+    # This CPU case proves connected dispatch and units, not USD/PhysX response.
+
+
+def test_native_isaac_scene_keeps_mimic_viscous_and_passive_hinge_authority(monkeypatch, tmp_path):
+    import sys
+    from unittest.mock import Mock
+
+    from omegaconf import OmegaConf
+    from test_scene_contact_authority import _isaac_scene_type
+
+    layout, _ = _scene(tmp_path)
+    tree = ET.parse(layout.scene_xml_path)
+    tree.getroot().find(".//joint[@name='left_joint']").set("damping", ".2")
+    tree.getroot().find(".//joint[@name='left_mimic']").set("damping", ".1")
+    tree.getroot().find("actuator/position[@name='command_A']").set("kv", ".3")
+    tree.write(layout.scene_xml_path)
+    meta = load_robot_mjcf_meta(layout.scene_xml_path)
+    scene = sys.modules[_isaac_scene_type(monkeypatch).__module__]
+    names = {}
+    for binding in layout.articulations:
+        path = tmp_path / (binding.entity_name + ".usd")
+        path.write_text("this fixture checks public property forwarding, not a USD")
+        names[binding.entity_name] = str(path)
+    cfg = OmegaConf.create({"robot": {"self_collision": True}, "sim": {
+        "native_assets": {"articulations": names},
+        "physx": {"solver_position_iteration_count": 16, "solver_velocity_iteration_count": 4},
+    }})
+    events = []
+    monkeypatch.setattr(scene, "validate_native_usd", lambda path, meta: events.append("admit"))
+    monkeypatch.setattr(scene, "ImplicitActuatorCfg",
+                        lambda **kwargs: (events.append("actuator") or SimpleNamespace(**kwargs)))
+    articulation_cfg = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+    articulation_cfg.InitialStateCfg = lambda **kwargs: SimpleNamespace(**kwargs)
+    monkeypatch.setattr(scene, "ArticulationCfg", articulation_cfg)
+    monkeypatch.setattr(scene.sim_utils, "UsdFileCfg", lambda **kwargs: SimpleNamespace(**kwargs), raising=False)
+    monkeypatch.setattr(scene.sim_utils, "ArticulationRootPropertiesCfg",
+                        lambda **kwargs: SimpleNamespace(**kwargs), raising=False)
+    left = meta.subtree("left_root")
+    selected = scene._native_articulation_cfg(layout.hands[0], left, cfg)
+    assert events == ["admit", "actuator"]
+    drive = selected.actuators["native_position"]
+    assert drive.joint_names_expr == ["left_joint"]
+    assert drive.stiffness == {"left_joint": 20.0}
+    assert drive.damping == {"left_joint": .5}
+    calls = []
+    authored_viscous = {"left_mimic": native_mimic_imports(left)[0].viscous_friction_per_degree}
+    asset = SimpleNamespace(
+        write_joint_stiffness_to_sim=lambda value, **kw: calls.append(("stiffness", value, kw)),
+        write_joint_damping_to_sim=lambda value, **kw: calls.append(("damping", value.clone(), kw)),
+        write_joint_armature_to_sim=lambda value, **kw: calls.append(("armature", value.clone(), kw)),
+        write_joint_friction_coefficient_to_sim=lambda value, **kw: calls.append(("friction", value.clone(), kw)),
+        authored_viscous=authored_viscous.copy(),
+    )
+    scene._install_native_joint_properties(asset, left, [1, 0], "cpu")
+    assert calls[0] == ("stiffness", 0.0, {"joint_ids": [0]})
+    assert calls[1][2] == {"joint_ids": [1, 0]}
+    np.testing.assert_array_equal(calls[1][1], [.5, 0])
+    assert asset.authored_viscous == authored_viscous
+    obj = meta.subtree("base")
+    selected = scene._native_articulation_cfg(layout.object, obj, cfg)
+    assert selected.actuators == {}
+    calls.clear()
+    scene._install_native_joint_properties(asset, obj, [3], "cpu")
+    assert [kind for kind, _, _ in calls] == ["damping", "armature", "friction"]
+    np.testing.assert_array_equal(calls[0][1], [.01])
+    assert all(kwargs == {"joint_ids": [3]} for _, _, kwargs in calls)
 
 
 def test_actual_native_action_derives_dimensions_and_records_accepted_supported_targets(

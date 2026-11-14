@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import os
 import sys
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 
 from simulator.isaacsim.assets import load_robot_asset
 
@@ -65,12 +67,282 @@ def _up_to_date(usd_path: str, sources: list[str]) -> bool:
     return all(os.path.getmtime(s) <= usd_mtime for s in sources if os.path.exists(s))
 
 
+def validate_native_mjcf_import(model) -> None:
+    """Admit the mechanics implemented by the pinned native Isaac importer.
+
+    In particular, its MJCF parser ignores joint equalities. They must be
+    representable by our explicit affine, limited-revolute mimic installation.
+    """
+    import mujoco
+    import numpy as np
+
+    scalar = {
+        j for j in range(model.njnt)
+        if int(model.jnt_type[j]) in (
+            int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE)
+        )
+    }
+    if any(
+        j not in scalar and int(model.jnt_type[j]) != int(mujoco.mjtJoint.mjJNT_FREE)
+        for j in range(model.njnt)
+    ):
+        raise ValueError("native Isaac import requires scalar joints and declared FREE roots")
+    if any(model.qpos0[int(model.jnt_qposadr[j])] != 0 for j in scalar):
+        raise ValueError("native Isaac import requires zero scalar joint references")
+    driven = {
+        int(model.actuator_trnid[a, 0]) for a in range(model.nu)
+        if int(model.actuator_trntype[a]) == int(mujoco.mjtTrn.mjTRN_JOINT)
+    }
+    if any(model.jnt_stiffness[j] != 0 for j in scalar - driven):
+        raise ValueError("native Isaac passive joint springs are not implemented")
+    free_bodies = {
+        int(model.jnt_bodyid[j]) for j in range(model.njnt)
+        if int(model.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_FREE)
+    }
+
+    def free_root(joint):
+        body = int(model.jnt_bodyid[joint])
+        while body and body not in free_bodies:
+            body = int(model.body_parentid[body])
+        return body
+
+    followers = set()
+    for e in range(model.neq):
+        first, second = int(model.eq_obj1id[e]), int(model.eq_obj2id[e])
+        if (
+            int(model.eq_type[e]) != int(mujoco.mjtEq.mjEQ_JOINT)
+            or not model.eq_active0[e] or second < 0
+            or first not in scalar or second not in scalar
+            or int(model.jnt_type[first]) != int(mujoco.mjtJoint.mjJNT_HINGE)
+            or int(model.jnt_type[second]) != int(mujoco.mjtJoint.mjJNT_HINGE)
+            or not model.jnt_limited[first] or not model.jnt_limited[second]
+            or np.any(model.eq_data[e, 2:5] != 0)
+            or model.eq_data[e, 1] == 0
+            or first in followers or first in driven
+            or not free_root(first) or free_root(first) != free_root(second)
+        ):
+            raise ValueError(
+                f"native Isaac equality {mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_EQUALITY, e)!r} requires one "
+                "active affine limited-revolute follower in the same FREE articulation"
+            )
+        followers.add(first)
+
+
+@dataclass(frozen=True)
+class NativeMimicImport:
+    joint_name: str
+    reference_joint_name: str
+    gearing: float
+    offset_degrees: float
+    viscous_friction_per_degree: float
+
+
+def native_mimic_imports(meta) -> tuple[NativeMimicImport, ...]:
+    """MuJoCo reference-relative coefficients in the actual USD angular units."""
+    result = []
+    for mimic in meta.mimics:
+        follower = meta.joint_names.index(mimic.joint_name)
+        reference = meta.joint_names.index(mimic.reference_joint_name)
+        p = mimic.polynomial
+        if any(p[2:] != 0) or p[1] == 0:
+            raise ValueError("native Isaac mimics require affine joint equalities")
+        offset = (
+            meta.joint_default[follower] + p[0]
+            - p[1] * meta.joint_default[reference]
+        )
+        result.append(NativeMimicImport(
+            mimic.joint_name, mimic.reference_joint_name, -float(p[1]),
+            -math.degrees(float(offset)),
+            float(meta.joint_damping[follower]) * math.pi / 180.0,
+        ))
+    return tuple(result)
+
+
+def _materialize_native_inline_meshes(document, model, directory) -> None:
+    """Use compiled triangles AND compiled geom poses in one centered chart."""
+    from pathlib import Path
+
+    import mujoco
+
+    inline = {}
+    for mesh in document.findall("asset/mesh"):
+        if mesh.get("file") or mesh.get("vertex") is None:
+            continue
+        mid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MESH, mesh.get("name"))
+        va, vn = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
+        fa, fn = int(model.mesh_faceadr[mid]), int(model.mesh_facenum[mid])
+        if not fn:
+            raise ValueError(f"native inline mesh {mesh.get('name')!r} has no compiled triangles")
+        path = Path(directory) / (mesh.get("name") + ".obj")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as output:
+            for v in model.mesh_vert[va:va + vn]:
+                output.write("v " + " ".join(format(float(x), ".17g") for x in v) + "\n")
+            for face in model.mesh_face[fa:fa + fn]:
+                output.write("f " + " ".join(str(int(x) + 1) for x in face) + "\n")
+        # Scale/ref/recentering are already in compiled vertices and geom poses.
+        mesh.attrib.clear()
+        mesh.attrib.update(name=model.mesh(mid).name, file=str(path.resolve()), scale="1 1 1")
+        inline[mid] = mesh.get("name")
+    world = document.find("worldbody")
+    for body in [world, *world.iter("body")]:
+        bid = 0 if body is world else model.body(body.get("name")).id
+        geoms = body.findall("geom")
+        if len(geoms) != int(model.body_geomnum[bid]):
+            raise ValueError("native mesh import requires the authored body/geom roster")
+        for i, geom in enumerate(geoms):
+            gid = int(model.body_geomadr[bid]) + i
+            if (
+                int(model.geom_type[gid]) != int(mujoco.mjtGeom.mjGEOM_MESH)
+                or int(model.geom_dataid[gid]) not in inline
+            ):
+                continue
+            for key in ("axisangle", "euler", "xyaxes", "zaxis"):
+                geom.attrib.pop(key, None)
+            for key, value in (("pos", model.geom_pos[gid]), ("quat", model.geom_quat[gid])):
+                geom.set(key, " ".join(format(float(x), ".17g") for x in value))
+
+
+def _native_usd_views(usd_path, meta):
+    from pxr import Usd, UsdPhysics
+
+    stage = Usd.Stage.Open(str(usd_path))
+    if stage is None:
+        raise ValueError(f"cannot open native USD: {usd_path}")
+    bodies, joints, roots = {}, {}, []
+    for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            if prim.GetName() in bodies:
+                raise ValueError(f"duplicate native USD body {prim.GetName()!r}")
+            bodies[prim.GetName()] = prim
+        if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint):
+            if prim.GetName() in joints:
+                raise ValueError(f"duplicate native USD joint {prim.GetName()!r}")
+            joints[prim.GetName()] = prim
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+            roots.append(prim)
+        if prim.IsA(UsdPhysics.Joint):
+            joint = UsdPhysics.Joint(prim)
+            ends = (joint.GetBody0Rel().GetTargets(), joint.GetBody1Rel().GetTargets())
+            if not ends[0] or not ends[1]:
+                raise ValueError("native FREE asset contains a joint to WORLD")
+    if set(bodies) != set(meta.body_names) or set(joints) != set(meta.joint_names):
+        raise ValueError("native USD body/scalar-joint roster differs from MJCF")
+    root = meta.free_roots[0].body_name
+    if len(roots) != 1 or roots[0] != bodies[root]:
+        raise ValueError("native USD must have its one declared floating articulation root")
+    return stage, bodies, joints
+
+
+def complete_native_usd(usd_path, meta) -> None:
+    """Install the native constraints missing from pinned MJCF import, pre-parse."""
+    from omni.physx.bindings._physx import (
+        JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR,
+    )
+    from pxr import PhysxSchema, Sdf, UsdPhysics
+
+    stage, _, joints = _native_usd_views(usd_path, meta)
+    for i, name in enumerate(meta.joint_names):
+        prim = joints[name]
+        joint = (UsdPhysics.RevoluteJoint(prim) if prim.IsA(UsdPhysics.RevoluteJoint)
+                 else UsdPhysics.PrismaticJoint(prim))
+        bounds = meta.joint_range[i] if meta.joint_limited[i] else (-math.inf, math.inf)
+        if prim.IsA(UsdPhysics.RevoluteJoint):
+            bounds = tuple(math.degrees(float(x)) for x in bounds)
+        joint.CreateLowerLimitAttr().Set(float(bounds[0]))
+        joint.CreateUpperLimitAttr().Set(float(bounds[1]))
+    for fact in native_mimic_imports(meta):
+        prim = joints[fact.joint_name]
+        reference = joints[fact.reference_joint_name]
+        axis = "rot" + UsdPhysics.RevoluteJoint(prim).GetAxisAttr().Get()
+        mimic = PhysxSchema.PhysxMimicJointAPI.Apply(prim, axis)
+        mimic.CreateReferenceJointRel().SetTargets([reference.GetPath()])
+        mimic.CreateReferenceJointAxisAttr().Set(
+            "rot" + UsdPhysics.RevoluteJoint(reference).GetAxisAttr().Get()
+        )
+        mimic.CreateGearingAttr().Set(fact.gearing)
+        mimic.CreateOffsetAttr().Set(fact.offset_degrees)
+        drive = UsdPhysics.DriveAPI.Apply(prim, UsdPhysics.Tokens.angular)
+        drive.CreateStiffnessAttr().Set(0.0)
+        drive.CreateDampingAttr().Set(0.0)
+        PhysxSchema.PhysxJointAxisAPI.Apply(prim, UsdPhysics.Tokens.angular)
+        prim.CreateAttribute(
+            JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR, Sdf.ValueTypeNames.Float,
+        ).Set(fact.viscous_friction_per_degree)
+    stage.GetRootLayer().Save()
+    validate_native_usd(usd_path, meta)
+
+
+def validate_native_usd(usd_path, meta) -> None:
+    """Read-only admission, also used for an externally supplied native USD."""
+    import mujoco
+    import numpy as np
+    from omni.physx.bindings._physx import (
+        JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR,
+    )
+    from pxr import PhysxSchema, UsdPhysics
+
+    source = mujoco.MjModel.from_xml_path(meta.xml_path)
+    validate_native_mjcf_import(source)
+    _, bodies, joints = _native_usd_views(usd_path, meta)
+    expected_mimics = {f.joint_name: f for f in native_mimic_imports(meta)}
+    for i, name in enumerate(meta.joint_names):
+        prim = joints[name]
+        jid = source.joint(name).id
+        angular = int(source.jnt_type[jid]) == int(mujoco.mjtJoint.mjJNT_HINGE)
+        joint_type = UsdPhysics.RevoluteJoint if angular else UsdPhysics.PrismaticJoint
+        if not prim.IsA(joint_type):
+            raise ValueError(f"native USD joint type differs for {name!r}")
+        joint = joint_type(prim)
+        child = meta.joint_body_names[i]
+        parent = meta.body_parent_names[meta.body_names.index(child)]
+        if (
+            joint.GetBody0Rel().GetTargets() != [bodies[parent].GetPath()]
+            or joint.GetBody1Rel().GetTargets() != [bodies[child].GetPath()]
+        ):
+            raise ValueError(f"native USD joint body binding differs for {name!r}")
+        bounds = meta.joint_range[i] if meta.joint_limited[i] else (-math.inf, math.inf)
+        if angular:
+            bounds = tuple(math.degrees(float(x)) for x in bounds)
+        if (
+            joint.GetLowerLimitAttr().Get() != float(np.float32(bounds[0]))
+            or joint.GetUpperLimitAttr().Get() != float(np.float32(bounds[1]))
+        ):
+            raise ValueError(f"native USD joint limits differ for {name!r}")
+        mimics = PhysxSchema.PhysxMimicJointAPI.GetAll(prim)
+        drive = UsdPhysics.DriveAPI.Get(prim, "angular" if angular else "linear")
+        if name not in expected_mimics:
+            if mimics:
+                raise ValueError(f"unexpected native USD mimic at {name!r}")
+            if name not in meta.driven_joint_names and drive and drive.GetStiffnessAttr().Get() != 0:
+                raise ValueError(f"native passive joint {name!r} has a position drive")
+            continue
+        fact = expected_mimics[name]
+        if len(mimics) != 1:
+            raise ValueError(f"native USD mimic is absent or ambiguous at {name!r}")
+        mimic = mimics[0]
+        reference = joints[fact.reference_joint_name]
+        if (
+            mimic.GetName() != "rot" + joint.GetAxisAttr().Get()
+            or mimic.GetReferenceJointAxisAttr().Get()
+            != "rot" + UsdPhysics.RevoluteJoint(reference).GetAxisAttr().Get()
+            or mimic.GetReferenceJointRel().GetTargets() != [reference.GetPath()]
+            or mimic.GetGearingAttr().Get() != float(np.float32(fact.gearing))
+            or mimic.GetOffsetAttr().Get() != float(np.float32(fact.offset_degrees))
+            or (drive and (drive.GetStiffnessAttr().Get() != 0 or drive.GetDampingAttr().Get() != 0))
+            or prim.GetAttribute(JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR).Get()
+            != float(np.float32(fact.viscous_friction_per_degree))
+        ):
+            raise ValueError(f"native USD mimic/property binding differs for {name!r}")
+
+
 def write_native_mjcf_assets(layout, assets) -> dict[str, str]:
     """Write importer inputs from ONE authoritative composed scene.
 
     Explicit compiled inertials prevent importer density estimates from changing
     bodies whose original inertial was derived from multiple collision geoms.
-    Source mesh coordinates, body transforms and passive equalities are retained.
+    Inline hulls use compiled triangles and geom poses in one declared chart.
+    Body transforms and supported passive equalities are retained.
     This function compiles metadata only; it does not create MjData or step.
     """
     from pathlib import Path
@@ -85,6 +357,7 @@ def write_native_mjcf_assets(layout, assets) -> dict[str, str]:
             mesh.file = str((meshdir / mesh.file).resolve())
     spec.meshdir = ""
     model = spec.compile()
+    validate_native_mjcf_import(model)
     actual_roots = {
         model.body(int(model.jnt_bodyid[j])).name
         for j in range(model.njnt)
@@ -93,6 +366,9 @@ def write_native_mjcf_assets(layout, assets) -> dict[str, str]:
     if actual_roots != {binding.root_body_name for binding in layout.articulations}:
         raise ValueError("configured native articulations must cover the source FREE roots")
     original = ET.fromstring(spec.to_xml())
+    _materialize_native_inline_meshes(
+        original, model, Path(assets["static"]).parent / "native_meshes",
+    )
     for body in original.findall(".//body"):
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body.get("name"))
         if model.body_mass[bid] <= 0:
@@ -170,11 +446,13 @@ def convert_native_scene(config_path: str) -> None:
     from omegaconf import OmegaConf
 
     from envs.scene.native import NativeSceneCfg
+    from simulator.mjcf_meta import load_robot_mjcf_meta
 
     config = OmegaConf.load(config_path)
     layout = NativeSceneCfg.from_mapping(config.robot.native_scene)
     assets = config.sim.native_assets
     inputs = write_native_mjcf_assets(layout, assets)
+    metadata = load_robot_mjcf_meta(layout.scene_xml_path)
     selected = [(b.entity_name, assets.articulations[b.entity_name], False) for b in layout.articulations]
     selected.append(("static", assets.static, True))
     for name, usd, fixed in selected:
@@ -192,10 +470,12 @@ def convert_native_scene(config_path: str) -> None:
                 link_density=0.0,
             )
         )
+        if not fixed:
+            binding = next(b for b in layout.articulations if b.entity_name == name)
+            complete_native_usd(destination, metadata.subtree(binding.root_body_name))
         _log(f"converted configured native asset {name}: {destination}")
-    # TODO(Isaac gate): assert actual USD mimic gearing, inertials, collision
-    # shape/filter/material parity. Successful conversion alone is not that
-    # qualification; MJCF explicit contact pairs do not transfer by assumption.
+    # TODO(Isaac gate): qualify installed inertia/collision/filter/material facts
+    # and constraint response. USD admission alone is not physical parity.
 
 
 def object_mass_properties(obj_dir: str):
