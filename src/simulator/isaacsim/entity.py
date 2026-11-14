@@ -4,6 +4,7 @@ a freshness token. Conventions: wxyz quats, world frame, MJCF ordering."""
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,7 +31,7 @@ def _xyzw_to_wxyz(q: torch.Tensor) -> torch.Tensor:
 
 
 class ArticulationAdapter(NamedArticulationView):
-    """mjlab ``Entity`` surface for the xhand articulation."""
+    """MJCF-ordered ``Entity`` view with explicit imported body names."""
 
     is_fixed_base = True
 
@@ -41,6 +42,8 @@ class ArticulationAdapter(NamedArticulationView):
         clock: _FreshnessClock,
         device: str,
         spec_fn=None,
+        *,
+        body_name_map: Mapping[str, str] | None = None,
     ) -> None:
         self._art = articulation
         self._meta = meta
@@ -53,14 +56,8 @@ class ArticulationAdapter(NamedArticulationView):
         self.num_joints = len(self.joint_names)
         self._body_index = {n: i for i, n in enumerate(self.body_names)}
 
-        # MJCF -> URDF link-name divergences (the URDF twin renames the palms).
-        alias = {
-            "R_forearm_rot_y_link": "right_hand_link",
-            "L_forearm_rot_y_link": "left_hand_link",
-        }
-        # Only the xhand URDF renames the palms; MJCF-named USDs (sharpa) keep the MJCF name.
-        have = set(articulation.body_names)
-        urdf_names = [alias[n] if (n in alias and n not in have) else n for n in self.body_names]
+        names = body_name_map or {}
+        urdf_names = [names.get(n, n) for n in self.body_names]
 
         # entity(MJCF) order -> isaac articulation order permutations
         ids, _ = articulation.find_bodies(urdf_names, preserve_order=True)

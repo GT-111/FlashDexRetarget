@@ -15,13 +15,13 @@ from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObj
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 
-from envs.commands.motion_tracking.reference.hand import ALLLINK_BODY_NAMES_BY_SIDE
 from envs.scene._object_setup import object_park_position
 from envs.scene.native import NativeSceneCfg
 from simulator.mjcf_meta import RobotMjcfMeta
 from simulator.native.entity import NativeRobotAdapter, _FreshnessClock, _ObjIndexing
 
-from .convert_assets import COLVIS_ROBOT_DIRNAME, colvis_enabled
+from .assets import IsaacRobotAsset, resolve_robot_asset
+from .convert_assets import colvis_enabled
 from .entity import (
     ArticulationAdapter,
     FreeArticulationAdapter,
@@ -36,8 +36,6 @@ from .sensors import (
 )
 from .sim import IsaacSimAdapter, principal_inertia
 
-_SIM_DIR = Path(__file__).resolve().parents[3]  # simulation/
-
 
 def _abl(name: str) -> bool:
     """Physics-ablation probe switch (FDR_ABL_*), all default off.
@@ -46,8 +44,7 @@ def _abl(name: str) -> bool:
 
 
 def _alllink_bodies_by_side(cfg) -> dict[str, list[str]]:
-    """{side: all-link contact bodies} from the scene's {r,l}_alllink_contact sensors (the mujoco
-    source of truth, so other hands work); the xhand constant is the fallback."""
+    """Configured sensor order, or the selected robot's explicit contact links."""
     out: dict[str, list[str]] = {}
     for side in ("right", "left"):
         pat = None
@@ -55,30 +52,8 @@ def _alllink_bodies_by_side(cfg) -> dict[str, list[str]]:
             if str(sn.get("name", "")) == f"{side[0]}_alllink_contact":
                 pat = [str(b) for b in sn["primary"]["pattern"]]
                 break
-        out[side] = pat or list(ALLLINK_BODY_NAMES_BY_SIDE[side])
+        out[side] = pat if pat is not None else list(cfg.robot.contact_links.get(side, []))
     return out
-
-
-def _robot_usd_path(meta: RobotMjcfMeta) -> Path:
-    """Converted robot USD for the configured MJCF (xhand_right / xhand_bimanual).
-    FDR_COLVIS: debug robot whose visuals ARE the collided convex hulls."""
-    override = os.environ.get("FDR_ROBOT_USD")
-    if override:
-        return Path(override)
-    stem = Path(meta.xml_path).stem
-    variant = next((v for v in ("bimanual", "left") if v in stem), "right")
-    if Path(meta.xml_path).parent.name == "sharpa":
-        return _SIM_DIR / "assets/robot/sharpa/urdf/converted" / f"sharpa_{variant}.usd"
-    return _SIM_DIR / "assets/robot/xhand/urdf" / (
-        COLVIS_ROBOT_DIRNAME if colvis_enabled() else "converted"
-    ) / f"xhand_{variant}.usd"
-
-
-# MJCF -> URDF/USD link renames (see assets fork report).
-_URDF_LINK_ALIAS = {
-    "R_forearm_rot_y_link": "right_hand_link",
-    "L_forearm_rot_y_link": "left_hand_link",
-}
 
 
 class IsaacSceneAdapter:
@@ -132,15 +107,16 @@ class IsaacSceneAdapter:
 
 
 def _robot_articulation_cfg(
-    meta: RobotMjcfMeta, self_collision: bool, pos_iters: int, vel_iters: int,
+    meta: RobotMjcfMeta, asset: IsaacRobotAsset,
+    self_collision: bool, pos_iters: int, vel_iters: int,
     contact_offset: float = 0.002, rest_offset: float = 0.0,
     max_depen: float = 5.0, max_contact_impulse: float | None = None,
 ) -> ArticulationCfg:
-    """xhand articulation: converted USD + MJCF-derived implicit PD gains."""
-    robot_usd = _robot_usd_path(meta)
+    """Explicit converted USD with MJCF-derived implicit PD gains."""
+    robot_usd = asset.usd_path
     if not robot_usd.exists():
         raise FileNotFoundError(
-            f"{robot_usd} missing — run convert_assets.py --robot"
+            f"{robot_usd} missing — run convert_assets.py --robot-config <robot-or-run.yaml>"
             + (" --collision-visual" if colvis_enabled() else "")
         )
 
@@ -369,6 +345,7 @@ def build_isaac_scene(
     (B,) selects PER-ENV-OBJECT mode; None = legacy parked-slot mode."""
     if cfg.robot.get("native_scene") is not None:
         return _build_native_isaac_scene(cfg, sim_ctx, device, meta)
+    robot_asset = resolve_robot_asset(cfg, collision_visual=colvis_enabled())
     num_envs = int(cfg.scene.num_envs)
     per_env_mode = assigned_obj_slot is not None
     scene = InteractiveScene(
@@ -443,7 +420,7 @@ def build_isaac_scene(
     mimp = None if mimp is None else float(mimp)
     robot = Articulation(
         _robot_articulation_cfg(
-            meta, bool(cfg.robot.get("self_collision", False)), pos_iters, vel_iters,
+            meta, robot_asset, bool(cfg.robot.get("self_collision", False)), pos_iters, vel_iters,
             coff, roff, mdep, mimp,
         )
     )
@@ -583,15 +560,13 @@ def build_isaac_scene(
     alllink = _alllink_bodies_by_side(cfg)
     robot_sides = [
         s for s in ("right", "left")
-        if alllink[s][0] in meta.body_names
+        if alllink[s] and alllink[s][0] in meta.body_names
     ]
     link_sensors: dict[str, list[ContactSensor]] = {}
     for side in robot_sides:
         link_sensors[side] = []
         for body in [] if _abl("NOREPORT") else alllink[side]:
-            urdf_body = body  # xhand URDF renames the palms; MJCF-named USDs keep the name
-            if not stage.GetPrimAtPath(f"/World/envs/env_0/Robot/{body}").IsValid():
-                urdf_body = _URDF_LINK_ALIAS.get(body, body)
+            urdf_body = robot_asset.body_name(body)
             s = ContactSensor(
                 ContactSensorCfg(
                     prim_path=f"/World/envs/env_.*/Robot/{urdf_body}",
@@ -623,7 +598,9 @@ def build_isaac_scene(
     )
     sim_adapter._clock = clock
 
-    robot_adapter = ArticulationAdapter(robot, meta, clock, device)
+    robot_adapter = ArticulationAdapter(
+        robot, meta, clock, device, body_name_map=robot_asset.body_name_map
+    )
     # 0.0 matches every run before the fix (resets cleared it); 0.8 is the MJCF gravcomp.
     robot_adapter.init_gravcomp(float(cfg.sim.get("robot_gravcomp", 0.0)))
 

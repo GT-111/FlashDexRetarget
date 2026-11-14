@@ -71,14 +71,13 @@ pip install --no-deps -e .
 if [ ! -f "$ENV_FILE" ]; then
     echo "[setup] writing scripts/env.sh"
     cat > "$ENV_FILE" <<EOF
-# FlashDexRetarget environment (machine-specific, gitignored): conda env, robot USD.
+# FlashDexRetarget environment (machine-specific, gitignored).
 source "\$(conda info --base)/etc/profile.d/conda.sh"
 conda activate $CONDA_ENV
 
 export MUJOCO_GL=\${MUJOCO_GL:-disabled}
 # Isaac license acceptance is supplied by the operator's shell.
-# The xhand_spec robot the flashdexretarget policies are trained on (assets/robot/xhand/urdf/converted_spec).
-export FDR_ROBOT_USD=\${FDR_ROBOT_USD:-$PROJECT_DIR/assets/robot/xhand/urdf/converted_spec/xhand_bimanual_spec.usd}
+# Robot asset bindings live in config/envs/robot/.
 PROJECT_DIR=$PROJECT_DIR
 EOF
 else
@@ -86,22 +85,29 @@ else
 fi
 
 # ── 5. robot USDs (object USDs are made by the retarget pipeline) ──────────
-convert_robot() {   # <usd> <convert_assets.py args>
-    local usd=$1; shift
+convert_robot() {   # <robot config>
+    local robot_config=$1
+    local usd
+    usd=$(python - "$robot_config" <<'PY'
+import sys
+
+from simulator.isaacsim.assets import load_robot_asset
+
+print(load_robot_asset(sys.argv[1]).usd_path)
+PY
+)
     if [ -f "$usd" ]; then
         echo "[setup] $(basename "$usd") exists"
     else
         echo "[setup] converting $(basename "$usd" .usd) URDF to USD"
-        MUJOCO_GL=disabled python src/simulator/isaacsim/convert_assets.py --robot "$@"
+        MUJOCO_GL=disabled python src/simulator/isaacsim/convert_assets.py --robot-config "$robot_config"
     fi
 }
 if [ "$SKIP_ASSETS" = 1 ]; then
     echo "[setup] --skip_assets: robot USDs not converted"
 else
-    convert_robot "$PROJECT_DIR/assets/robot/xhand/urdf/converted_spec/xhand_bimanual_spec.usd" \
-        --robot-variant bimanual --robot-suffix _spec
-    convert_robot "$PROJECT_DIR/assets/robot/sharpa/urdf/converted/sharpa_bimanual.usd" \
-        --robot-name sharpa --robot-variant bimanual
+    convert_robot config/envs/robot/xhand_bimanual.yaml
+    convert_robot config/envs/robot/sharpa_bimanual.yaml
 fi
 
 # ── 6. smoke test ───────────────────────────────────────────────────────

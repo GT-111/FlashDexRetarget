@@ -1,5 +1,14 @@
 # @package _global_
 
+sim:
+  robot_asset:
+    source_urdf_path: assets/robot/xhand/urdf/xhand_bimanual_spec.urdf
+    usd_path: ${oc.env:FDR_ROBOT_USD,assets/robot/xhand/urdf/converted_spec/xhand_bimanual_spec.usd}
+    collision_visual_usd_path: assets/robot/xhand/urdf/converted_colvis/xhand_bimanual_spec.usd
+    body_name_map:
+      R_forearm_rot_y_link: right_hand_link
+      L_forearm_rot_y_link: left_hand_link
+
 robot:
   entity_name: robot
   self_collision: true

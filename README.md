@@ -194,6 +194,23 @@ bash scripts/setup.sh
 One script builds the conda env `FlashDexRetarget` (pinned Isaac freeze, rsl_rl_flashsac), `scripts/env.sh`
 and the XHAND and Sharpa Wave USDs.
 
+Each stock robot config declares `sim.robot_asset`: the source URDF, destination
+USD and any MJCF-to-USD body-name mapping. Setup and runtime read that same
+binding; another robot is never inferred to be XHAND from its MJCF filename.
+XHAND selects the `_spec` asset by default. Its config alone admits the optional
+`FDR_ROBOT_USD` override, so an existing XHAND override cannot select an asset
+for Sharpa or a new robot. Convert a registered stock asset with:
+
+```sh
+python src/simulator/isaacsim/convert_assets.py \
+    --robot-config config/envs/robot/xhand_bimanual.yaml
+```
+
+The same option accepts a resolved run YAML. The separate native route keeps
+`robot.native_scene` and its named `sim.native_assets` bindings; it does not use
+the stock robot binding. See [asset configuration](docs/guide/flashdexretarget.md#robot-assets)
+for registering another asset and the collision-visual debug variant.
+
 > [!CAUTION]
 > `setup.sh` installs every package with `--no-deps`. Add packages to this env the same way
 > (`pip install --no-deps <pkg>`): a plain `pip install` pulls newer torch / warp and breaks Isaac Lab.

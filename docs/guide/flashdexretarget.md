@@ -33,6 +33,56 @@ The run is named `flashdexretarget-<dataset>-<robot>` and tagged `<dataset>`, `<
 `<dataset>` is the directory of `MOTION` (`<dataset>/motion.pt` or `<dataset>/<robot>/motion.pt`);
 `logger.wandb.run_name=<name>` replaces it.
 
+### Robot assets
+
+The selected stock robot YAML owns both its authoritative `robot.xml_path` and
+the Isaac import binding:
+
+```yaml
+sim:
+  robot_asset:
+    source_urdf_path: assets/robot/my_hand/urdf/my_hand.urdf
+    usd_path: assets/robot/my_hand/urdf/converted/my_hand.usd
+    body_name_map: {}  # MJCF body name -> imported USD body name; omitted names retain identity
+```
+
+Paths are relative to the repository root unless absolute. Add a mapping only
+for names the source URDF actually changes. The converter, articulation view
+and contact-sensor prims share this mapping; joint, actuator, mimic, inertial
+and collision definitions retain their existing source owners. Required link
+names come from the actual MJCF metadata and complete source URDF link roster,
+including authored fixed fingertip frames, rather than a fixed finger roster.
+Runtime requires this explicit binding for
+the stock route. It does not guess a hand or a USD from the MJCF filename.
+
+```sh
+python src/simulator/isaacsim/convert_assets.py \
+    --robot-config config/envs/robot/sharpa_bimanual.yaml
+# A resolved run YAML selects the same binding.
+python src/simulator/isaacsim/convert_assets.py --robot-config <resolved-run.yaml>
+```
+
+XHAND declares its trained `_spec` URDF/USD and palm renames in
+`config/envs/robot/xhand_bimanual.yaml`; Sharpa declares its own asset and the
+palm renames present in its source URDF. Only the XHAND config reads
+`FDR_ROBOT_USD`; Sharpa and custom registrations are independent of it.
+`scripts/env.sh` supplies the environment rather than a global robot asset.
+
+A robot may also declare `collision_visual_usd_path`. Convert that explicit
+destination with `--collision-visual` and select it with `FDR_COLVIS=1`.
+XHAND registers this debug variant; requesting it for a registration without
+one fails. Debug visuals use per-collision convex hulls, retaining the original
+collision mesh paths, transforms, scales and inertials. This changes visual
+representation, not the declared collider recipe. Objects keep their existing
+`.isaac_usd_colvis` route. Neither converted files nor named-link validation
+qualifies physical contact or task success.
+
+Native FREE-root scenes instead use `robot.native_scene` and named
+`sim.native_assets.static` / `sim.native_assets.articulations` USDs with
+`--native-scene-config <resolved-run.yaml>`. Keep that per-entity route for
+floating hands and passive articulated objects; the stock fixed-root URDF
+binding does not replace it.
+
 ### Hydra overrides
 
 The defaults below come from `config/` (`envs/`, `runner/`, `eval/`, `logger/`); arguments to the launcher

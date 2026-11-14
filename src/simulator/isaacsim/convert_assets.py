@@ -1,4 +1,4 @@
-"""Standalone CLI: convert COACD objects + the xhand URDF to USD via IsaacLab
+"""Standalone CLI: convert COACD objects + configured robot URDFs to USD via IsaacLab
 UrdfConverter (headless AppLauncher boot)."""
 
 from __future__ import annotations
@@ -9,14 +9,7 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 
-REPO_SIM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 3))
-ROBOT_DIR = os.path.join(REPO_SIM_DIR, "assets", "robot")
-ROBOT_URDF_DIR = os.path.join(ROBOT_DIR, "xhand", "urdf")
-
-
-def robot_urdf(variant: str, suffix: str = "", robot: str = "xhand") -> str:
-    """Source URDF per robot and variant (xhand_right.urdf, sharpa_bimanual.urdf, ...)."""
-    return os.path.join(ROBOT_DIR, robot, "urdf", f"{robot}_{variant}{suffix}.urdf")
+from simulator.isaacsim.assets import load_robot_asset
 
 OBJ_DENSITY = 800.0  # kg/m^3, matches get_object_spec / holosoma taco URDFs
 OBJ_MASS_CLAMP = (0.05, 0.5)  # kg, matches get_object_spec
@@ -24,7 +17,6 @@ OBJ_MASS_CLAMP = (0.05, 0.5)  # kg, matches get_object_spec
 # "collision == visual" debug variant: same physics, visuals replaced by the
 # exact shapes PhysX collides with. Runtime switch: FDR_COLVIS=1.
 COLVIS_OBJ_DIRNAME = ".isaac_usd_colvis"
-COLVIS_ROBOT_DIRNAME = "converted_colvis"
 COLVIS_RGBA = "0.85 0.45 0.2 1"
 
 
@@ -39,17 +31,11 @@ def parse_args() -> argparse.Namespace:
         "--objects", nargs="*", default=[], help="object ids under <data-root>/objects/",
     )
     parser.add_argument("--data-root", help="dataset directory holding objects/ (needed with --objects)")
-    parser.add_argument("--robot", action="store_true", help="also convert a robot URDF")
-    parser.add_argument("--robot-name", default="xhand", choices=["xhand", "sharpa"],
-                        help="sharpa ships the bimanual URDF only (--robot-variant bimanual)")
     parser.add_argument(
-        "--robot-variant", default="right", choices=["right", "left", "bimanual"],
-        help="which <robot>_<variant>.urdf to convert (xhand: generate via mjcf_to_urdf.py)",
+        "--robot-config",
+        help="stock robot YAML or resolved run YAML with an explicit sim.robot_asset binding",
     )
     parser.add_argument("--force", action="store_true", help="reconvert even if USD is up to date")
-    parser.add_argument("--robot-suffix", default="",
-                        help="convert xhand_<variant><suffix>.urdf into converted<suffix>/ "
-                             "(e.g. _spec)")
     parser.add_argument(
         "--native-scene-config",
         help="resolved run yaml with robot.native_scene and sim.native_assets: split its named MJCF assets",
@@ -57,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--collision-visual", action="store_true",
         help="write the debug variant whose visual meshes ARE the collision geometry "
-        f"(objects -> {COLVIS_OBJ_DIRNAME}/, robot -> converted_colvis/); "
+        f"(objects -> {COLVIS_OBJ_DIRNAME}/, robot -> configured collision_visual_usd_path); "
         "select at runtime with FDR_COLVIS=1",
     )
     from isaaclab.app import AppLauncher
@@ -325,12 +311,10 @@ def convert_object(obj_dir: str, force: bool, collision_visual: bool = False) ->
     verify_usd(converter.usd_path)
 
 
-def author_robot_colvis_urdf(out_dir: str, variant: str = "right") -> str:
-    """xhand URDF variant whose visuals are the per-collision-mesh convex hulls —
-    exactly what PhysX collides with under collider_type='convex_hull'."""
+def author_robot_colvis_urdf(src_urdf: str, out_dir: str) -> str:
+    """Visualize the configured URDF's hulls without moving its collision meshes."""
     import trimesh
 
-    src_urdf = robot_urdf(variant)
     urdf_dir = os.path.dirname(src_urdf)
     hull_dir = os.path.join(out_dir, "hull_meshes")
     os.makedirs(hull_dir, exist_ok=True)
@@ -344,7 +328,10 @@ def author_robot_colvis_urdf(out_dir: str, variant: str = "right") -> str:
             if mesh_el is None:
                 raise RuntimeError(f"non-mesh collision in link {link.get('name')!r}")
             src = os.path.normpath(os.path.join(urdf_dir, mesh_el.get("filename")))
-            stem = os.path.splitext(os.path.basename(src))[0]
+            # The generated URDF lives elsewhere. Retain the original collider,
+            # including when different links use the same mesh basename.
+            mesh_el.set("filename", src)
+            stem = f"{link.attrib['name']}_{i}"
             hull_path = os.path.join(hull_dir, f"{stem}.obj")
             if not _up_to_date(hull_path, [src]):
                 trimesh.load(src, force="mesh").convex_hull.export(hull_path)
@@ -362,43 +349,47 @@ def author_robot_colvis_urdf(out_dir: str, variant: str = "right") -> str:
             )
             mat = ET.SubElement(vis, "material", name="mat_colvis")
             ET.SubElement(mat, "color", rgba=COLVIS_RGBA)
-    urdf_path = os.path.join(out_dir, f"xhand_{variant}_colvis.urdf")
+    urdf_path = os.path.join(out_dir, f"{os.path.splitext(os.path.basename(src_urdf))[0]}_colvis.urdf")
     tree.write(urdf_path)
     _log(f"  authored collision-visual robot URDF ({n_hulls} hulls) -> {urdf_path}")
     return urdf_path
 
 
-def convert_robot(force: bool, collision_visual: bool = False, variant: str = "right",
-                  suffix: str = "", robot: str = "xhand") -> None:
+def convert_robot(config_path: str, force: bool, collision_visual: bool = False) -> None:
     from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg
 
-    if collision_visual and robot != "xhand":
-        raise ValueError("--collision-visual is xhand-only")
-    src_urdf = robot_urdf(variant, suffix, robot)
-    # A suffixed variant gets its own output dir so it never shadows the stock USD.
-    out_dir = os.path.join(
-        ROBOT_DIR, robot, "urdf",
-        COLVIS_ROBOT_DIRNAME if collision_visual else f"converted{suffix}",
-    )
-    usd_path = os.path.join(out_dir, f"{robot}_{variant}{suffix}.usd")
-    if not force and _up_to_date(usd_path, [src_urdf]):
-        _log(f"up to date, skipping: {usd_path}")
-        _block_empty_robot_visual_references(usd_path, src_urdf)
-        return
+    from simulator.mjcf_meta import load_robot_mjcf_meta
+
+    asset = load_robot_asset(config_path, collision_visual=collision_visual)
+    src_urdf = str(asset.source_urdf_path)
+    usd_path = str(asset.usd_path)
+    out_dir = str(asset.usd_path.parent)
+    meta = load_robot_mjcf_meta(asset.mjcf_path)
+    # The import also contains authored fixed frames (for example fingertip
+    # sites materialized as URDF links), beyond the MJCF body view.
+    expected_links = list(dict.fromkeys(
+        [asset.body_name(name) for name in meta.body_names]
+        + [link.attrib["name"] for link in ET.parse(src_urdf).getroot().findall("link")]
+    ))
     urdf_src = src_urdf
     if collision_visual:
         os.makedirs(out_dir, exist_ok=True)
-        urdf_src = author_robot_colvis_urdf(out_dir, variant)
+        urdf_src = author_robot_colvis_urdf(src_urdf, out_dir)
+    if not force and _up_to_date(usd_path, [src_urdf]):
+        _log(f"up to date, skipping: {usd_path}")
+        _block_empty_robot_visual_references(usd_path, urdf_src)
+        verify_usd(usd_path, expect_links=expected_links)
+        return
     cfg = UrdfConverterCfg(
         asset_path=urdf_src,
         usd_dir=out_dir,
-        usd_file_name=f"{robot}_{variant}{suffix}.usd",
+        usd_file_name=asset.usd_path.name,
         force_usd_conversion=True,
         make_instanceable=False,
         # MJCF anchors the wrist chain at worldbody: the 6 wrist joints ARE the
         # floating base, so the URDF "world" root is welded to the stage.
         fix_base=True,
-        # Keep track_hand_right_*_tip fixed links as bodies (fingertip frames).
+        # Retain the configured fixed link frames in the imported body roster.
         merge_fixed_joints=False,
         joint_drive=UrdfConverterCfg.JointDriveCfg(
             drive_type="force",
@@ -412,9 +403,7 @@ def convert_robot(force: bool, collision_visual: bool = False, variant: str = "r
     converter = UrdfConverter(cfg)
     _log(f"converted robot -> {converter.usd_path}")
     _block_empty_robot_visual_references(converter.usd_path, urdf_src)
-    sides = ("right", "left") if variant == "bimanual" else (variant,)
-    verify_usd(converter.usd_path, expect_links=[f"track_hand_{s}_{f}_tip" for s in sides
-                                                for f in ("thumb", "index", "middle", "ring", "pinky")])
+    verify_usd(converter.usd_path, expect_links=expected_links)
 
 
 def _block_empty_robot_visual_references(usd_path: str, urdf_path: str) -> list[str]:
@@ -506,9 +495,8 @@ def main() -> None:
         if not os.path.isdir(obj_dir):
             raise FileNotFoundError(f"object dir not found: {obj_dir}")
         convert_object(obj_dir, force=args.force, collision_visual=args.collision_visual)
-    if args.robot:
-        convert_robot(force=args.force, collision_visual=args.collision_visual,
-                      variant=args.robot_variant, suffix=args.robot_suffix, robot=args.robot_name)
+    if args.robot_config:
+        convert_robot(args.robot_config, force=args.force, collision_visual=args.collision_visual)
     if args.native_scene_config:
         convert_native_scene(args.native_scene_config)
 
