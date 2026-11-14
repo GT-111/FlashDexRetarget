@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
-import os
 import random
-import signal
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,52 +24,125 @@ from envs.curriculum.assist import XfrcAssistCurriculum
 from runner.off_policy_runner import LEARNING_STATE_FILE, OffPolicyRunner
 
 
-def test_stop_signal_authority_and_installation_failure(monkeypatch, capsys, tmp_path):
+def _stop_loop(tmp_path, monkeypatch, *, ready=True):
+    """Real loop/checkpoint orchestration with explicit small fake numerical writers."""
+    import runner.off_policy_runner as runner_module
+
+    monkeypatch.setattr(runner_module.wandb, "run", None)
+    monkeypatch.setattr(runner_module, "log_metrics", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.delenv("FDR_ITER_TIMING_FILE", raising=False)
     runner = OffPolicyRunner.__new__(OffPolicyRunner)
+    runner._cfg = OmegaConf.create({"save_replay_buffer": False})
+    runner._save_path_base = tmp_path
+    runner._stop_request_path = tmp_path / "stop.request"
+    runner._train_cmd = None
+    runner._eval_ever_state = {}
+    runner._n_envs, runner._step_offset = 2, 0
+    runner._updates_per_step, runner._log_every = 1, 0
+    runner._eval_stride, runner._save_stride = 2, 0
+    runner._start_clock = lambda: None
+    runner._cost_metrics = lambda _step: {}
+    runner._finish = lambda: pytest.fail("a requested stop must not run weights-only finish")
+    runner._eval_supported = lambda: pytest.fail("stop must precede optional evaluation")
+    events = []
 
-    def reject_install(*_args):
-        raise ValueError("signal only works in main thread")
+    def save(path):
+        target = Path(path)
+        assert target.name == "stop2.tmp"
+        assert runner._stop_request_path.is_file() and not (tmp_path / "stop2").exists()
+        target.mkdir()
+        (target / "networks.json").write_text("{}")
+        events.append("networks")
 
-    with monkeypatch.context() as patch:
-        patch.setattr(signal, "signal", reject_install)
-        with pytest.raises(ValueError, match="main thread"):
-            runner._install_stop_signal()
+    def save_buffer(path):
+        assert runner._stop_request_path.is_file() and not (tmp_path / "stop2").exists()
+        (Path(path) / "replay.json").write_text("{}")
+        events.append("replay")
 
-    previous = signal.getsignal(signal.SIGUSR1)
-    assert signal.SIGUSR1 not in signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    try:
-        runner._agent = SimpleNamespace(ready=lambda: True, update=lambda: {})
-        runner._n_envs = 2
-        runner._step_offset = 0
-        runner._updates_per_step = 1
-        runner._log_every = 0
-        runner._eval_stride = runner._save_stride = 0
-        runner._start_clock = runner._finish = lambda: None
-        runner._collect = lambda *_args: None
-        runner._crossed = lambda *_args: False
-        runner._eval_supported = lambda: False
-        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-        for timing in (False, True):
-            if timing:
-                monkeypatch.setenv("FDR_ITER_TIMING_FILE", str(tmp_path / "timing.csv"))
-            else:
-                monkeypatch.delenv("FDR_ITER_TIMING_FILE", raising=False)
-            runner.learn(3)
-        records = [json.loads(line) for line in capsys.readouterr().out.splitlines()
-                   if line.startswith('{"kind": "runner_stop_signal_authority"')]
-        assert [record["phase"] for record in records] == [
-            "installed", "first_completed_update", "installed", "first_completed_update",
-        ]
-        installed, completed = records[-2:]
-        assert installed["PID"] == os.getpid()
-        assert installed["main_thread"] and installed["python_handler_is_runner_callback"]
-        assert not installed["USR1_blocked"] and not installed["USR1_pending"]
-        assert int(installed["linux_masks"]["SigCgt"], 16) & (1 << (signal.SIGUSR1 - 1))
-        os.kill(installed["PID"], signal.SIGUSR1)
-        assert runner._stop_requested
-        assert completed["python_handler_is_runner_callback"] and not completed["USR1_pending"]
-    finally:
-        signal.signal(signal.SIGUSR1, previous)
+    def save_learning(path, env_step):
+        assert runner._stop_request_path.is_file() and not (tmp_path / "stop2").exists()
+        (Path(path) / "learning.json").write_text(json.dumps({"env_step": env_step}))
+        events.append("learning")
+
+    runner._agent = SimpleNamespace(ready=lambda: ready, update=lambda: {},
+                                    save=save, save_buffer=save_buffer)
+    runner._save_learning_state = save_learning
+    runner._collect = lambda *_args: events.append("collect")
+    return runner, events
+
+
+@pytest.mark.parametrize("request_during", ["update", "evaluation", "final_evaluation"])
+def test_stop_request_created_during_update_or_evaluation_commits_full_then_returns(
+    monkeypatch, tmp_path, request_during,
+):
+    runner, events = _stop_loop(tmp_path, monkeypatch)
+    timing = tmp_path / "timing.csv"
+    monkeypatch.setenv("FDR_ITER_TIMING_FILE", str(timing))
+
+    def update():
+        events.append("update")
+        if request_during == "update":
+            runner._stop_request_path.write_text("operator request\n")
+        return {}
+
+    def evaluate(_step):
+        events.append("evaluation")
+        runner._stop_request_path.write_text("operator request\n")
+        return {}
+
+    runner._agent.update = update
+    if request_during != "update":
+        runner._eval_supported = lambda: True
+        runner._eval_env = SimpleNamespace(shares_train_env=False)
+        runner._run_eval = evaluate
+        runner._all_solved = lambda *_args: pytest.fail("stop must precede all-solved return")
+    if request_during == "final_evaluation":
+        runner._eval_stride = 0
+    runner.learn(1 if request_during == "final_evaluation" else 3)
+
+    checkpoint = tmp_path / "stop2"
+    assert not runner._stop_request_path.exists() and not (tmp_path / "stop2.tmp").exists()
+    assert (checkpoint / "stop.request").read_text() == "operator request\n"
+    assert {path.name for path in checkpoint.iterdir()} == {
+        "networks.json", "replay.json", "learning.json", "resume_state.json", "stop.request",
+    }
+    assert json.loads((checkpoint / "resume_state.json").read_text())["ckpt"] == str(checkpoint)
+    assert events.count("collect") == events.count("update") == 1
+    assert events[-3:] == ["networks", "replay", "learning"]
+    assert len(timing.read_text().splitlines()) == 2
+
+
+def test_warmup_stop_request_commits_without_update(monkeypatch, tmp_path):
+    runner, events = _stop_loop(tmp_path, monkeypatch, ready=False)
+    runner._agent.update = lambda: pytest.fail("warmup stop must not manufacture an update")
+
+    def collect(*_args):
+        events.append("collect")
+        runner._stop_request_path.write_text("stop during warmup\n")
+
+    runner._collect = collect
+    runner.learn(3)
+    assert events == ["collect", "networks", "replay", "learning"]
+    assert (tmp_path / "stop2" / "stop.request").read_text() == "stop during warmup\n"
+
+
+def test_stop_save_failure_preserves_request_and_no_committed_checkpoint(
+    monkeypatch, capsys, tmp_path,
+):
+    runner, _events = _stop_loop(tmp_path, monkeypatch)
+    runner._stop_request_path.write_text("retain this request\n")
+
+    def fail_replay(path):
+        (Path(path) / "partial-replay").write_text("incomplete")
+        raise OSError("replay disk full")
+
+    runner._agent.save_buffer = fail_replay
+    with pytest.raises(OSError, match="replay disk full"):
+        runner.learn(3)
+    assert runner._stop_request_path.read_text() == "retain this request\n"
+    assert not (tmp_path / "stop2").exists() and not (tmp_path / "stop2.tmp").exists()
+    assert "graceful stop at" not in capsys.readouterr().out
 
 
 def _buffer(capacity=64):
@@ -376,3 +448,218 @@ def test_real_sac_learning_and_full_owner_restore_keep_schedules_rng_and_fresh_e
     restored.update()
     assert restored._alg.update_step == 3
     assert restored._alg.critic_scheduler.last_epoch == original._alg.critic_scheduler.last_epoch + 1
+
+
+def test_stop_full_restore_uses_new_output_and_preserves_existing_state(monkeypatch, tmp_path):
+    import runner.off_policy_runner as runner_module
+
+    monkeypatch.setattr(runner_module.wandb, "run", None)
+    monkeypatch.delenv("FDR_ITER_TIMING_FILE", raising=False)
+    original = _agent()
+    _feed_agent(original)
+    original.update()
+    curriculum, env = _curriculum()
+    for step in range(1, 7):
+        _curriculum_step(curriculum, env, step)
+    space = gym.spaces.Box(-1, 1, shape=(2, 4), dtype=np.float32)
+    space.seed(21)
+    output = tmp_path / "parent"
+    output.mkdir()
+    runner = _runner(original, space, curriculum, output)
+    runner._cfg = OmegaConf.create({"save_replay_buffer": False})
+    runner._stop_request_path = output / "stop.request"
+    runner._restored_loop_wall_clock = None
+    runner._eval_ever_state = {}
+    runner._updates_per_step, runner._log_every = 1, 0
+    runner._eval_stride = runner._save_stride = 0
+    runner._eval_supported = lambda: pytest.fail("stopped FULL must return before final evaluation")
+    runner._finish = lambda: pytest.fail("stopped FULL must not delete or overwrite replay")
+
+    def collect(*_args):
+        original.observe({
+            "observation": np.full((2, 6), .09, dtype=np.float32),
+            "next_observation": np.full((2, 6), .10, dtype=np.float32),
+            "action": np.zeros((2, 4), dtype=np.float32),
+            "reward": np.full((2, 2), .01, dtype=np.float32),
+            "terminated": np.zeros(2, dtype=bool), "truncated": np.zeros(2, dtype=bool),
+        })
+
+    update_owner = original.update
+
+    def update_and_request():
+        info = update_owner()
+        runner._stop_request_path.write_text("full parent\n")
+        return info
+
+    runner._collect = collect
+    original.update = update_and_request
+    runner.learn(3)
+    checkpoint = output / "stop102"
+    assert (checkpoint / "stop.request").read_text() == "full parent\n"
+    assert not (output / "stop.request").exists() and not (output / "final").exists()
+    state = torch.load(checkpoint / LEARNING_STATE_FILE, weights_only=False)
+    saved_algorithm = torch.load(checkpoint / "flashsac.pt", weights_only=False)
+    assert state["env_step"] == 102 and saved_algorithm["update_step"] == 2
+    assert json.loads((checkpoint / "resume_state.json").read_text())["ckpt"] == str(checkpoint)
+    restore_rng_state(state["rng"], space)
+    expected_draws = (torch.randn(3), space.sample())
+
+    restored = _agent()
+    restored.load(str(checkpoint))
+    restored.load_buffer(str(checkpoint))
+    fresh_curriculum, _ = _curriculum()
+    fresh_space = gym.spaces.Box(-1, 1, shape=(2, 4), dtype=np.float32)
+    fresh = _runner(restored, fresh_space, fresh_curriculum, tmp_path / "child")
+    fresh._step_offset = 102
+    fresh._restore_learning_state(checkpoint)
+    actual = torch.load(fresh._save_path_base / "learning-restored.pt", weights_only=False)
+    _tree_equal(actual["rng"], state["rng"])
+    assert actual["curriculum"] == state["curriculum"]
+    torch.testing.assert_close(torch.randn(3), expected_draws[0], rtol=0, atol=0)
+    np.testing.assert_array_equal(fresh_space.sample(), expected_draws[1])
+    assert not restored._alg.replay_buffer._n_step_transitions
+    assert restored._alg.replay_buffer._boundary_next_observations
+    for key in ["actor_optimizer_state_dict", "critic_optimizer_state_dict",
+                "temperature_optimizer_state_dict", "actor_scheduler_state_dict",
+                "critic_scheduler_state_dict", "temperature_scheduler_state_dict",
+                "grad_scaler_state_dict", "update_step"]:
+        _tree_equal(restored._alg.save()[key], saved_algorithm[key])
+    restored.update()
+    assert restored._alg.update_step == 3
+    assert (checkpoint / "stop.request").read_text() == "full parent\n"
+
+
+def _lifecycle_config(overrides=()):
+    OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / "config"),
+                               version_base=None):
+        return compose(config_name="flashdexretarget", overrides=[
+            "commands.motion_file=synthetic-not-read.pt", "num_envs=2", "device=cpu", *overrides,
+        ])
+
+
+def _training_entry():
+    path = Path(__file__).resolve().parents[1] / "train.py"
+    spec = importlib.util.spec_from_file_location("producer_entry_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_configured_run_root_routes_outputs_and_rejects_existing_content(monkeypatch, tmp_path):
+    import common.logger as logger
+    import runner.off_policy_runner as runner_module
+    import simulator.runtime as runtime_module
+
+    default = _lifecycle_config()
+    assert default.run_dir.startswith("logs/flashsac/") and "${" not in default.run_dir
+    output = tmp_path / "outputs"
+    output.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    config = _lifecycle_config([f"run_dir={output}"])
+    paths = []
+    monkeypatch.setattr(logger.wandb, "run", None)
+    monkeypatch.setattr(logger, "_init_wandb", lambda _cfg, path: paths.append(Path(path)))
+    logger.setup_logger(config.logger, config.runner)
+    assert paths == [output] and Path(config.runner.log_dir) == output
+    assert config.logger.wandb.run_name == "flashdexretarget"
+
+    flat = SimpleNamespace(reset=lambda: (np.zeros((2, 1)), {}),
+        action_space=gym.spaces.Box(-1, 1, shape=(2, 1), dtype=np.float32), current_aux=lambda: None)
+    monkeypatch.setattr(runner_module.FlatObsVecEnv, "from_env", lambda *_args, **_kwargs: flat)
+
+    def save(path):
+        target = Path(path)
+        target.mkdir()
+        (target / "network.json").write_text("{}")
+
+    monkeypatch.setattr(runner_module, "build_agent", lambda *_args, **_kwargs: SimpleNamespace(save=save))
+    physical = SimpleNamespace(command_manager=SimpleNamespace(get_term=lambda _name: None))
+    runner = OffPolicyRunner(SimpleNamespace(unwrapped=physical), config.runner, config.eval,
+                             eval_env=SimpleNamespace())
+    assert runner._save_path_base == output and runner._success_dir == output / "success"
+    assert runner._stop_request_path == output / "stop.request"
+    runner._finish()
+    assert (output / "final" / "network.json").is_file() and not (elsewhere / "logs").exists()
+
+    entry = _training_entry()
+    monkeypatch.setattr(runtime_module, "launch_runtime",
+                        lambda _cfg: pytest.fail("stale output must fail before runtime boot"))
+    for name in ("stop.request", "config.yaml"):
+        stale = tmp_path / name.replace(".", "-")
+        stale.mkdir()
+        original = stale / name
+        original.write_text("preserve old output\n")
+        with pytest.raises(FileExistsError, match="new or empty"):
+            entry.run(SimpleNamespace(config_path="config", config_name="flashdexretarget", overrides=[
+                "commands.motion_file=synthetic-not-read.pt", f"run_dir={stale}",
+            ]))
+        assert original.read_text() == "preserve old output\n"
+
+
+@pytest.mark.parametrize("failure", [None, "create_envs", "learn", "train_close", "logger_close", "system_exit"])
+def test_training_entry_cleanup_preserves_success_and_failure_status(monkeypatch, capsys, tmp_path, failure):
+    import common.logger as logger
+    import common.utils as utils
+    import envs
+    import runner as runner_package
+    import simulator.isaacsim.runtime as isaac_runtime
+    import simulator.runtime as runtime_module
+
+    events = []
+    runtime = isaac_runtime.IsaacRuntime.__new__(isaac_runtime.IsaacRuntime)
+    monkeypatch.setattr(isaac_runtime.os, "_exit", lambda code: events.append(("runtime_exit", code)))
+
+    def launch(cfg):
+        events.append("runtime_launch")
+        assert Path(cfg.run_dir).is_absolute() and (Path(cfg.run_dir) / "config.yaml").is_file()
+        return runtime
+
+    def close(name):
+        events.append(name)
+        if failure == name:
+            raise RuntimeError(f"actual {name} failure")
+
+    def create_envs(_cfg, device):
+        events.append("create_envs")
+        if failure == "create_envs":
+            raise RuntimeError("actual create_envs failure")
+        return SimpleNamespace(close=lambda: close("train_close")), SimpleNamespace(close=lambda: close("eval_close"))
+
+    def learn(**_kwargs):
+        events.append("learn")
+        if failure == "learn":
+            raise RuntimeError("actual learn failure")
+        if failure == "system_exit":
+            raise SystemExit(7)
+
+    monkeypatch.setattr(runtime_module, "launch_runtime", launch)
+    monkeypatch.setattr(envs, "create_envs", create_envs)
+    monkeypatch.setattr(logger, "setup_logger", lambda *_args: events.append("logger_setup"))
+    monkeypatch.setattr(logger, "close_logger", lambda: close("logger_close"))
+    monkeypatch.setattr(utils, "set_seed", lambda *_args: None)
+    monkeypatch.setattr(utils, "configure_torch_backends", lambda: None)
+    monkeypatch.setattr(runner_package, "create_runner", lambda *_args, **_kwargs: SimpleNamespace(learn=learn))
+    entry = _training_entry()
+    args = SimpleNamespace(config_path="config", config_name="flashdexretarget", overrides=[
+        "commands.motion_file=synthetic-not-read.pt", f"run_dir={tmp_path / 'run'}",
+    ])
+    if failure == "system_exit":
+        with pytest.raises(SystemExit) as caught:
+            entry.run(args)
+        assert caught.value.code == 7
+    elif failure is not None:
+        with pytest.raises(RuntimeError, match=f"actual {failure} failure"):
+            entry.run(args)
+        assert f"actual {failure} failure" in capsys.readouterr().err
+    else:
+        entry.run(args)
+    assert events[0] == "runtime_launch"
+    expected_status = 7 if failure == "system_exit" else int(failure is not None)
+    assert events[-1] == ("runtime_exit", expected_status)
+    assert events[-2] == "logger_close"
+    if failure != "create_envs":
+        assert events[-4:-2] == ["train_close", "eval_close"]

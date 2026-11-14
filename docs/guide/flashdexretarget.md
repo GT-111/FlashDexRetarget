@@ -184,20 +184,36 @@ gather), so a GPU with less memory can run the same config. The buffer scales wi
 
 ## Stop / resume
 
-`kill -USR1 <pid>` finishes the iteration, saves `stop<N>/` and exits. A full learning
-checkpoint contains networks and target critics, Adam and LR-scheduler states, the AMP scaler,
-reward-normalizer statistics, `replay_buffer.pt`, `learning_state.pt` and `resume_state.json`.
+Set `run_dir` to one new output directory. The entry resolves it once before
+starting the selected runtime and writes `config.yaml` there. An existing empty
+directory is accepted; nonempty directories, including stale stop requests, are
+preserved and rejected. Keep launch/configuration evidence outside this directory
+until the entry has admitted it.
 
-The runner registers this handler on the main thread; registration failure now
-stops startup. It logs one JSON signal-authority record at installation and one
-after the first completed update, including the actual PID, current handler and
-blocked/pending signal state. These records diagnose signal ownership; they do
-not establish that a later request produced a full checkpoint. Confirm the
-`graceful stop` message and complete `stop<N>/` before resuming.
+Create `<run_dir>/stop.request` to request a saved stop. The loop checks after
+each complete collection/update, including replay warmup, and around optional
+evaluation/checkpoint work. It writes a full `stop<N>.tmp`, renames it to
+`stop<N>/`, then moves the request into that committed directory and returns
+through the entry's environment/logger/runtime cleanup. A failed FULL leaves the
+request in place and propagates failure. Confirm the `graceful stop` message and
+complete `stop<N>/` before resuming. SIGUSR1 is no longer a stop transport: native
+compiler code can replace its handler after Python registration.
+
+```sh
+FDR_RUN_DIR=/absolute/node-local/path/new-run
+MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget.sh \
+    run_dir="$FDR_RUN_DIR"
+# After startup, in a shell with FDR_RUN_DIR set to that same path:
+touch "$FDR_RUN_DIR/stop.request"
+```
+
+A full learning checkpoint contains networks and target critics, Adam and
+LR-scheduler states, the AMP scaler, reward-normalizer statistics,
+`replay_buffer.pt`, `learning_state.pt` and `resume_state.json`.
 A periodic `step<N>/` includes replay and learning state only with `save_replay_buffer=true`.
 Weights-only checkpoints remain usable for evaluation and policy initialization.
 
-Resume full learning with `agent_load_path=<ckpt> buffer_load_path=<ckpt> step_offset=<N>
+Resume full learning into a **new** `run_dir` with `agent_load_path=<ckpt> buffer_load_path=<ckpt> step_offset=<N>
 logger.wandb.resume=true logger.wandb.resumeid=<id> ...`, using the actual env step and wandb id in
 `resume_state.json`. The current full format requires matching world count, replay capacity, n-step
 length and gamma. `learning_state.pt` restores Python, NumPy, Torch CPU and visible CUDA generators,
@@ -269,13 +285,22 @@ the run once every clip is archived.
 ## Outputs
 
 ```
-logs/flashsac/<run_name>-<MMDD-HHMMSS>/
+<run_dir>/
+├── config.yaml      resolved configuration, written before runtime launch
+├── wandb/           logger output
 ├── step<N>/         networks (+ replay_buffer.pt + learning_state.pt) + resume_state.json, every `save_checkpoint_per_env_step` env steps
-├── stop<N>/         SIGUSR1 stop
+├── stop<N>/         committed FULL plus consumed stop.request
 ├── final/           networks at the end of the run
-└── success/         first passing rollout per motion
-logs/rsl_rl/<YYYY-MM-DD_HH-MM-SS>_<run_name>/wandb/   wandb run directory
+├── success/         first passing rollout per motion
+├── learning-restored.pt    actual restored RNG/curriculum before resumed collection
+└── learning-restore.json   restoration scope (last two files on FULL resume)
 ```
+
+The default is `logs/<algorithm>/<YYYY-MM-DD_HH-MM-SS>_<run_name>/` relative to
+the launch directory. Logger, checkpoints, success archive and restore receipts
+share the resolved root. Explicit checkpoint load paths remain separate inputs;
+they do not implicitly reuse a parent's output directory. SDK shutdown preserves
+the actual successful or failing exit status.
 
 ## Pipeline
 

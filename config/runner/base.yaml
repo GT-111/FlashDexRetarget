@@ -14,7 +14,7 @@ save_checkpoint_per_env_step: 20_000_000
 save_checkpoint_per_interaction_step: ${eval:'max(1, int(${save_checkpoint_per_env_step} / ${num_train_envs}))'}
 logging_per_interaction_step: ${eval:'max(1, int(${num_interaction_steps} / 1000))'}
 
-save_path: "logs/${algorithm}/${logger.wandb.run_name}-TIMESTAMP"
+run_dir: "logs/${algorithm}/${now:%Y-%m-%d_%H-%M-%S}_${logger.wandb.run_name}"
 agent_load_path: null
 buffer_load_path: null
 save_replay_buffer: false
@@ -29,7 +29,7 @@ runner:
   logging_per_interaction_step: ${logging_per_interaction_step}
   save_checkpoint_per_interaction_step: ${save_checkpoint_per_interaction_step}
 
-  save_path: ${save_path}
+  run_dir: ${run_dir}
   agent_load_path: ${agent_load_path}
   buffer_load_path: ${buffer_load_path}
   save_replay_buffer: ${save_replay_buffer}

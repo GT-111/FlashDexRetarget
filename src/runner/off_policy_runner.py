@@ -3,10 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
-import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +21,7 @@ from common.utils import capture_rng_state, restore_rng_state
 from envs.vec_env import FlatObsVecEnv
 from evaluation.evaluate import evaluate
 
-# simulation/: anchor for the relative checkpoint / load paths in the cfg.
+# Existing relative checkpoint inputs are anchored at the project root.
 _BASE_DIR = Path(__file__).resolve().parents[2]
 LEARNING_STATE_FILE = "learning_state.pt"
 
@@ -84,12 +81,9 @@ class OffPolicyRunner:
             wandb.config.update(OmegaConf.to_container(runner_cfg, resolve=True), allow_val_change=True)
 
         # ── run dir / eval exports ───────────────────────────────────────────────────
-        # Stamped here (not in learn()) so the exports and the checkpoints share one run dir.
-        self._save_path_base = _BASE_DIR / runner_cfg.save_path.replace(
-            "TIMESTAMP", datetime.now().strftime("%m%d-%H%M%S")
-        )
-        succ_dir = eval_cfg.get("success_output_dir", None)
-        self._success_dir = Path(succ_dir) if succ_dir else self._save_path_base / "success"
+        self._save_path_base = Path(runner_cfg.run_dir)
+        self._stop_request_path = self._save_path_base / "stop.request"
+        self._success_dir = self._save_path_base / "success"
         # Per-trajectory "ever succeeded" vectors, kept across the evals of this run.
         self._eval_ever_state: dict = {}
 
@@ -123,7 +117,6 @@ class OffPolicyRunner:
         agent, n_envs = self._agent, self._n_envs
         n_steps = int(num_learning_iterations)
 
-        self._install_stop_signal()
         self._start_clock()
         # FDR_ITER_TIMING_FILE=<csv>: collect+update wall time per iteration for the GPU
         # packing probes, like the on-policy runner.
@@ -134,59 +127,62 @@ class OffPolicyRunner:
         meter = AverageMeter()
         update_budget = 0.0
         solved_stop = False
-        stop_authority_recorded = False
+        try:
+            for step in tqdm.tqdm(range(1, n_steps + 1), smoothing=0.1, mininterval=0.5):
+                env_step = self._step_offset + step * n_envs
+                if timing_f:
+                    torch.cuda.synchronize()
+                    iter_t0 = time.perf_counter()
 
-        for step in tqdm.tqdm(range(1, n_steps + 1), smoothing=0.1, mininterval=0.5):
-            env_step = self._step_offset + step * n_envs
+                self._collect(step, meter)
+                ready = agent.ready()
+                if ready:
+                    update_budget += self._updates_per_step
+                    while update_budget >= 1:
+                        train_info = agent.update()
+                        meter.update(train_info)
+                        update_budget -= 1
+                    if timing_f:
+                        torch.cuda.synchronize()
+                        timing_f.write(f"{step},{env_step},{time.perf_counter() - iter_t0:.6f},1\n")
+                        timing_f.flush()
+
+                # A request survives compiler signal changes and buffer warmup.
+                # Finish this collection/update transaction before saving FULL.
+                if self._stop_if_requested(env_step):
+                    return
+                if not ready:
+                    continue
+
+                if self._crossed(env_step, self._eval_stride) and self._eval_supported():
+                    eval_metrics = self._run_eval(env_step)
+                    log_metrics({**eval_metrics, **self._cost_metrics(env_step)}, step=env_step)
+                    if getattr(self._eval_env, "shares_train_env", False):
+                        self._reset_train_env()  # eval drove the train env: restart its episodes
+                    if self._stop_if_requested(env_step):
+                        return
+                    if self._all_solved(eval_metrics, env_step):
+                        solved_stop = True
+                        break
+
+                if self._log_every and step % self._log_every == 0:
+                    log_metrics({**meter.mean(), **self._cost_metrics(env_step)}, step=env_step)
+                    meter.reset()
+
+                if self._crossed(env_step, self._save_stride):
+                    self._save_checkpoint(env_step)
+                if self._stop_if_requested(env_step):
+                    return
+        finally:
             if timing_f:
-                torch.cuda.synchronize()
-                iter_t0 = time.perf_counter()
-
-            self._collect(step, meter)
-            if not agent.ready():
-                continue
-
-            update_budget += self._updates_per_step
-            did_update = False
-            while update_budget >= 1:
-                train_info = agent.update()
-                did_update = True
-                meter.update(train_info)
-                update_budget -= 1
-            if timing_f:
-                torch.cuda.synchronize()
-            if did_update and not stop_authority_recorded:
-                self._record_stop_signal_authority("first_completed_update")
-                stop_authority_recorded = True
-            if timing_f:
-                timing_f.write(f"{step},{env_step},{time.perf_counter() - iter_t0:.6f},1\n")
-                timing_f.flush()
-
-            if self._crossed(env_step, self._eval_stride) and self._eval_supported():
-                eval_metrics = self._run_eval(env_step)
-                log_metrics({**eval_metrics, **self._cost_metrics(env_step)}, step=env_step)
-                if getattr(self._eval_env, "shares_train_env", False):
-                    self._reset_train_env()  # eval drove the train env: restart its episodes
-                if self._all_solved(eval_metrics, env_step):
-                    solved_stop = True
-                    break
-
-            if self._log_every and step % self._log_every == 0:
-                log_metrics({**meter.mean(), **self._cost_metrics(env_step)}, step=env_step)
-                meter.reset()
-
-            if self._crossed(env_step, self._save_stride):
-                self._save_checkpoint(env_step)
-
-            if self._stop_requested:
-                self._graceful_stop(env_step)
+                timing_f.close()
 
         final_step = self._step_offset + n_steps * n_envs
-        if timing_f:
-            timing_f.close()
         # An all-solved stop has just evaluated and exported, so it skips the final sweep.
         if self._eval_supported() and not solved_stop:
             log_metrics({**self._run_eval(final_step), **self._cost_metrics(final_step)}, step=final_step)
+        if self._stop_if_requested(final_step):
+            return
         self._finish()
 
     # ─── loop stages ─────────────────────────────────────────────────────────────
@@ -314,23 +310,29 @@ class OffPolicyRunner:
     def _save_checkpoint(self, env_step: int) -> None:
         """Written to .tmp and renamed, so a failed write (e.g. full GPFS) leaves no corrupt
         step dir; a failure is logged and training continues."""
-        base = self._save_path_base
-        tmp, ckpt = base / f"step{env_step}.tmp", base / f"step{env_step}"
         save_buffer = bool(self._cfg.get("save_replay_buffer", False))
         try:
-            self._agent.save(str(tmp))
-            if save_buffer:
-                self._agent.save_buffer(str(tmp))
-                self._save_learning_state(tmp, env_step)
-            self._log_resume_state(tmp, env_step, final_path=ckpt)
-            os.replace(tmp, ckpt)
+            ckpt = self._write_checkpoint(env_step, f"step{env_step}", full=save_buffer)
             if bool(self._cfg.get("keep_last_checkpoint_only", False)):
                 self._prune_checkpoints(keep=ckpt.name)
             elif save_buffer:
                 self._prune_buffers(keep=ckpt.name)
         except Exception as exc:
-            shutil.rmtree(tmp, ignore_errors=True)
             print(f"[runner] checkpoint save failed, continuing: {exc}")
+
+    def _write_checkpoint(self, env_step: int, name: str, *, full: bool) -> Path:
+        tmp, ckpt = self._save_path_base / f"{name}.tmp", self._save_path_base / name
+        try:
+            self._agent.save(str(tmp))
+            if full:
+                self._agent.save_buffer(str(tmp))
+                self._save_learning_state(tmp, env_step)
+            self._log_resume_state(tmp, env_step, final_path=ckpt)
+            os.replace(tmp, ckpt)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        return ckpt
 
     def _prune_checkpoints(self, keep: str) -> None:
         """runner.keep_last_checkpoint_only: drop every step dir but ``keep`` (nets + buffer)."""
@@ -347,62 +349,17 @@ class OffPolicyRunner:
                 except OSError as exc:
                     print(f"[runner] could not drop {old}: {exc}")
 
-    def _install_stop_signal(self) -> dict[str, Any]:
-        """`kill -USR1 <pid>`: finish the current iteration, checkpoint WITH the replay
-        buffer and exit, so a resume does not refill the buffer."""
-        self._stop_requested = False
-
-        def _request_stop(*_args) -> None:
-            self._stop_requested = True
-            print("[runner] SIGUSR1: stopping after this iteration (saving buffer)", flush=True)
-
-        self._stop_signal_handler = _request_stop
-        signal.signal(signal.SIGUSR1, _request_stop)
-        return self._record_stop_signal_authority("installed")
-
-    def _record_stop_signal_authority(self, phase: str) -> dict[str, Any]:
-        handler = signal.getsignal(signal.SIGUSR1)
-        masks = {}
-        for line in Path("/proc/self/status").read_text().splitlines():
-            key, _, value = line.partition(":")
-            if key in {"SigBlk", "SigIgn", "SigCgt", "SigPnd", "ShdPnd"}:
-                masks[key] = value.strip()
-        record = {
-            "kind": "runner_stop_signal_authority",
-            "phase": phase,
-            "PID": os.getpid(),
-            "thread_id": threading.get_ident(),
-            "native_thread_id": threading.get_native_id(),
-            "main_thread": threading.current_thread() is threading.main_thread(),
-            "signal": "SIGUSR1",
-            "signal_number": int(signal.SIGUSR1),
-            "python_handler": getattr(handler, "__qualname__", str(handler)),
-            "python_handler_is_runner_callback": handler is self._stop_signal_handler,
-            "USR1_blocked": signal.SIGUSR1 in signal.pthread_sigmask(signal.SIG_BLOCK, set()),
-            "USR1_pending": signal.SIGUSR1 in signal.sigpending(),
-            "linux_masks": masks,
-        }
-        print(json.dumps(record), flush=True)
-        return record
-
-    def _graceful_stop(self, env_step: int) -> None:
-        ckpt = self._save_path_base / f"stop{env_step}"
-        self._agent.save(str(ckpt))
-        self._agent.save_buffer(str(ckpt))
-        self._save_learning_state(ckpt, env_step)
-        self._log_resume_state(ckpt, env_step)
+    def _stop_if_requested(self, env_step: int) -> bool:
+        if not self._stop_request_path.is_file():
+            return False
+        print(f"[runner] stop request accepted at env_step={env_step}: {self._stop_request_path}", flush=True)
+        ckpt = self._write_checkpoint(env_step, f"stop{env_step}", full=True)
+        self._stop_request_path.replace(ckpt / "stop.request")
         print(f"[runner] graceful stop at env_step={env_step}: {ckpt}", flush=True)
-        try:
-            wandb.finish()
-        except Exception:  # noqa: BLE001
-            pass
-        os._exit(0)
+        return True
 
     def _finish(self) -> None:
-        try:
-            self._agent.save(str(self._save_path_base / "final"))
-        except Exception as exc:
-            print(f"[runner] final checkpoint save failed: {exc}")
+        self._agent.save(str(self._save_path_base / "final"))
         # The buffer only serves a resume; a run that ends normally has nothing to resume.
         if bool(self._cfg.get("delete_replay_buffer_on_finish", False)):
             self._prune_buffers(keep="")

@@ -17,11 +17,12 @@ class IsaacRuntime:
             "kit_args": str(cfg.sim.kit_args),
         })
 
-    def close(self):
-        # Isaac Sim 5.1 segfaults in app.close(); the normal runner has flushed.
+    def close(self, exit_code: int):
+        # Isaac Sim 5.1 segfaults in app.close(); the entry has cleaned up and
+        # reported any original exception before this SDK-specific process exit.
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(0)
+        os._exit(exit_code)
 
 
 def launch(cfg):

@@ -277,7 +277,13 @@ MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget
 
 `ROBOT=sharpa` (with its `sharpa/motion.pt`) trains the Sharpa Wave hand. The defaults live in `config/`
 (learner: `config/runner/flashsac.yaml`). The policy is evaluated on every clip each 20M env steps, and
-checkpoints and the passing rollouts go to `logs/flashsac/<run>/`. Every option, GPU memory and resuming:
+all outputs share the configured `run_dir` (default `logs/flashsac/<run>/`).
+Set `run_dir=/absolute/node-local/path/new-run` for campaign placement; the entry
+accepts only a new or empty directory. Creating `<run_dir>/stop.request` requests
+a full saved stop after the current iteration, including replay warmup. A
+successful FULL consumes the request and returns through normal cleanup;
+explicit resume loads the parent checkpoint into a new output directory.
+Every option, GPU memory and resuming:
 [`docs/guide/flashdexretarget.md`](docs/guide/flashdexretarget.md).
 
 ## Visualization
