@@ -1,0 +1,30 @@
+# @package _global_
+
+eval:
+  interval: 20_000_000
+  num_per_motion: 1
+  save_success_data: true
+  env:
+    clear_terminations: true
+    clear_curriculum: true
+    disable_obs_corruption: true
+    disable_object_pin: true
+  command:
+    sampling_mode: start
+    noise_to_initial_level: 0.0
+    start_frame: 0
+  command_name: ${commands.name}
+  success_criterion: full
+  stop_when_all_solved: false
+  callbacks:
+    - _target_: evaluation.callbacks.motion_tracking_eval_setup.MotionTrackingEvalSetup
+      command_name: ${commands.name}
+      num_per_motion: ${eval.num_per_motion}
+      start_frame: ${eval.command.start_frame}
+    - _target_: evaluation.callbacks.tracking_performance.NativeReferenceTrackingPerformance
+      command_name: ${commands.name}
+      grace_steps: 0
+      thresholds: ${native_tracking_tolerances}
+    - _target_: evaluation.callbacks.rollout_record.NativeRolloutRecord
+      command_name: ${commands.name}
+      binding: ${native_recording_binding}

@@ -1,4 +1,4 @@
-"""Standalone CLI: convert COACD objects + the xhand URDF to USD via IsaacLab
+"""Standalone CLI: convert COACD objects + configured robot URDFs to USD via IsaacLab
 UrdfConverter (headless AppLauncher boot)."""
 
 from __future__ import annotations
@@ -9,14 +9,7 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 
-REPO_SIM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 3))
-ROBOT_DIR = os.path.join(REPO_SIM_DIR, "assets", "robot")
-ROBOT_URDF_DIR = os.path.join(ROBOT_DIR, "xhand", "urdf")
-
-
-def robot_urdf(variant: str, suffix: str = "", robot: str = "xhand") -> str:
-    """Source URDF per robot and variant (xhand_right.urdf, sharpa_bimanual.urdf, ...)."""
-    return os.path.join(ROBOT_DIR, robot, "urdf", f"{robot}_{variant}{suffix}.urdf")
+from simulator.isaacsim.assets import load_robot_asset
 
 OBJ_DENSITY = 800.0  # kg/m^3, matches get_object_spec / holosoma taco URDFs
 OBJ_MASS_CLAMP = (0.05, 0.5)  # kg, matches get_object_spec
@@ -24,7 +17,6 @@ OBJ_MASS_CLAMP = (0.05, 0.5)  # kg, matches get_object_spec
 # "collision == visual" debug variant: same physics, visuals replaced by the
 # exact shapes PhysX collides with. Runtime switch: FDR_COLVIS=1.
 COLVIS_OBJ_DIRNAME = ".isaac_usd_colvis"
-COLVIS_ROBOT_DIRNAME = "converted_colvis"
 COLVIS_RGBA = "0.85 0.45 0.2 1"
 
 
@@ -39,21 +31,19 @@ def parse_args() -> argparse.Namespace:
         "--objects", nargs="*", default=[], help="object ids under <data-root>/objects/",
     )
     parser.add_argument("--data-root", help="dataset directory holding objects/ (needed with --objects)")
-    parser.add_argument("--robot", action="store_true", help="also convert a robot URDF")
-    parser.add_argument("--robot-name", default="xhand", choices=["xhand", "sharpa"],
-                        help="sharpa ships the bimanual URDF only (--robot-variant bimanual)")
     parser.add_argument(
-        "--robot-variant", default="right", choices=["right", "left", "bimanual"],
-        help="which <robot>_<variant>.urdf to convert (xhand: generate via mjcf_to_urdf.py)",
+        "--robot-config",
+        help="stock robot YAML or resolved run YAML with an explicit sim.robot_asset binding",
     )
     parser.add_argument("--force", action="store_true", help="reconvert even if USD is up to date")
-    parser.add_argument("--robot-suffix", default="",
-                        help="convert xhand_<variant><suffix>.urdf into converted<suffix>/ "
-                             "(e.g. _spec)")
+    parser.add_argument(
+        "--native-scene-config",
+        help="resolved run yaml with robot.native_scene and sim.native_assets: split its named MJCF assets",
+    )
     parser.add_argument(
         "--collision-visual", action="store_true",
         help="write the debug variant whose visual meshes ARE the collision geometry "
-        f"(objects -> {COLVIS_OBJ_DIRNAME}/, robot -> converted_colvis/); "
+        f"(objects -> {COLVIS_OBJ_DIRNAME}/, robot -> configured collision_visual_usd_path); "
         "select at runtime with FDR_COLVIS=1",
     )
     from isaaclab.app import AppLauncher
@@ -73,6 +63,139 @@ def _up_to_date(usd_path: str, sources: list[str]) -> bool:
         return False
     usd_mtime = os.path.getmtime(usd_path)
     return all(os.path.getmtime(s) <= usd_mtime for s in sources if os.path.exists(s))
+
+
+def write_native_mjcf_assets(layout, assets) -> dict[str, str]:
+    """Write importer inputs from ONE authoritative composed scene.
+
+    Explicit compiled inertials prevent importer density estimates from changing
+    bodies whose original inertial was derived from multiple collision geoms.
+    Source mesh coordinates, body transforms and passive equalities are retained.
+    This function compiles metadata only; it does not create MjData or step.
+    """
+    from pathlib import Path
+
+    import mujoco
+
+    source = Path(layout.scene_xml_path).resolve()
+    spec = mujoco.MjSpec.from_file(str(source))
+    meshdir = source.parent / (spec.meshdir or "")
+    for mesh in spec.meshes:
+        if mesh.file and not Path(mesh.file).is_absolute():
+            mesh.file = str((meshdir / mesh.file).resolve())
+    spec.meshdir = ""
+    model = spec.compile()
+    actual_roots = {
+        model.body(int(model.jnt_bodyid[j])).name
+        for j in range(model.njnt)
+        if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE
+    }
+    if actual_roots != {binding.root_body_name for binding in layout.articulations}:
+        raise ValueError("configured native articulations must cover the source FREE roots")
+    original = ET.fromstring(spec.to_xml())
+    for body in original.findall(".//body"):
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body.get("name"))
+        if model.body_mass[bid] <= 0:
+            continue
+        inertial = body.find("inertial")
+        if inertial is None:
+            inertial = ET.SubElement(body, "inertial")
+        inertial.attrib.clear()
+        for key, value in (
+            ("pos", model.body_ipos[bid]),
+            ("quat", model.body_iquat[bid]),
+            ("diaginertia", model.body_inertia[bid]),
+        ):
+            inertial.set(key, " ".join(format(float(v), ".17g") for v in value))
+        inertial.set("mass", format(float(model.body_mass[bid]), ".17g"))
+    roots = {b.root_body_name for b in layout.articulations}
+    outputs = {}
+    selected = [
+        (b.entity_name, b.root_body_name, assets["articulations"][b.entity_name]) for b in layout.articulations
+    ]
+    selected.append(("static", None, assets["static"]))
+    for name, root_name, usd in selected:
+        document = copy.deepcopy(original)
+        world = document.find("worldbody")
+        for child in list(world):
+            keep = (
+                child.tag == "body" and child.get("name") == root_name
+                if root_name is not None
+                else child.get("name") not in roots
+            )
+            if not keep:
+                world.remove(child)
+        joints = {j.get("name") for j in world.iter("joint")}
+        # FREE motor channels are replaced by the configured root-wrench action,
+        # not imported as fake scalar position drives.
+        for section in ("actuator", "equality"):
+            element = document.find(section)
+            if element is not None:
+                for item in list(element):
+                    references = [
+                        item.get(k)
+                        for k in ("joint", "joint1", "joint2")
+                        if item.get(k)
+                    ]
+                    if not references or not all(j in joints for j in references):
+                        element.remove(item)
+        geoms = {g.get("name") for g in world.iter("geom")}
+        contact = document.find("contact")
+        if contact is not None:
+            for pair in list(contact):
+                if pair.get("geom1") not in geoms or pair.get("geom2") not in geoms:
+                    contact.remove(pair)
+        meshes = {g.get("mesh") for g in world.iter("geom") if g.get("mesh")}
+        asset = document.find("asset")
+        if asset is not None:
+            for mesh in list(asset.findall("mesh")):
+                if mesh.get("name") not in meshes:
+                    asset.remove(mesh)
+        for section in ("sensor", "keyframe"):
+            element = document.find(section)
+            if element is not None:
+                document.remove(element)
+        output = Path(usd).with_suffix(".xml")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        ET.ElementTree(document).write(output, encoding="utf-8", xml_declaration=True)
+        outputs[name] = str(output)
+    return outputs
+
+
+def convert_native_scene(config_path: str) -> None:
+    """Use the pinned Isaac Lab MJCF converter, never the rigid density path."""
+    from pathlib import Path
+
+    from isaaclab.sim.converters import MjcfConverter, MjcfConverterCfg
+    from omegaconf import OmegaConf
+
+    from envs.scene.native import NativeSceneCfg
+
+    config = OmegaConf.load(config_path)
+    layout = NativeSceneCfg.from_mapping(config.robot.native_scene)
+    assets = config.sim.native_assets
+    inputs = write_native_mjcf_assets(layout, assets)
+    selected = [(b.entity_name, assets.articulations[b.entity_name], False) for b in layout.articulations]
+    selected.append(("static", assets.static, True))
+    for name, usd, fixed in selected:
+        destination = Path(usd)
+        MjcfConverter(
+            MjcfConverterCfg(
+                asset_path=inputs[name],
+                usd_dir=str(destination.parent),
+                usd_file_name=destination.name,
+                force_usd_conversion=True,
+                make_instanceable=False,
+                fix_base=fixed,
+                import_inertia_tensor=True,
+                import_sites=True,
+                link_density=0.0,
+            )
+        )
+        _log(f"converted configured native asset {name}: {destination}")
+    # TODO(Isaac gate): assert actual USD mimic gearing, inertials, collision
+    # shape/filter/material parity. Successful conversion alone is not that
+    # qualification; MJCF explicit contact pairs do not transfer by assumption.
 
 
 def object_mass_properties(obj_dir: str):
@@ -188,12 +311,10 @@ def convert_object(obj_dir: str, force: bool, collision_visual: bool = False) ->
     verify_usd(converter.usd_path)
 
 
-def author_robot_colvis_urdf(out_dir: str, variant: str = "right") -> str:
-    """xhand URDF variant whose visuals are the per-collision-mesh convex hulls —
-    exactly what PhysX collides with under collider_type='convex_hull'."""
+def author_robot_colvis_urdf(src_urdf: str, out_dir: str) -> str:
+    """Visualize the configured URDF's hulls without moving its collision meshes."""
     import trimesh
 
-    src_urdf = robot_urdf(variant)
     urdf_dir = os.path.dirname(src_urdf)
     hull_dir = os.path.join(out_dir, "hull_meshes")
     os.makedirs(hull_dir, exist_ok=True)
@@ -207,7 +328,10 @@ def author_robot_colvis_urdf(out_dir: str, variant: str = "right") -> str:
             if mesh_el is None:
                 raise RuntimeError(f"non-mesh collision in link {link.get('name')!r}")
             src = os.path.normpath(os.path.join(urdf_dir, mesh_el.get("filename")))
-            stem = os.path.splitext(os.path.basename(src))[0]
+            # The generated URDF lives elsewhere. Retain the original collider,
+            # including when different links use the same mesh basename.
+            mesh_el.set("filename", src)
+            stem = f"{link.attrib['name']}_{i}"
             hull_path = os.path.join(hull_dir, f"{stem}.obj")
             if not _up_to_date(hull_path, [src]):
                 trimesh.load(src, force="mesh").convex_hull.export(hull_path)
@@ -225,42 +349,47 @@ def author_robot_colvis_urdf(out_dir: str, variant: str = "right") -> str:
             )
             mat = ET.SubElement(vis, "material", name="mat_colvis")
             ET.SubElement(mat, "color", rgba=COLVIS_RGBA)
-    urdf_path = os.path.join(out_dir, f"xhand_{variant}_colvis.urdf")
+    urdf_path = os.path.join(out_dir, f"{os.path.splitext(os.path.basename(src_urdf))[0]}_colvis.urdf")
     tree.write(urdf_path)
     _log(f"  authored collision-visual robot URDF ({n_hulls} hulls) -> {urdf_path}")
     return urdf_path
 
 
-def convert_robot(force: bool, collision_visual: bool = False, variant: str = "right",
-                  suffix: str = "", robot: str = "xhand") -> None:
+def convert_robot(config_path: str, force: bool, collision_visual: bool = False) -> None:
     from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg
 
-    if collision_visual and robot != "xhand":
-        raise ValueError("--collision-visual is xhand-only")
-    src_urdf = robot_urdf(variant, suffix, robot)
-    # A suffixed variant gets its own output dir so it never shadows the stock USD.
-    out_dir = os.path.join(
-        ROBOT_DIR, robot, "urdf",
-        COLVIS_ROBOT_DIRNAME if collision_visual else f"converted{suffix}",
-    )
-    usd_path = os.path.join(out_dir, f"{robot}_{variant}{suffix}.usd")
-    if not force and _up_to_date(usd_path, [src_urdf]):
-        _log(f"up to date, skipping: {usd_path}")
-        return
+    from simulator.mjcf_meta import load_robot_mjcf_meta
+
+    asset = load_robot_asset(config_path, collision_visual=collision_visual)
+    src_urdf = str(asset.source_urdf_path)
+    usd_path = str(asset.usd_path)
+    out_dir = str(asset.usd_path.parent)
+    meta = load_robot_mjcf_meta(asset.mjcf_path)
+    # The import also contains authored fixed frames (for example fingertip
+    # sites materialized as URDF links), beyond the MJCF body view.
+    expected_links = list(dict.fromkeys(
+        [asset.body_name(name) for name in meta.body_names]
+        + [link.attrib["name"] for link in ET.parse(src_urdf).getroot().findall("link")]
+    ))
     urdf_src = src_urdf
     if collision_visual:
         os.makedirs(out_dir, exist_ok=True)
-        urdf_src = author_robot_colvis_urdf(out_dir, variant)
+        urdf_src = author_robot_colvis_urdf(src_urdf, out_dir)
+    if not force and _up_to_date(usd_path, [src_urdf]):
+        _log(f"up to date, skipping: {usd_path}")
+        _block_empty_robot_visual_references(usd_path, urdf_src)
+        verify_usd(usd_path, expect_links=expected_links)
+        return
     cfg = UrdfConverterCfg(
         asset_path=urdf_src,
         usd_dir=out_dir,
-        usd_file_name=f"{robot}_{variant}{suffix}.usd",
+        usd_file_name=asset.usd_path.name,
         force_usd_conversion=True,
         make_instanceable=False,
         # MJCF anchors the wrist chain at worldbody: the 6 wrist joints ARE the
         # floating base, so the URDF "world" root is welded to the stage.
         fix_base=True,
-        # Keep track_hand_right_*_tip fixed links as bodies (fingertip frames).
+        # Retain the configured fixed link frames in the imported body roster.
         merge_fixed_joints=False,
         joint_drive=UrdfConverterCfg.JointDriveCfg(
             drive_type="force",
@@ -273,9 +402,53 @@ def convert_robot(force: bool, collision_visual: bool = False, variant: str = "r
     )
     converter = UrdfConverter(cfg)
     _log(f"converted robot -> {converter.usd_path}")
-    sides = ("right", "left") if variant == "bimanual" else (variant,)
-    verify_usd(converter.usd_path, expect_links=[f"track_hand_{s}_{f}_tip" for s in sides
-                                                for f in ("thumb", "index", "middle", "ring", "pinky")])
+    _block_empty_robot_visual_references(converter.usd_path, urdf_src)
+    verify_usd(converter.usd_path, expect_links=expected_links)
+
+
+def _block_empty_robot_visual_references(usd_path: str, urdf_path: str) -> list[str]:
+    """Remove generated importer references for URDF links without visuals.
+
+    Isaac Sim 5.1 creates a reference to ``/visuals/<link>`` even for empty
+    wrist-chain and tip frames. Root-layer list edits cannot remove arcs inside
+    a referenced layer stack. Edit their introducing generated PrimSpecs instead;
+    physical links, joints, tips, collisions and real visual assets stay intact.
+    """
+    from pathlib import Path
+
+    from pxr import Sdf, Usd
+
+    stage = Usd.Stage.Open(usd_path)
+    root_path = stage.GetDefaultPrim().GetPath()
+    output_dir = Path(usd_path).resolve().parent
+    blocked = []
+    edits = {}
+    layers = {}
+    for link in ET.parse(urdf_path).getroot().findall("link"):
+        if link.find("visual") is not None:
+            continue
+        path = root_path.AppendChild(link.attrib["name"]).AppendChild("visuals")
+        prim = stage.GetPrimAtPath(path)
+        if not prim:
+            continue
+        changed = False
+        for spec in prim.GetPrimStack():
+            layer = spec.layer
+            if (layer.realPath and Path(layer.realPath).resolve().is_relative_to(output_dir)
+                    and spec.HasInfo("references")):
+                edits[(layer.identifier, str(spec.path))] = spec
+                layers[layer.identifier] = layer
+                changed = True
+        if changed:
+            blocked.append(str(path))
+    # Collect USD opinions first; query no composed prims during Sdf changes.
+    with Sdf.ChangeBlock():
+        for spec in edits.values():
+            spec.ClearInfo("references")
+    for identifier in sorted(layers):
+        layers[identifier].Save()
+    _log(f"removed {len(blocked)} empty URDF visual reference paths in {len(layers)} generated layers")
+    return blocked
 
 
 def verify_usd(usd_path: str, expect_links: list[str] | None = None) -> None:
@@ -322,9 +495,10 @@ def main() -> None:
         if not os.path.isdir(obj_dir):
             raise FileNotFoundError(f"object dir not found: {obj_dir}")
         convert_object(obj_dir, force=args.force, collision_visual=args.collision_visual)
-    if args.robot:
-        convert_robot(force=args.force, collision_visual=args.collision_visual,
-                      variant=args.robot_variant, suffix=args.robot_suffix, robot=args.robot_name)
+    if args.robot_config:
+        convert_robot(args.robot_config, force=args.force, collision_visual=args.collision_visual)
+    if args.native_scene_config:
+        convert_native_scene(args.native_scene_config)
 
     _log("all conversions done")
     sys.stdout.flush()

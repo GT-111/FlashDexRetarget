@@ -163,6 +163,19 @@ class ResidualAction(ActionTerm):
         return len(self._all_joint_ids)
 
     @property
+    def action_names(self) -> tuple[str, ...]:
+        return tuple(self._entity.joint_names[int(i)] for i in self._all_joint_ids)
+
+    @property
+    def action_sides(self) -> tuple[str, ...]:
+        """The stock scalar robot's declared R_/L_ joint naming convention."""
+        return tuple(
+            "right" if n.startswith(("R_", "right_"))
+            else "left" if n.startswith(("L_", "left_")) else ""
+            for n in self.action_names
+        )
+
+    @property
     def n_dofs(self) -> int:
         return len(self._all_joint_ids)
 

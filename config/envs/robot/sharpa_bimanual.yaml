@@ -1,5 +1,13 @@
 # @package _global_
 
+sim:
+  robot_asset:
+    source_urdf_path: assets/robot/sharpa/urdf/sharpa_bimanual.urdf
+    usd_path: assets/robot/sharpa/urdf/converted/sharpa_bimanual.usd
+    body_name_map:
+      R_forearm_rot_y_link: right_hand_link
+      L_forearm_rot_y_link: left_hand_link
+
 robot:
   entity_name: robot
   self_collision: true

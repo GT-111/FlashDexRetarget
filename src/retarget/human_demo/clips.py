@@ -14,6 +14,16 @@ MANO_JOINT_NAMES = tuple(
 )
 SIDES = ("right", "left")
 
+_NATIVE_FRAME_ARRAYS = (
+    "time_ns", "joint_pos", "joint_vel", "joint_position_support", "joint_velocity_support",
+    "object_part_state_w", "object_part_pose_support", "object_part_linear_velocity_support",
+    "object_part_angular_velocity_support", "object_joint_pos", "object_joint_vel",
+    "object_joint_position_support", "object_joint_velocity_support",
+)
+_NATIVE_ROOT_ARRAYS = (
+    "root_state_w", "root_pose_support", "root_linear_velocity_support", "root_angular_velocity_support",
+)
+
 
 def mano_reference(joints: np.ndarray, verts: np.ndarray, global_rot: np.ndarray, side: str,
                    tip_vertex: Mapping[str, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -36,7 +46,108 @@ def mano_reference(joints: np.ndarray, verts: np.ndarray, global_rot: np.ndarray
 
 def load_clip(path: str | Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=True) as z:
-        return {k: z[k] for k in z.files}
+        clip = {k: z[k] for k in z.files}
+    if "native_reference" in clip:
+        # These are trusted author clips, as for the existing object-valued NPZ fields.
+        clip["native_reference"] = clip["native_reference"].item()
+    return clip
+
+
+def native_reference(clip: dict) -> dict | None:
+    """Read explicit prepared native facts; never derive state or support from MANO.
+
+    The nested carrier is preserved in the author's trusted NPZ/PT formats.
+    Q/Qvel describe named physical scalar joints; FREE roots are separate
+    p/WXYZ/world-link-velocity/world-omega states. Unknown rates are zero with
+    independent false support. ``time_ns`` is the actual prepared query clock,
+    retaining its original phase after crop, rather than a capture-time claim.
+    """
+    value = clip.get("native_reference")
+    if value is None:
+        return None
+    reference = dict(value.item() if isinstance(value, np.ndarray) else value)
+    frames = num_frames(clip)
+
+    def names(field):
+        result = tuple(str(name) for name in reference[field])
+        if len(set(result)) != len(result):
+            raise ValueError(f"native reference {field} must name distinct physical coordinates")
+        reference[field] = result
+        return result
+
+    def array(field, shape, *, support=False, parent=None):
+        owner = reference if parent is None else parent
+        result = np.asarray(owner[field])
+        if result.shape != shape or (support and result.dtype.kind != "b"):
+            raise ValueError(f"native reference {field} must have shape {shape} and explicit boolean support")
+        if not support and not np.isfinite(result).all():
+            raise ValueError(f"native reference {field} must retain finite carried values")
+        owner[field] = result
+        return result
+
+    clock = array("time_ns", (frames,))
+    if clock.dtype.kind not in "iu" or clock[0] < 0 or np.any(np.diff(clock) <= 0):
+        raise ValueError("native reference time_ns must retain exact chronological integer query times")
+    reference["time_ns"] = clock.astype(np.int64, copy=False)
+    if not reference["clock_authority"] or not reference["provenance"]:
+        raise ValueError("native reference requires explicit prepared-clock and state provenance")
+    if "source_import_elapsed_ns" in clip and not np.array_equal(clock, clip["source_import_elapsed_ns"]):
+        raise ValueError("native reference clock differs from the actual prepared source rows")
+    joint_names = names("joint_names")
+    if not joint_names:
+        raise ValueError("native hand reference must name its physical scalar joints")
+    array("joint_pos", (frames, len(joint_names)))
+    velocity = array("joint_vel", (frames, len(joint_names)))
+    array("joint_position_support", velocity.shape, support=True)
+    velocity_support = array("joint_velocity_support", velocity.shape, support=True)
+    if np.any(velocity[~velocity_support] != 0):
+        raise ValueError("native unknown joint velocities require zero values and false support")
+    roots = dict(reference["root_body_names"])
+    if set(roots) != set(sides(clip)) or len(set(roots.values())) != len(roots):
+        raise ValueError("native roots must name the distinct actual bodies for the available hand sides")
+    reference["root_body_names"] = roots
+    for field in _NATIVE_ROOT_ARRAYS:
+        reference[field] = dict(reference[field])
+        if set(reference[field]) != set(roots):
+            raise ValueError(f"native reference {field} has different hand sides")
+    for side in roots:
+        state = {field: reference[field][side] for field in _NATIVE_ROOT_ARRAYS}
+        root = array("root_state_w", (frames, 13), parent=state)
+        array("root_pose_support", (frames,), support=True, parent=state)
+        linear = array("root_linear_velocity_support", (frames,), support=True, parent=state)
+        angular = array("root_angular_velocity_support", (frames,), support=True, parent=state)
+        if np.any(root[~linear, 7:10] != 0) or np.any(root[~angular, 10:13] != 0):
+            raise ValueError("native unknown root rates require zero values and independent false support")
+        for field in _NATIVE_ROOT_ARRAYS:
+            reference[field][side] = state[field]
+    parts = names("object_part_body_names")
+    if (not parts or not reference["object_entity_name"]
+            or reference["object_root_body_name"] not in parts):
+        raise ValueError("native object reference must name its actual entity, FREE base and parts")
+    part_state = array("object_part_state_w", (frames, len(parts), 13))
+    array("object_part_pose_support", (frames, len(parts)), support=True)
+    linear = array("object_part_linear_velocity_support", (frames, len(parts)), support=True)
+    angular = array("object_part_angular_velocity_support", (frames, len(parts)), support=True)
+    if np.any(part_state[..., 7:10][~linear] != 0) or np.any(part_state[..., 10:13][~angular] != 0):
+        raise ValueError("native unknown part rates require zero values and independent false support")
+    object_joints = names("object_joint_names")
+    array("object_joint_pos", (frames, len(object_joints)))
+    velocity = array("object_joint_vel", (frames, len(object_joints)))
+    array("object_joint_position_support", velocity.shape, support=True)
+    velocity_support = array("object_joint_velocity_support", velocity.shape, support=True)
+    if np.any(velocity[~velocity_support] != 0):
+        raise ValueError("native unknown passive-joint rates require zero values and false support")
+    return reference
+
+
+def crop_native_reference(reference: dict, start: int) -> dict:
+    """Slice only declared row fields; names, provenance and clock origin remain."""
+    result = dict(reference)
+    for field in _NATIVE_FRAME_ARRAYS:
+        result[field] = reference[field][start:]
+    for field in _NATIVE_ROOT_ARRAYS:
+        result[field] = {side: value[start:] for side, value in reference[field].items()}
+    return result
 
 
 def save_clip(path: str | Path, clip: dict[str, np.ndarray]) -> None:

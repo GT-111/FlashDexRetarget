@@ -1,0 +1,16 @@
+# @package robot.native_scene.object
+
+# Exact named topology of the selected 5070 scene. The passive hinge remains
+# inside ONE physical articulation; source part surfaces are not collision edits.
+entity_name: articulated_object
+root_body_name: object_0
+root_joint_name: object_0_free
+parts:
+  - name: base
+    body_name: object_0
+    mesh_path: ${oc.env:FDR_NATIVE_BOX_BASE_MESH}
+    distance_sign: unsigned
+  - name: lid
+    body_name: object_0_articulated
+    mesh_path: ${oc.env:FDR_NATIVE_BOX_LID_MESH}
+    distance_sign: unsigned

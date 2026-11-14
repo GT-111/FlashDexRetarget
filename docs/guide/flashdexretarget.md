@@ -33,6 +33,56 @@ The run is named `flashdexretarget-<dataset>-<robot>` and tagged `<dataset>`, `<
 `<dataset>` is the directory of `MOTION` (`<dataset>/motion.pt` or `<dataset>/<robot>/motion.pt`);
 `logger.wandb.run_name=<name>` replaces it.
 
+### Robot assets
+
+The selected stock robot YAML owns both its authoritative `robot.xml_path` and
+the Isaac import binding:
+
+```yaml
+sim:
+  robot_asset:
+    source_urdf_path: assets/robot/my_hand/urdf/my_hand.urdf
+    usd_path: assets/robot/my_hand/urdf/converted/my_hand.usd
+    body_name_map: {}  # MJCF body name -> imported USD body name; omitted names retain identity
+```
+
+Paths are relative to the repository root unless absolute. Add a mapping only
+for names the source URDF actually changes. The converter, articulation view
+and contact-sensor prims share this mapping; joint, actuator, mimic, inertial
+and collision definitions retain their existing source owners. Required link
+names come from the actual MJCF metadata and complete source URDF link roster,
+including authored fixed fingertip frames, rather than a fixed finger roster.
+Runtime requires this explicit binding for
+the stock route. It does not guess a hand or a USD from the MJCF filename.
+
+```sh
+python src/simulator/isaacsim/convert_assets.py \
+    --robot-config config/envs/robot/sharpa_bimanual.yaml
+# A resolved run YAML selects the same binding.
+python src/simulator/isaacsim/convert_assets.py --robot-config <resolved-run.yaml>
+```
+
+XHAND declares its trained `_spec` URDF/USD and palm renames in
+`config/envs/robot/xhand_bimanual.yaml`; Sharpa declares its own asset and the
+palm renames present in its source URDF. Only the XHAND config reads
+`FDR_ROBOT_USD`; Sharpa and custom registrations are independent of it.
+`scripts/env.sh` supplies the environment rather than a global robot asset.
+
+A robot may also declare `collision_visual_usd_path`. Convert that explicit
+destination with `--collision-visual` and select it with `FDR_COLVIS=1`.
+XHAND registers this debug variant; requesting it for a registration without
+one fails. Debug visuals use per-collision convex hulls, retaining the original
+collision mesh paths, transforms, scales and inertials. This changes visual
+representation, not the declared collider recipe. Objects keep their existing
+`.isaac_usd_colvis` route. Neither converted files nor named-link validation
+qualifies physical contact or task success.
+
+Native FREE-root scenes instead use `robot.native_scene` and named
+`sim.native_assets.static` / `sim.native_assets.articulations` USDs with
+`--native-scene-config <resolved-run.yaml>`. Keep that per-entity route for
+floating hands and passive articulated objects; the stock fixed-root URDF
+binding does not replace it.
+
 ### Hydra overrides
 
 The defaults below come from `config/` (`envs/`, `runner/`, `eval/`, `logger/`); arguments to the launcher
@@ -45,7 +95,22 @@ are applied last.
 | `num_envs` | `2048` | parallel environments |
 | `seed` | `42` | random seed |
 | `device` | `cuda:0` | simulation and learner device |
+| `sim.kit_args` | `""` | extra arguments forwarded to the existing Isaac AppLauncher, including the graphics-device selection |
 | `episode_length_s` | `20.0` | episode time limit; an episode also ends with its clip |
+
+With a CUDA visibility mask, `device` addresses the visible CUDA devices while
+Kit's renderer ordinal can refer to the full physical GPU table. The resource
+owner supplies that mapping through `sim.kit_args`, for example
+`'sim.kit_args="--/renderer/activeGpu=1"'` when the selected graphics device is
+ordinal 1 and its masked physics device is `cuda:0`. An empty string preserves
+AppLauncher's default mapping. A CUDA mask alone does not isolate graphics
+contexts; include any auxiliary context in the owning allocation's budget.
+
+Robot conversion removes importer-created visual references for URDF links
+without visual geometry from their introducing layers inside the generated
+USD directory. An empty reference list on an outer assembly cannot remove
+those nested arcs. Keep the generated configuration layers with the robot USD;
+real visuals, source meshes, colliders, inertials and joints are preserved.
 
 **Learner** (`config/runner/flashsac.yaml`)
 
@@ -119,14 +184,63 @@ gather), so a GPU with less memory can run the same config. The buffer scales wi
 
 ## Stop / resume
 
-`kill -USR1 <pid>` finishes the iteration, saves `stop<N>/` (networks, replay buffer,
-`resume_state.json`) and exits. A periodic `step<N>/` holds the replay buffer only with
-`save_replay_buffer=true`, so pass it when the run may need to resume from one.
+`kill -USR1 <pid>` finishes the iteration, saves `stop<N>/` and exits. A full learning
+checkpoint contains networks and target critics, Adam and LR-scheduler states, the AMP scaler,
+reward-normalizer statistics, `replay_buffer.pt`, `learning_state.pt` and `resume_state.json`.
 
-Every checkpoint's `resume_state.json` records the env step, the wandb id and the curriculum state a resume
-needs; resume by passing `agent_load_path=<ckpt> buffer_load_path=<ckpt> step_offset=<N>
-logger.wandb.resume=true logger.wandb.resumeid=<id> ...` to the launcher. Eval and checkpoint points lie on
-an absolute env-step grid, so a resume does not shift them.
+The runner registers this handler on the main thread; registration failure now
+stops startup. It logs one JSON signal-authority record at installation and one
+after the first completed update, including the actual PID, current handler and
+blocked/pending signal state. These records diagnose signal ownership; they do
+not establish that a later request produced a full checkpoint. Confirm the
+`graceful stop` message and complete `stop<N>/` before resuming.
+A periodic `step<N>/` includes replay and learning state only with `save_replay_buffer=true`.
+Weights-only checkpoints remain usable for evaluation and policy initialization.
+
+Resume full learning with `agent_load_path=<ckpt> buffer_load_path=<ckpt> step_offset=<N>
+logger.wandb.resume=true logger.wandb.resumeid=<id> ...`, using the actual env step and wandb id in
+`resume_state.json`. The current full format requires matching world count, replay capacity, n-step
+length and gamma. `learning_state.pt` restores Python, NumPy, Torch CPU and visible CUDA generators,
+the independent Gym action sampler, and the adaptive curriculum's gains, histories and partial epoch.
+The visible CUDA layout must match. Eval and checkpoint points stay on the absolute env-step grid;
+the original LR horizon and optimizer age continue.
+
+Physical worlds and episodes start fresh. Per-world return carry, correlated exploration noise and
+pending n-step transitions are cleared, while learned and running statistics are retained. The replay
+stores explicit factual successors for the old fragment's edge, so new episodes cannot become its
+next states. The same sealing occurs when evaluation shares and resets the training worlds; the
+curriculum also drops its previous physical episode lengths while retaining global history. These
+semantics do not claim an identical simulator or CUDA-graph trajectory after restart.
+
+A replay save copies only occupied rows into independent CPU storage; it retains the configured live
+capacity and sampler. At high occupancy, allow host RAM and disk space for that complete occupied
+snapshot. The new run writes `learning-restored.pt` and `learning-restore.json` before collection so
+its actual restored RNG and curriculum state can be compared with the full checkpoint. Old replay
+files lacking the current fragment and learning state are not full learning resumes.
+
+The native task uses the same compact replay implementation. Only its future
+reference span is dropped; its factual base observations stay stored. The shared
+native future builder reconstructs that span from scene-local wrist p/WXYZ,
+WORLD linear/angular velocity, complete named hand Q/Qvel, object-joint Q/Qvel,
+and the stored `(motion_id, motion_step)`. The immutable library supplies actual
+native column correspondence, independent support and exact int64 query times.
+The physical world count and replay sample count may differ. Reconstruction
+does not consult live achieved state or replace a saved phase with the current
+command cursor. Existing final-observation and fragment-address handling applies.
+Resolved observation entity/joint columns select the native commands by their
+actual names. A different Q/Qvel column order is supported; missing required
+command columns, clipped reconstruction inputs or zero source scales cannot
+recover the factual input and are rejected. Q/Qvel must observe the command's
+actual robot entity; a different entity with matching scalar names cannot supply
+its physical facts.
+
+The native profiles use 5 ms physics and four substeps per 20 ms control endpoint;
+the prepared carrier must match the actual clock. The stock Isaac author profile
+retains 1/240 s physics. Configure `n_future`, replay capacity, storage dtype and
+device in `runner.agent` and admit memory for the resulting layout. Float16 replay
+quantizes stored factual observations; it does not quantize the integer phase,
+source clocks or library support. Reconstructed geometric values inherit that
+existing factual-storage precision rather than recovering discarded precision.
 
 ## Other algorithms
 
@@ -156,7 +270,7 @@ the run once every clip is archived.
 
 ```
 logs/flashsac/<run_name>-<MMDD-HHMMSS>/
-├── step<N>/         networks (+ replay_buffer.pt) + resume_state.json, every `save_checkpoint_per_env_step` env steps
+├── step<N>/         networks (+ replay_buffer.pt + learning_state.pt) + resume_state.json, every `save_checkpoint_per_env_step` env steps
 ├── stop<N>/         SIGUSR1 stop
 ├── final/           networks at the end of the run
 └── success/         first passing rollout per motion

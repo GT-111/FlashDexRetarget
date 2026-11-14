@@ -1,0 +1,19 @@
+# @package _global_
+
+actions:
+  name: native
+  _target_: envs.actions.native.NativeResidualActionCfg
+  entity_name: ${robot.entity_name}
+  command_name: ${commands.name}
+  native_scene: ${robot.native_scene}
+  action_scale: 1.0
+  action_offset: 0.0
+  clip:
+    ".*": [-1.0, 1.0]
+  translation_residual_m: 0.1
+  rotation_residual_rad: 1.0
+  finger_residual_rad: null
+  cutoff_hz:
+    wrist_trans: 5.0
+    wrist_rot: 5.0
+    finger: null

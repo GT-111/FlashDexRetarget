@@ -52,3 +52,7 @@ class Agent(ABC):
 
     def load_buffer(self, path: str) -> None:
         """Restore what save_buffer wrote; nothing by default."""
+
+    def reset_collection(self) -> None:
+        """Close the old physical fragment and start fresh episode carry."""
+        return None

@@ -52,6 +52,15 @@ class IsaacMotionTrackingCommand(MotionTrackingCommand):
         self._slot_motion_table = table
         self._slot_motion_count = counts
 
+    def clear_object_wrenches(self, env_ids=None):
+        names = {name for side in self._side_list for name in self.obj_entity_names(side)}
+        count = self.num_envs if env_ids is None else len(env_ids)
+        zero = torch.zeros(count, 1, 3, device=self.device)
+        for name in names:
+            self._env.scene[name].write_external_wrench_to_sim(
+                zero, zero.clone(), env_ids=env_ids,
+            )
+
     def _resample_command(self, env_ids: torch.Tensor) -> None:
         assigned = getattr(self._env.scene, "assigned_obj_slot", None)
         if (

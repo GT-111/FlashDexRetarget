@@ -1,0 +1,10 @@
+# @package _global_
+sim:
+  _target_: simulator.native.create.create_native_envs
+  runtime_launcher: null
+  backend: mjwarp
+  dt: 0.005
+  plant:
+    _target_: simulator.native.mjwarp.MjWarpPlant
+    nconmax: 512
+    njmax: 2048

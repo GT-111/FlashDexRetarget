@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "FlashDexRetarget"
 version = "0.0.1"
-description = "Bimanual dexterous motion retargeting with FlashSAC on Isaac Sim: hand + object policies tracking human motion capture."
+description = "Bimanual dexterous motion retargeting with one FlashSAC core and configurable physics execution."
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Kyungmin Lee", email = "char7165@gmail.com" }]
 keywords = ["robotics", "reinforcement-learning", "manipulation", "isaac-sim", "flashsac"]
@@ -15,11 +15,15 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 # The FlashDexRetarget env, installed with --no-deps only (README "Setup"): pip cannot resolve
-# the Isaac stack, so these pins document the env rather than drive a resolve.
+# the Isaac stack, so these pins document the author env rather than drive a resolve.
+# The author Isaac freeze stays on Python 3.11. This native campaign selects
+# an existing Python 3.12 runtime; requirements/native_cu128.txt is a separate
+# candidate constraint set, not evidence of installed engine versions.
 dependencies = [
   # requirements/isaac_cu128.txt (Isaac Sim / Isaac Lab freeze)
   "isaacsim==5.1.0.0",

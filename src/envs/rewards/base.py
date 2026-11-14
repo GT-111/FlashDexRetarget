@@ -58,8 +58,7 @@ class BaseRewards:
         not side-split. Use a NEGATIVE weight."""
         return torch.sum(env.action_manager.action ** 2, dim=-1)
 
-    # Action dims are grouped by type ([wrist_trans R,L | wrist_rot R,L | fingers R,L]), so a
-    # side is picked by joint-name prefix, not by halving the vector.
+    # Root and finger coordinates are grouped by type. The action term owns their sides.
 
     @staticmethod
     def _side_action_mask(env: "ManagerBasedRlEnv", side: str) -> torch.Tensor:
@@ -67,14 +66,13 @@ class BaseRewards:
         key = f"_side_action_mask_{side}"
         mask = getattr(act_term, key, None)
         if mask is None:
-            names = act_term._entity.joint_names
-            prefixes = ("R_", "right_") if side == "right" else ("L_", "left_")
+            names = act_term.action_names
             mask = torch.tensor(
-                [names[int(i)].startswith(prefixes) for i in act_term._all_joint_ids],
+                [owner == side for owner in act_term.action_sides],
                 dtype=torch.bool, device=env.device,
             )
             if not bool(mask.any()):
-                raise ValueError(f"no {side}-side joints among the action joints {list(names)}")
+                raise ValueError(f"no {side}-side coordinates among the actions {list(names)}")
             setattr(act_term, key, mask)
         return mask
 

@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import signal
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,11 +20,13 @@ from omegaconf import DictConfig, OmegaConf
 from agents import build_agent
 from common.average_meters import AverageMeter
 from common.logger import log_metrics
+from common.utils import capture_rng_state, restore_rng_state
 from envs.vec_env import FlatObsVecEnv
 from evaluation.evaluate import evaluate
 
 # simulation/: anchor for the relative checkpoint / load paths in the cfg.
 _BASE_DIR = Path(__file__).resolve().parents[2]
+LEARNING_STATE_FILE = "learning_state.pt"
 
 
 class OffPolicyRunner:
@@ -70,6 +73,8 @@ class OffPolicyRunner:
         self._observations, env_infos = self._train_env.reset()
         self._just_reset = True  # no policy obs yet: the next step acts randomly
         self._nonfinite_steps = 0
+        self._restored_loop_wall_clock: float | None = None
+        self._train_env.action_space.seed(runner_cfg.seed)
 
         # ── agent ────────────────────────────────────────────────────────────────────
         self._agent = build_agent(runner_cfg.agent, self._train_env, env_infos, eval_cfg.command_name)
@@ -108,6 +113,9 @@ class OffPolicyRunner:
             except Exception as exc:  # noqa: BLE001 - a missing curve must not stop training
                 print(f"[eval] ever-success state not restored from {ever_src}: {exc!r}", flush=True)
 
+        if runner_cfg.buffer_load_path is not None:
+            self._restore_learning_state((_BASE_DIR / runner_cfg.buffer_load_path).resolve())
+
     # ─── training loop ───────────────────────────────────────────────────────────
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
@@ -126,6 +134,7 @@ class OffPolicyRunner:
         meter = AverageMeter()
         update_budget = 0.0
         solved_stop = False
+        stop_authority_recorded = False
 
         for step in tqdm.tqdm(range(1, n_steps + 1), smoothing=0.1, mininterval=0.5):
             env_step = self._step_offset + step * n_envs
@@ -138,12 +147,18 @@ class OffPolicyRunner:
                 continue
 
             update_budget += self._updates_per_step
+            did_update = False
             while update_budget >= 1:
                 train_info = agent.update()
+                did_update = True
                 meter.update(train_info)
                 update_budget -= 1
             if timing_f:
                 torch.cuda.synchronize()
+            if did_update and not stop_authority_recorded:
+                self._record_stop_signal_authority("first_completed_update")
+                stop_authority_recorded = True
+            if timing_f:
                 timing_f.write(f"{step},{env_step},{time.perf_counter() - iter_t0:.6f},1\n")
                 timing_f.flush()
 
@@ -239,6 +254,10 @@ class OffPolicyRunner:
                 )
 
     def _reset_train_env(self) -> None:
+        self._agent.reset_collection()
+        xf = getattr(self._train_cmd, "_xfrc_curr_ctrl", None)
+        if xf is not None:
+            xf.reset_collection()
         self._observations, reset_infos = self._train_env.reset()
         self._obs_aux = reset_infos.get("obs_aux", self._obs_aux)
         self._just_reset = True
@@ -276,7 +295,9 @@ class OffPolicyRunner:
     def _start_clock(self) -> None:
         # A resumed wandb run continues its logged wall clock.
         self._wall_offset = 0.0
-        if getattr(wandb.run, "resumed", False):
+        if self._restored_loop_wall_clock is not None:
+            self._wall_offset = self._restored_loop_wall_clock
+        elif getattr(wandb.run, "resumed", False):
             self._wall_offset = float(wandb.run.summary.get("time/wall_clock_s", 0.0) or 0.0)
         self._loop_start = time.perf_counter()
 
@@ -285,7 +306,7 @@ class OffPolicyRunner:
         return {
             "time/env_step": float(step),
             "time/wall_clock_s": self._wall_offset + elapsed,
-            "time/env_steps_per_s": step / max(elapsed, 1e-9),
+            "time/env_steps_per_s": (step - self._step_offset) / max(elapsed, 1e-9),
         }
 
     # ─── checkpoints / stopping ──────────────────────────────────────────────────
@@ -300,8 +321,9 @@ class OffPolicyRunner:
             self._agent.save(str(tmp))
             if save_buffer:
                 self._agent.save_buffer(str(tmp))
+                self._save_learning_state(tmp, env_step)
+            self._log_resume_state(tmp, env_step, final_path=ckpt)
             os.replace(tmp, ckpt)
-            self._log_resume_state(ckpt, env_step)
             if bool(self._cfg.get("keep_last_checkpoint_only", False)):
                 self._prune_checkpoints(keep=ckpt.name)
             elif save_buffer:
@@ -325,7 +347,7 @@ class OffPolicyRunner:
                 except OSError as exc:
                     print(f"[runner] could not drop {old}: {exc}")
 
-    def _install_stop_signal(self) -> None:
+    def _install_stop_signal(self) -> dict[str, Any]:
         """`kill -USR1 <pid>`: finish the current iteration, checkpoint WITH the replay
         buffer and exit, so a resume does not refill the buffer."""
         self._stop_requested = False
@@ -334,15 +356,40 @@ class OffPolicyRunner:
             self._stop_requested = True
             print("[runner] SIGUSR1: stopping after this iteration (saving buffer)", flush=True)
 
-        try:
-            signal.signal(signal.SIGUSR1, _request_stop)
-        except ValueError:  # not the main thread
-            pass
+        self._stop_signal_handler = _request_stop
+        signal.signal(signal.SIGUSR1, _request_stop)
+        return self._record_stop_signal_authority("installed")
+
+    def _record_stop_signal_authority(self, phase: str) -> dict[str, Any]:
+        handler = signal.getsignal(signal.SIGUSR1)
+        masks = {}
+        for line in Path("/proc/self/status").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key in {"SigBlk", "SigIgn", "SigCgt", "SigPnd", "ShdPnd"}:
+                masks[key] = value.strip()
+        record = {
+            "kind": "runner_stop_signal_authority",
+            "phase": phase,
+            "PID": os.getpid(),
+            "thread_id": threading.get_ident(),
+            "native_thread_id": threading.get_native_id(),
+            "main_thread": threading.current_thread() is threading.main_thread(),
+            "signal": "SIGUSR1",
+            "signal_number": int(signal.SIGUSR1),
+            "python_handler": getattr(handler, "__qualname__", str(handler)),
+            "python_handler_is_runner_callback": handler is self._stop_signal_handler,
+            "USR1_blocked": signal.SIGUSR1 in signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            "USR1_pending": signal.SIGUSR1 in signal.sigpending(),
+            "linux_masks": masks,
+        }
+        print(json.dumps(record), flush=True)
+        return record
 
     def _graceful_stop(self, env_step: int) -> None:
         ckpt = self._save_path_base / f"stop{env_step}"
         self._agent.save(str(ckpt))
         self._agent.save_buffer(str(ckpt))
+        self._save_learning_state(ckpt, env_step)
         self._log_resume_state(ckpt, env_step)
         print(f"[runner] graceful stop at env_step={env_step}: {ckpt}", flush=True)
         try:
@@ -363,8 +410,51 @@ class OffPolicyRunner:
 
     # ─── resume state ────────────────────────────────────────────────────
 
+    def _save_learning_state(self, ckpt: Path, env_step: int) -> None:
+        xf = getattr(self._train_cmd, "_xfrc_curr_ctrl", None)
+        torch.save({
+            "env_step": int(env_step),
+            "num_envs": self._n_envs,
+            "rng": capture_rng_state(self._train_env.action_space),
+            "curriculum": None if xf is None else xf.state_dict(self._train_env.unwrapped.common_step_counter),
+            "nonfinite_steps": self._nonfinite_steps,
+            "loop_wall_clock_s": self._wall_offset + time.perf_counter() - self._loop_start,
+            "collector_restart": "fresh physical worlds; seal replay frontier and reset episode returns/noise/pending tape",
+        }, ckpt / LEARNING_STATE_FILE)
+
+    def _restore_learning_state(self, ckpt: Path) -> None:
+        state = torch.load(ckpt / LEARNING_STATE_FILE, map_location="cpu", weights_only=False)
+        if (state["env_step"], state["num_envs"]) != (self._step_offset, self._n_envs):
+            raise ValueError("FULL learning progress and world count must match the selected run")
+        xf = getattr(self._train_cmd, "_xfrc_curr_ctrl", None)
+        if (xf is None) != (state["curriculum"] is None):
+            raise ValueError("FULL adaptive-curriculum owner differs from the selected run")
+        if xf is not None:
+            xf.load_state_dict(state["curriculum"], self._train_env.unwrapped.common_step_counter)
+        self._agent.reset_collection()
+        self._nonfinite_steps = state["nonfinite_steps"]
+        self._restored_loop_wall_clock = state["loop_wall_clock_s"]
+        # Owner loading and the new world's reset can consume random draws.
+        # Restore learning generators only after those operations finish.
+        restore_rng_state(state["rng"], self._train_env.action_space)
+        self._save_path_base.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "env_step": self._step_offset,
+            "rng": capture_rng_state(self._train_env.action_space),
+            "curriculum": None if xf is None else xf.state_dict(self._train_env.unwrapped.common_step_counter),
+        }, self._save_path_base / "learning-restored.pt")
+        (self._save_path_base / "learning-restore.json").write_text(json.dumps({
+            "checkpoint": str(ckpt), "env_step": self._step_offset,
+            "rng_components": list(state["rng"]),
+            "CUDA_generators": len(state["rng"]["torch_cuda"]),
+            "curriculum_restored": xf is not None,
+            "actual_restored_state": "learning-restored.pt",
+            "collector_restart": state["collector_restart"],
+            "nonfinite_steps": self._nonfinite_steps,
+        }, indent=2) + "\n")
+
     def _curriculum_state(self) -> dict[str, Any]:
-        """Assist gains, as resume overrides read them."""
+        """Readable assist summary; FULL restoration uses the owner's complete state."""
         xf = getattr(self._train_cmd, "_xfrc_curr_ctrl", None)
         return {
             "xfrc": None if xf is None else {
@@ -376,18 +466,15 @@ class OffPolicyRunner:
             },
         }
 
-    def _log_resume_state(self, ckpt: Path, env_step: int) -> None:
+    def _log_resume_state(self, ckpt: Path, env_step: int, final_path: Path | None = None) -> None:
         """Write the overrides a resume needs (ckpt, step, wandb id, curriculum state) next
         to the checkpoint."""
         state = {
             "env_step": int(env_step),
-            "ckpt": str(ckpt),
+            "ckpt": str(final_path if final_path is not None else ckpt),
             "wandb_id": str(wandb.run.id) if wandb.run is not None else None,
             **self._curriculum_state(),
             "ever": {k: v.to(torch.uint8).cpu().tolist() for k, v in self._eval_ever_state.items()
                      if torch.is_tensor(v)},
         }
-        try:
-            (ckpt / "resume_state.json").write_text(json.dumps(state))
-        except Exception as exc:  # noqa: BLE001
-            print(f"[runner] resume-state dump failed: {exc}")
+        (ckpt / "resume_state.json").write_text(json.dumps(state))

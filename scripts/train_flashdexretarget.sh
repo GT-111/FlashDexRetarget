@@ -13,9 +13,6 @@ dir="$(dirname "$motion")"
 dataset="$(basename "$dir")"
 
 args=(--overrides envs/robot@robot=${robot}_bimanual)
-if [ "$robot" = sharpa ]; then
-    unset FDR_ROBOT_USD   # env.sh points it at the XHAND USD
-fi
 args+=(
     --overrides commands.motion_file="$motion"
     --overrides logger.wandb.run_name=flashdexretarget-${dataset}-${robot}

@@ -60,6 +60,8 @@ def export_success(
             "frames": int(arrays["joint_pos"].shape[0]),
             "rollout": rel,
             "first_saved_env_step": int(env_step),
+            "recording": str(arrays.get("recording", "author-post-step-recording")),
+            "fields": sorted(arrays),
         }
         written += 1
     if not written:
@@ -74,6 +76,9 @@ def export_success(
             "num_saved": len(saved),
             "updated_at_env_step": int(env_step),
             "coordinate_frame": "env-local (scene env_origins subtracted)",
+            "selection": "first_success_ever_archive; not frozen_final_policy_evaluation",
+            "action_authority": "raw action_manager.action; installed_* facts only when the actual action owner supplies them",
+            "reference_phase_authority": "recorded_motion_steps in native-v2 are pre-advance metric endpoints; command_motion_steps retain the next-target cursor",
             "fields": "joint_pos, joint_vel, actions, root_pos, root_quat, obj_pos, obj_quat",
             "saved": saved,
         },

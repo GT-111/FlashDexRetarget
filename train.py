@@ -8,7 +8,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import argparse
-import os
 
 import hydra
 from omegaconf import OmegaConf
@@ -23,16 +22,16 @@ def run(args: argparse.Namespace) -> None:
         cfg = hydra.compose(config_name=args.config_name, overrides=args.overrides)
     OmegaConf.resolve(cfg)
 
-    # ─── Isaac Sim app (boots before torch-heavy imports) ─────────────────
-    os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "1")
-    from isaaclab.app import AppLauncher
-
+    # The selected runtime boots before Torch-heavy imports; native paths need no Kit.
+    from simulator.runtime import launch_runtime
     headless = bool(cfg.get("headless", True))
-    AppLauncher({"headless": headless})
+    runtime = launch_runtime(cfg)
+
+    from envs import create_envs
+    # isort: split
 
     from common.logger import setup_logger
     from common.utils import configure_torch_backends, set_seed
-    from envs import create_envs
     from runner import create_runner
 
     set_seed(cfg.seed)
@@ -46,7 +45,6 @@ def run(args: argparse.Namespace) -> None:
 
     train_env.close()
     eval_env.close()
-    # isaacsim 5.1 segfaults in close(); flush wandb and hard-exit instead.
     try:
         import wandb
 
@@ -56,7 +54,8 @@ def run(args: argparse.Namespace) -> None:
         pass
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(0)
+    if runtime is not None:
+        runtime.close()
 
 
 if __name__ == "__main__":

@@ -160,7 +160,7 @@ def _archive_success(
             ok=(~failed) & scored,
             motion_ids=torch.cat([s["motion_ids"] for s in states[id(rec_cb)]]),
             env_step=env_step,
-            criterion=f"{crit} SR@1.0",
+            criterion=f"{crit} {getattr(tp_cb, 'success_criterion_label', 'SR@1.0')}",
             motion_names=_motion_names(lib),
             motion_file=getattr(lib, "motion_file", None),
         )
