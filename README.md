@@ -241,7 +241,22 @@ bash scripts/setup.sh --profile newton --dexforge-root /path/to/DexForge
 
 `--env NAME` selects a different conda environment; setup checks its Python minor
 version before installation and regenerates that profile's activation file.
-Keep machine overrides in the calling shell. The native engine pins are candidate
+Newly generated activation files also check that minor version when sourced and
+clear inherited `PYTHONPATH`. Keep machine overrides in the calling shell.
+Cache defaults use `${TMPDIR:-/tmp}/flashdexretarget-${UID}/${CONDA_DEFAULT_ENV}`
+for XDG, CUDA, Torch extensions/Inductor, Triton and Warp; explicit cache paths
+and the operator's existing license acceptance are preserved.
+
+The preparation wrapper uses the same explicit `--profile isaac|mjwarp|newton`
+selection. `isaac` is the default; native profiles require their generated
+`env/native.sh`. Preparation selects only the environment: choose its input,
+steps, robot and task through ordinary Hydra arguments. Native setup omits the
+human-processing stack, so full human/MANO import and physics IK use the author
+environment. See [prepared native input](docs/guide/kinematic_retargeting.md#prepared-native-input)
+for packing an existing carrier. A missing selected activation is an error;
+manually managed environments can call the public Python entry directly.
+
+The native engine pins are candidate
 constraints, not a claim that a new environment or scene passed physical or
 learning qualification. Select a new or stopped environment; setup does not
 manage running jobs or protect an active environment from package replacement.

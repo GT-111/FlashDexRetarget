@@ -15,8 +15,18 @@ go to `kinematic_retargeting.yaml`. The scripts run two commands, which can also
 
 ```sh
 bash scripts/retarget/import_human_demo.sh source=taco raw=<raw_dataset_path> dataset=<output_dataset_path>   # taco | oakink2 | hot3d
-bash scripts/retarget/kinematic_retargeting.sh dataset=<output_dataset_path> robot=xhand
+bash scripts/retarget/kinematic_retargeting.sh --profile isaac dataset=<output_dataset_path> robot=xhand
 ```
+
+`--profile` selects the existing activation file: `isaac` (the default) uses
+Python 3.11 from `scripts/env.sh`; `mjwarp` and `newton` use Python 3.12 from
+`env/native.sh`. Run the corresponding [setup](../../README.md#setup) first.
+The selected activation must exist and match its Python minor. It clears
+inherited `PYTHONPATH`, supplies node-local cache defaults, and preserves
+operator cache overrides and license acceptance. Unlike the training wrapper,
+preparation's profile chooses only the environment; input, steps, robot and
+task stay explicit Hydra configuration. Full human import and physics IK use
+the author environment, since native setup omits that processing stack.
 
 | | step | does | writes (under the dataset) |
 |---|---|---|---|
@@ -41,9 +51,12 @@ physics IK and report flow above, including object preparation from an existing
 For an already prepared native dataset, select its own input constructor:
 
 ```sh
-bash scripts/retarget/kinematic_retargeting.sh dataset=<prepared_dataset> \
+bash scripts/retarget/kinematic_retargeting.sh --profile mjwarp dataset=<prepared_dataset> \
   input=prepared_native steps.convex=false steps.usd=false steps.sdf=false
 ```
+
+`--profile newton` uses the same native activation with its selected public
+DexForge packages. Neither profile silently enables native input or skips steps.
 
 The default manifest is `<prepared_dataset>/native-reference.json`; select a
 different dataset-relative manifest with `input.manifest=...`. It declares the
