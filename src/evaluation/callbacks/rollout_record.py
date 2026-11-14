@@ -1,4 +1,4 @@
-"""Per-step eval rollout capture for the success archive (success_export.py); one flat
+"""Eval capture for first-success and explicit frozen-attempt exports; one flat
 device->host copy per step, split back into fields at export time."""
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ class RolloutRecord:
             ].cpu(),
             "motion_ids": self.cmd.motion_ids[
                 slice(None) if active_mask is None else active_mask
-            ].cpu(),
+            ].cpu().clone(),
         }
 
     def reduce_state(self, states: list[dict[str, Any]]) -> dict[str, float]:

@@ -395,6 +395,26 @@ run publication. Periodic and final evaluations at the same env step retain
 separate timestamped reports. Native reference tracking and net-link-force/SDF
 association do not certify physical interaction or articulated BOX success.
 
+For a frozen checkpoint comparison, the public `evaluate` call accepts
+`recording_dir` and `frozen_authority={"checkpoint": ..., "source_revision": ...}`.
+The caller must bind the checkpoint actually loaded and the source actually
+executed; the exporter does not verify loading history. Select the normal rollout
+recorder in `eval.callbacks`. This explicit call retains that recorder even when
+`save_success_data=false`; it does not add a recorder automatically.
+
+The recording directory receives a timestamped `manifest.json` and a separate
+NPZ for every recorded attempt, including failed and unscored attempts. Actual
+batch/world addresses and per-motion replica indices join the scalar report to
+the NPZ's embedded attempt identity. Planned but unexecuted slots and unavailable
+recorders retain reasons without invented arrays. This selected-library roster
+does not replace an external task family's original planned population.
+
+Native source phases, exact source clocks, physical clocks, raw interval contacts
+and their support retain the recorder's arrays and dtypes. First-success archives
+keep their existing selection meaning and share the NPZ serializer. Ordinary
+training omits `recording_dir` and continues to write scalar attempt reports
+without automatically storing every rollout.
+
 ## Outputs
 
 ```

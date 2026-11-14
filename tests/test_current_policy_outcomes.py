@@ -17,7 +17,7 @@ from omegaconf import OmegaConf
 from test_native_task_contract import _command
 
 from evaluation.callbacks.tracking_performance import NativeReferenceTrackingPerformance
-from evaluation.evaluate import write_current_policy_outcomes
+from evaluation.evaluate import evaluate, write_current_policy_outcomes
 from evaluation.shared import build_eval_plan
 from runner.off_policy_runner import OffPolicyRunner
 
@@ -254,3 +254,112 @@ def test_native_current_rows_preserve_missing_support_empty_hinges_and_failure(t
     assert len(result["attempts"][0]["masses"]["joint_position_error_rad"]) == len(joint_names)
     assert "no contact/task" in report["callback_metadata"][key]["meaning"]
     assert "UNQUALIFIED" in report["physical_task_or_BOX_success"]
+
+
+class _RecordedEvaluationEnv(_EvaluationEnv):
+    def __init__(self):
+        super().__init__()
+        self.scene.env_origins = torch.zeros(4, 3)
+        self.command.sim_obj_quat_w = torch.zeros(4, 2, 4)
+        self.command.sim_obj_quat_w[..., 0] = 1
+        self.command.robot = SimpleNamespace(data=SimpleNamespace(
+            joint_pos=torch.zeros(4, 2), joint_vel=torch.zeros(4, 2),
+            root_link_pos_w=torch.zeros(4, 3), root_link_quat_w=torch.tensor([[1., 0., 0., 0.]] * 4),
+        ))
+
+    def reset(self):
+        self.command.robot.data.joint_pos[:] = torch.arange(4)[:, None]
+        return super().reset()
+
+    def step(self, actions):
+        self.command.robot.data.joint_pos += .01
+        return super().step(actions)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_explicit_frozen_eval_keeps_failed_unscored_absent_replicas_and_cpu_identity(tmp_path, enabled):
+    env, cfg, agent = _RecordedEvaluationEnv(), _config(), _Agent()
+    cfg.callbacks.append({"_target_": "evaluation.callbacks.rollout_record.RolloutRecord", "enabled": enabled})
+    success = tmp_path / "success"
+    success.mkdir()
+    old = '{"saved": [{"motion_id": 0, "first_saved_env_step": 1}]}\n'
+    (success / "manifest.json").write_text(old)
+    authority = {"checkpoint": "/fixture/full", "source_revision": "frozen-fixture"}
+    outcome_dir = tmp_path / "evaluation"
+    evaluate(agent, env, cfg, "cpu", success_dir=success, env_step=8192,
+             outcome_dir=outcome_dir, recording_dir=outcome_dir / "recordings", frozen_authority=authority)
+    report_path = next(outcome_dir.glob("current-policy-*.json"))
+    report = json.loads(report_path.read_text())
+    manifest_path = outcome_dir / report["factual_recording_manifest"]
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["schema"] == "frozen_current_policy_attempts_v1"
+    assert manifest["frozen_authority"] == report["frozen_authority"] == authority
+    assert (manifest_path.parent / manifest["evaluation_report"]).resolve() == report_path
+    assert manifest["selected_motion_count"] == 4 and manifest["configured_replicas_per_motion"] == 2
+    assert env.exit_count == 1 and torch.equal(env.command.motion_ids, torch.full((4,), 99))
+    tracking = _callback(report, ".TrackingPerformance")
+    assert report["motions"][0]["callbacks"][tracking]["full_threshold_counts"] == [
+        {"pass": 1, "fail": 1, "unscored": 0, "nonfinite": 0}]
+    assert report["motions"][3]["callbacks"][tracking]["unscored_attempt_count"] == 2
+    absent = manifest["motions"][2]["attempts"]
+    assert len(absent) == 2 and all(row["execution"] == "not_evaluated" for row in absent)
+    assert all(row["recording"]["reason"] == "attempt_not_evaluated" and row["recording"]["rollout"] is None for row in absent)
+    actual = [row for motion in manifest["motions"] for row in motion["attempts"] if row["execution"] == "executed"]
+    assert len(actual) == 6
+    assert [row["evaluation_row"] for row in manifest["motions"][0]["attempts"]] == [1, 3]
+    assert len({row["attempt_id"] for row in actual}) == 6
+    for motion, recorded in zip(report["motions"], manifest["motions"], strict=True):
+        assert motion["factual_attempts"] == recorded["attempts"]
+        for row in motion["callbacks"][tracking]["attempts"]:
+            entry = next(a for a in recorded["attempts"] if a["attempt_id"] == row["attempt_id"])
+            assert entry["evaluation_row"] == row["evaluation_row"]
+            assert entry["replica_index"] == row["replica_index"]
+            recording = entry["recording"]
+            if not enabled:
+                assert recording["status"] == "unavailable" and recording["reason"] == "recorder_disabled"
+                continue
+            assert recording["status"] == "recorded" and recording["reason"] is None
+            with np.load(manifest_path.parent / recording["rollout"], allow_pickle=False) as saved:
+                identity = json.loads(str(saved["evaluation_attempt_json"]))
+                assert identity["evaluation_id"] == manifest["evaluation_id"]
+                assert identity["attempt_id"] == entry["attempt_id"] and identity["frozen_authority"] == authority
+                assert int(saved["motion_id"]) == motion["motion_id"] != 99
+                assert identity["evaluation_row"] == row["evaluation_row"]
+                assert saved["joint_pos"][0, 0] == pytest.approx(entry["env_index"] + .01)
+    assert len(list(manifest_path.parent.glob("rollouts/*.npz"))) == (6 if enabled else 0)
+    assert (success / "manifest.json").read_text() == old
+
+
+def test_frozen_eval_without_selected_recorder_retains_actual_unavailable_attempts(tmp_path):
+    env, cfg = _EvaluationEnv(), _config()
+    evaluate(_Agent(), env, cfg, "cpu", outcome_dir=tmp_path,
+             recording_dir=tmp_path / "recordings",
+             frozen_authority={"checkpoint": "/fixture/full", "source_revision": "fixture"})
+    report = json.loads(next(tmp_path.glob("current-policy-*.json")).read_text())
+    manifest = json.loads((tmp_path / report["factual_recording_manifest"]).read_text())
+    actual = [row for motion in manifest["motions"] for row in motion["attempts"] if row["execution"] == "executed"]
+    assert len(actual) == 6 and all(row["recording"]["reason"] == "no_rollout_recorder_selected" for row in actual)
+    assert not list((tmp_path / "recordings").rglob("*.npz"))
+
+
+def test_frozen_recording_requires_authority_before_any_rollout(tmp_path):
+    env, agent = _EvaluationEnv(), _Agent()
+    with pytest.raises(ValueError, match="checkpoint and source_revision"):
+        evaluate(agent, env, _config(), "cpu", outcome_dir=tmp_path, recording_dir=tmp_path / "records")
+    assert agent.calls == env.exit_count == 0
+
+
+def test_unmasked_cpu_recorder_identity_survives_restore_train_mutation():
+    from evaluation.callbacks.rollout_record import RolloutRecord
+
+    env = _RecordedEvaluationEnv()
+    env.command.motion_ids[:] = torch.tensor([1, 0, 1, 0])
+    env.reset()
+    recorder = RolloutRecord()
+    recorder.on_start(env)
+    env.step(torch.zeros(4, 2))
+    recorder.on_step(env)
+    state = recorder.collect_state()  # The supported default keeps every env.
+    env.exit_eval()  # Restoring TRAIN changes the same CPU motion_ids in place.
+    assert state["motion_ids"].tolist() == [1, 0, 1, 0]
+    assert recorder.rollout_arrays([state], 0)["motion_id"] == 1

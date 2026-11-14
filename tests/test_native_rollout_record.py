@@ -216,3 +216,92 @@ def test_ik_crop_preserves_full_id_inventory_and_query_origin(tmp_path):
     assert names == [f"{path}#S10001__st00"]
     assert loaded[0]["source_lineage"] == lineage
     np.testing.assert_array_equal(loaded[0]["source_query_ordinal"], (1., 2.))
+
+
+def test_frozen_attempt_npz_keeps_actual_native_schema_clocks_interval_and_first_success(tmp_path):
+    from dexforge_adaptation.flashdex_retarget import flashdex_source_mapping
+
+    from evaluation.callbacks.success_export import export_current_attempts
+
+    origin = 2**54 + 31
+    source = flashdex_source_mapping(source_id="arctic", source_revision="fixture",
+        source_unit_id="fixture", source_episode_index=174, fold="train",
+        source_frame_index=(0, 1, 2), source_time_ns=(origin, origin+20_000_000, origin+40_000_000),
+        selected_source_frame_index=(0, 1, 2), prepared_source_ordinal=(0., 1., 2.),
+        prepared_elapsed_time_ns=(0, 20_000_000, 40_000_000),
+        clock_authority="synthetic exact source clock, independent of physical time", processing={"fixture": True})
+    binding = dict(producer_identity={"method": "synthetic serialization, not physics"},
+        scene_identity={"fixture": True}, scene_from_source_world=np.eye(4).tolist(),
+        assistance_receipt={"evaluation_external_wrenches_cleared": True, "evaluation_object_playback": False},
+        hands={side: {"body_name": side+"_root", "command_joint_names": {"driver": side+"_driver"},
+                      "physical_joint_names": {"driver": side+"_driver"}} for side in ("left", "right")},
+        object_part_names=["base", "lid"], object_parts={name: {"entity_name": "object", "body_name": body}
+            for name, body in (("base", "object_root"), ("lid", "object_lid"))}, clips={"fixture": source})
+
+    def setup(env, command):
+        def contacts():
+            row = int(command.reference_phase["motion_steps"].item())
+            addresses = {side+"/"+name: dict(hand_side=side, hand_body_name=side+"_root",
+                part_entity_name="object", part_body_name=part["body_name"])
+                for side in ("left", "right") for name, part in binding["object_parts"].items()}
+            return dict(addresses=addresses, pairs={name: {
+                "normal_force_n": torch.tensor([.75 if row else float("nan")]),
+                "force_bearing_contact_present": torch.tensor([row > 0]),
+                "force_bearing_distance_max_m": torch.tensor([.01 if row else float("nan")])} for name in addresses},
+                measurement_support=torch.tensor([row > 0]), sample_time_s=torch.tensor([1.25+row*.02], dtype=torch.float64),
+                clock="synthetic solver", normal_force_authority="synthetic protocol", distance_authority="synthetic protocol")
+
+        def interval():
+            facts = contacts()
+            row = int(command.reference_phase["motion_steps"].item())
+            begin = 1.25+(row-1)*.02+torch.arange(3, dtype=torch.float64)[None]*(.02/3)
+            if not row:
+                begin[:] = float("nan")
+            return {**facts, "num_substeps": 3, "sampling": "synthetic discrete protocol",
+                "pairs": {name: {"normal_force_n": torch.tensor([[.75, 0., .4] if row else [float("nan")]*3]),
+                    "force_bearing_contact_present": torch.tensor([[True, False, True] if row else [False]*3]),
+                    "force_bearing_distance_max_m": torch.tensor([[.01, float("nan"), .03] if row else [float("nan")]*3])}
+                    for name in facts["addresses"]},
+                "measurement_support": torch.full((1, 3), row > 0), "sample_recorded": torch.full((1, 3), row > 0),
+                "clock_support": torch.full((1, 3), row > 0), "interval_complete": torch.tensor([row > 0]),
+                "sample_begin_time_s": begin, "sample_end_time_s": begin+.02/3}
+
+        env.scene.hand_part_contact_facts = contacts
+        env.scene.hand_part_contact_interval_facts = interval
+        env.scene.physics_time_s = lambda: torch.tensor(
+            [1.25+int(command.reference_phase["motion_steps"].item())*.02], dtype=torch.float64)
+
+    success_manifest = record_reference_phase_fixture(tmp_path, binding, native=True, setup_scene=setup)
+    original_manifest = success_manifest.read_bytes()
+    first = json.loads(original_manifest)["saved"][0]
+    with np.load(success_manifest.parent / first["rollout"], allow_pickle=False) as old:
+        arrays = {key: old[key].copy() for key in old.files}
+    recorder = SimpleNamespace(rollout_arrays=lambda states, row: arrays if row == 0 else None)
+    authority = {"checkpoint": "/fixture/frozen-full", "source_revision": "fixture-source"}
+    manifest_path, motions = export_current_attempts(tmp_path / "frozen", recorder, [], [
+        {"evaluation_row": 0, "batch_index": 0, "env_index": 1, "motion_id": 0},
+        {"evaluation_row": 1, "batch_index": 1, "env_index": 0, "motion_id": 0}],
+        evaluation_id="frozen-fixture", env_step=123, frozen_authority=authority,
+        motion_names=["fixture", "missing"], num_per_motion=2, motion_file="fixture-motion.pt",
+        evaluation_report=tmp_path / "current-policy.json")
+    entry = motions[0]["attempts"][0]
+    with np.load(manifest_path.parent / entry["recording"]["rollout"], allow_pickle=False) as saved:
+        for key, value in arrays.items():
+            assert saved[key].dtype == value.dtype
+            np.testing.assert_array_equal(saved[key], value)
+        identity = json.loads(str(saved["evaluation_attempt_json"]))
+        assert identity == {"evaluation_id": "frozen-fixture", "attempt_id": "m00000-a00000", "motion_id": 0,
+            "replica_index": 0, "evaluation_row": 0, "env_step": 123, "frozen_authority": authority}
+        assert json.loads(str(saved["native_binding_json"]))["clips"]["fixture"]["prepared_time_ns"][0] == origin
+        np.testing.assert_array_equal(saved["recorded_motion_steps"], (0, 1, 2))
+        assert saved["command_motion_steps"][-1] == 2  # Keep actual clamped cursor distinct.
+        assert saved["native_physics_time_s"].dtype == np.float64
+        assert saved["hand_part_interval_sample_begin_time_s"].dtype == np.float64
+        assert saved["hand_part_interval_sample_recorded"].dtype == bool
+        assert not saved["hand_part_interval_sample_recorded"][0].any()
+        assert np.isnan(saved["hand_part_interval_normal_force_n"][0]).all()
+    assert motions[0]["attempts"][1]["recording"]["reason"] == "recorder_returned_no_factual_tape"
+    assert all(row["recording"]["reason"] == "attempt_not_evaluated" for row in motions[1]["attempts"])
+    assert export_success(success_manifest.parent, recorder, [], torch.tensor([True]), torch.tensor([0]),
+        99999, "fixture", motion_names=["fixture"]) == 0
+    assert success_manifest.read_bytes() == original_manifest

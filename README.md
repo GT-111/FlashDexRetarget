@@ -65,6 +65,10 @@ endpoint and ordinary DexForge reader reopening. The original `RolloutRecord`
 remains available.
 Success archives retain their first-success selection meaning; they are not a
 frozen final-policy evaluation or a qualification of a different physics backend.
+Explicit frozen evaluation can additionally retain every actual attempt through
+`evaluate(recording_dir=..., frozen_authority=...)`, with separate replica
+identity and unavailable slots. The [evaluation guide](docs/guide/flashdexretarget.md#evaluation)
+describes the selected recorder and checkpoint/source authority.
 
 The shared manager binds scene-owned tracking views after command/reference
 admission and before observations or rewards are constructed. Contact rows follow
