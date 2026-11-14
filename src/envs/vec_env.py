@@ -23,6 +23,7 @@ class FlatObsVecEnv(VectorEnv):
     def __init__(
         self,
         env: Any,
+        command: Any,
         to_numpy: bool = True,
         share_obs: bool = False,
         reward_heads: dict[str, Any] | None = None,
@@ -83,7 +84,7 @@ class FlatObsVecEnv(VectorEnv):
         self._head_checks_left = 0
         self._action_sides: dict[str, list[int]] = {}
         if reward_heads and bool(reward_heads.get("enable", False)):
-            self._setup_reward_heads(dict(reward_heads.get("overrides") or {}))
+            self._setup_reward_heads(dict(reward_heads.get("overrides") or {}), command)
             self._ep_head_returns = np.zeros((self.num_envs, len(self._head_names)), dtype=np.float32)
         # Optional obs-aux provider (obs compaction): called right after each obs compute.
         self._aux_fn: Any = None
@@ -101,11 +102,10 @@ class FlatObsVecEnv(VectorEnv):
         """Obs aux of the current state (None without a provider)."""
         return self._aux_now()
 
-    def _setup_reward_heads(self, overrides: dict[str, str]) -> None:
+    def _setup_reward_heads(self, overrides: dict[str, str], command: Any) -> None:
         """Map every active reward term to a hand side by its `_r_`/`_l_` name token (or an
         explicit override: right|left|both); untagged terms are split evenly across heads."""
-        cmd = self._env.command_manager.get_term("motion")
-        sides = list(cmd._side_list)
+        sides = list(command._side_list)
         if len(sides) < 2:
             raise ValueError(f"reward_heads needs a bimanual command, got sides {sides}.")
         rm = self._env.reward_manager
@@ -168,11 +168,12 @@ class FlatObsVecEnv(VectorEnv):
     def from_env(
         cls,
         env: Any,
+        command: Any,
         to_numpy: bool = True,
         share_obs: bool = False,
         reward_heads: dict[str, Any] | None = None,
     ) -> "FlatObsVecEnv":
-        return cls(env, to_numpy=to_numpy, share_obs=share_obs, reward_heads=reward_heads)
+        return cls(env, command, to_numpy=to_numpy, share_obs=share_obs, reward_heads=reward_heads)
 
     @property
     def unwrapped(self) -> Any:

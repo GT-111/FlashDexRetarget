@@ -598,3 +598,136 @@ def test_stock_isaac_curriculum_does_not_enter_native_static_admission():
             pytest.raises(ReachedStockDiscovery):
         create_envs(cfg, device="cpu")
     discover.assert_called_once()
+
+
+def _configured_native_runner(tmp_path, monkeypatch, command_name):
+    import gymnasium as gym
+    import numpy as np
+    from hydra import compose, initialize_config_dir
+    from mjlab.managers import ActionManager, CommandManager, RewardManager
+    from omegaconf import OmegaConf, open_dict
+    from test_native_reference import _pipeline_config, _prepared_native_dataset
+
+    import runner.off_policy_runner as runner_module
+    from envs import build_actions, build_commands, build_rewards
+    from envs.scene.native import bind_native_scene_config
+    from retarget.kinematic_retargeting import PreparedNativeInput
+
+    dataset, clip = _prepared_native_dataset(tmp_path)
+    PreparedNativeInput(dataset, _pipeline_config(dataset), 1, "native-reference.json").pack()
+    native = clip["native_reference"]
+    mesh = str(dataset / "objects/synthetic-mesh/visual.obj")
+    environment = {"FDR_NATIVE_SCENE_XML": "synthetic-not-read.xml",
+                   "FDR_NATIVE_USD_DIR": str(tmp_path),
+                   "FDR_NATIVE_BOX_BASE_MESH": mesh, "FDR_NATIVE_BOX_LID_MESH": mesh}
+    with patch.dict("os.environ", environment), initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "config"), version_base=None,
+    ):
+        OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
+        cfg = compose(config_name="native", overrides=[f"commands.name={command_name}",
+            f"commands.motion_file={dataset / 'motion.pt'}", "device=cpu", "num_envs=1",
+            f"run_dir={tmp_path / 'run'}"])
+        cfg.native_recording_binding = "synthetic-not-read-binding.json"
+        cfg.native_tracking_tolerances = {name: .1 for name in cfg.native_tracking_tolerances}
+        with open_dict(cfg.robot):
+            cfg.robot.native_scene = dict(
+                scene_xml_path="synthetic-not-read.xml",
+                hands=[dict(side=side, entity_name=side, root_body_name=body,
+                    root_joint_name=side + "_free", command_actuator_names=["command_" + side],
+                    root_control=dict(position_stiffness=0, position_damping=0,
+                        rotation_stiffness=0, rotation_damping=0,
+                        force_limit_n=None, torque_limit_nm=None))
+                    for side, body in native["root_body_names"].items()],
+                object=dict(entity_name=native["object_entity_name"], root_body_name="base",
+                    root_joint_name="object_free", parts=[dict(name=body, body_name=body, mesh_path=mesh)
+                        for body in native["object_part_body_names"]]))
+            cfg.robot.site_names = {kind: {side: [side + "_tip"] for side in ("left", "right")}
+                                    for kind in ("tip", "contact")}
+            cfg.robot.body_mapping = dict(all=[], level1={}, level2={})
+        bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=(0., 0., -9.81))
+        OmegaConf.resolve(cfg)
+    assert cfg.per_hand_actor_critic and cfg.runner.agent.reward_heads.enable
+
+    names = ("left_a", "left_mimic", "right_b")
+    command_joints = {"command_left": "left_a", "command_right": "right_b"}
+    robot = SimpleNamespace(num_joints=len(names), joint_names=names,
+        body_names=("left_root", "right_root"),
+        find_sites=lambda requested, preserve_order: ([0], requested),
+        find_joints_by_actuator_names=lambda requested: (
+            [names.index(command_joints[n]) for n in requested], [command_joints[n] for n in requested]),
+        native_command_limits=lambda requested: np.tile([-1., 1.], (len(requested), 1)),
+        data=SimpleNamespace(joint_pos=torch.zeros(1, 3), joint_vel=torch.zeros(1, 3),
+            joint_pos_target=torch.zeros(1, 3), body_link_pos_w=torch.zeros(1, 2, 3),
+            body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2]),
+            body_link_lin_vel_w=torch.zeros(1, 2, 3), body_link_ang_vel_w=torch.zeros(1, 2, 3)))
+    obj = SimpleNamespace(joint_names=("hinge_a", "hinge_b"), body_names=("base", "lid"),
+                         data=SimpleNamespace(joint_pos=torch.zeros(1, 2), joint_vel=torch.zeros(1, 2)))
+
+    class Scene(dict):
+        env_origins = torch.zeros(1, 3)
+
+    env = SimpleNamespace(num_envs=1, device="cpu", step_dt=.02,
+        scene=Scene(robot=robot, articulated_object=obj), cfg=SimpleNamespace(),
+        episode_length_buf=torch.zeros(1, dtype=torch.long))
+    # The name route does not depend on mesh queries, a solver, or a learned actor.
+    monkeypatch.setattr("utils.sdf.bake_object_sdf_grid", lambda *_a, **_kw: torch.zeros(4, 2, 2, 2))
+    env.command_manager = CommandManager(build_commands(cfg.commands), env)
+    command = env.command_manager.get_term(command_name)
+    assert type(command) is NativeMotionTrackingCommand
+    assert env.command_manager.active_terms == [command_name]
+    env.action_manager = ActionManager(build_actions(cfg.actions), env)
+    env.reward_manager = RewardManager(build_rewards(cfg.rewards, command_name=command_name,
+        entity_name=cfg.robot.entity_name), env)
+    observations = {name: torch.zeros(1, 2) for name in ("actor", "critic")}
+    env.single_observation_space = gym.spaces.Dict({name: gym.spaces.Box(-np.inf, np.inf, (2,), np.float32)
+                                                  for name in observations})
+    env.single_action_space = gym.spaces.Box(-np.inf, np.inf, (env.action_manager.total_action_dim,), np.float32)
+    env.observation_manager = SimpleNamespace(active_terms={name: ["synthetic"] for name in observations},
+        group_obs_term_dim={name: [(2,)] for name in observations})
+    env.reset = lambda: (observations, {})
+    received = []
+
+    def build_agent(_cfg, flat, info, name):
+        received.append((flat, info, name))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(runner_module, "build_agent", build_agent)
+    monkeypatch.setattr(runner_module.wandb, "run", None)
+    runner = runner_module.OffPolicyRunner(SimpleNamespace(unwrapped=env), cfg.runner, cfg.eval,
+                                         eval_env=SimpleNamespace())
+    return runner, command, env, received
+
+
+@pytest.mark.parametrize("command_name", ["native_transfer", "motion"])
+def test_configured_native_command_routes_real_runner_heads_and_early_reset(tmp_path, monkeypatch, command_name):
+    from omegaconf import OmegaConf
+
+    from envs.terminations import build_terminations
+
+    runner, command, env, received = _configured_native_runner(tmp_path, monkeypatch, command_name)
+    flat, info, used_name = received[0]
+    assert runner._train_cmd is command and flat is runner._train_env
+    assert used_name == command_name and info["reward_heads"] == command._side_list
+    action = next(iter(env.action_manager._terms.values()))
+    for side, indices in info["action_sides"].items():
+        assert indices == [i for i, owner in enumerate(action.action_sides) if owner == side]
+    env.reward_manager._step_reward[:] = torch.arange(1, len(env.reward_manager.active_terms) + 1)
+    total = env.reward_manager._step_reward.sum(-1) * env.step_dt
+    heads = flat._head_rewards(total)
+    torch.testing.assert_close(heads.sum(-1), total)
+
+    # This stock term also accepts the configured command through its existing builder.
+    terms = build_terminations(OmegaConf.create(dict(
+        _target_="envs.terminations.motion_tracking.MotionTrackingTerminations",
+        task_reward_early_reset=dict(params=dict(task_term="native_root_pose", threshold=.6, interval=5)),
+    )), command_name=command_name, entity_name="robot")
+    term = terms["task_reward_early_reset"]
+    assert term.params["command_name"] == command_name
+    index = env.reward_manager.active_terms.index("native_root_pose")
+    weight = env.reward_manager._term_cfgs[index].weight
+    for rate, expected in ((.7, False), (.1, True)):
+        env.reward_manager._step_reward[:, index] = rate * weight
+        for step in range(1, 7):
+            env.episode_length_buf[:] = step
+            fired = term.func(env, **term.params)
+            assert fired.tolist() == [expected and step == 6]

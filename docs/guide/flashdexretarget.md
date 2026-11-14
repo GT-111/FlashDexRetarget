@@ -149,6 +149,11 @@ real visuals, source meshes, colliders, inertials and joints are preserved.
 | `runner.agent.traj_encoder.enable` | `true` | Conv1D encoder over the next 10 reference frames |
 | `runner.agent.use_compile` / `use_amp` | `true` / `true` | `torch.compile` / mixed precision |
 
+`commands.name` selects the registered command. The runner passes that actual
+command to the flat observation/reward-head wrapper, so hand ownership follows
+its declared sides. Task-reward early reset uses the same injected command name.
+The default `motion` and a configured rename share the same rewards and thresholds.
+
 **Run length and checkpoints** (`config/runner/base.yaml`)
 
 | key | default | meaning |

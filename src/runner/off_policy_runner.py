@@ -53,20 +53,21 @@ class OffPolicyRunner:
         share_obs = bool(runner_cfg.get("share_actor_critic_obs", False))
 
         # ── envs ─────────────────────────────────────────────────────────────────────
-        heads_cfg = runner_cfg.agent.get("reward_heads", None)
-        self._train_env = FlatObsVecEnv.from_env(
-            env.unwrapped,
-            share_obs=share_obs,
-            reward_heads=OmegaConf.to_container(heads_cfg, resolve=True) if heads_cfg is not None else None,
-        )
-        self._eval_env = eval_env
-        # The TRAIN env's command term holds the curriculum state that resume_state.json records.
+        # The TRAIN command owns both hand sides and saved curriculum state.
         try:
             self._train_cmd = env.unwrapped.command_manager.get_term(
                 eval_cfg.command_name
             )
         except Exception:  # noqa: BLE001 - no command manager (non-tracking task)
             self._train_cmd = None
+        heads_cfg = runner_cfg.agent.get("reward_heads", None)
+        self._train_env = FlatObsVecEnv.from_env(
+            env.unwrapped,
+            command=self._train_cmd,
+            share_obs=share_obs,
+            reward_heads=OmegaConf.to_container(heads_cfg, resolve=True) if heads_cfg is not None else None,
+        )
+        self._eval_env = eval_env
         self._observations, env_infos = self._train_env.reset()
         self._just_reset = True  # no policy obs yet: the next step acts randomly
         self._nonfinite_steps = 0
