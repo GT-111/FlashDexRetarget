@@ -17,6 +17,7 @@ class MjWarpPlant(NativePlant):
         import mujoco_warp as mjw
         import warp as wp
 
+        wp.init()
         self._wp, self._mjw = wp, mjw
         selected = torch.device(device)
         self._torch_stream = torch.cuda.current_stream(selected) if selected.type == "cuda" else None

@@ -11,9 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import mujoco
 import numpy as np
+import pytest
 import torch
-from test_native_contract import _scene
-
 from envs import create_envs
 from simulator.mjcf_meta import load_robot_mjcf_meta
 from simulator.native.mjwarp import MjWarpPlant
@@ -27,6 +26,7 @@ from simulator.native.plant import (
 )
 from simulator.native.scene import NativeScene, NativeSim
 from simulator.runtime import launch_runtime
+from test_native_contract import _scene
 
 
 def _mechanics(tmp_path):
@@ -108,6 +108,49 @@ def test_world_root_wrench_and_body_velocity_match_actual_mujoco_charts(tmp_path
     np.testing.assert_allclose(native.numpy(), data.qvel[d:d + 6], atol=1e-12)
     # The authored left passive mimic remains outside the independent command width.
     assert load_robot_mjcf_meta(_layout.scene_xml_path).actuator_names == ["command_A", "command_B", "command_C"]
+
+
+def test_mjwarp_constructor_initializes_runtime_before_torch_stream_conversion():
+    events = []
+    initialized = False
+
+    class ReachedModelLoad(Exception):
+        pass
+
+    def initialize():
+        nonlocal initialized
+        events.append("warp_init")
+        initialized = True
+
+    stream = SimpleNamespace(cuda_stream=7, device=torch.device("cuda:0"))
+
+    def torch_stream(device):
+        assert device == stream.device
+        events.append("torch_stream")
+        return stream
+
+    def warp_stream(value):
+        # Warp's real Torch bridge reads context.runtime directly. This first
+        # constructor must initialize it rather than inherit another backend's.
+        if not initialized:
+            raise AttributeError("uninitialized Warp runtime before stream conversion")
+        assert value is stream
+        events.append("warp_stream")
+        return object()
+
+    def model_load(path):
+        assert path == "not-opened.xml"
+        events.append("model_load")
+        raise ReachedModelLoad
+
+    warp = SimpleNamespace(init=initialize, stream_from_torch=warp_stream)
+    with patch.dict(sys.modules, {"warp": warp, "mujoco_warp": SimpleNamespace()}), \
+            patch.object(torch.cuda, "current_stream", side_effect=torch_stream), \
+            patch.object(mujoco.MjModel, "from_xml_path", side_effect=model_load), \
+            pytest.raises(ReachedModelLoad):
+        MjWarpPlant(scene_xml_path="not-opened.xml", num_envs=2, sim_dt=.005,
+                    device="cuda:0", contact_pairs={}, nconmax=512, njmax=2048)
+    assert events == ["warp_init", "torch_stream", "warp_stream", "model_load"]
 
 
 def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_path):
