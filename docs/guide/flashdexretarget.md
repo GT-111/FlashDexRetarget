@@ -128,14 +128,32 @@ gather), so a GPU with less memory can run the same config. The buffer scales wi
 
 ## Stop / resume
 
-`kill -USR1 <pid>` finishes the iteration, saves `stop<N>/` (networks, replay buffer,
-`resume_state.json`) and exits. A periodic `step<N>/` holds the replay buffer only with
-`save_replay_buffer=true`, so pass it when the run may need to resume from one.
+`kill -USR1 <pid>` finishes the iteration, saves `stop<N>/` and exits. A full learning
+checkpoint contains networks and target critics, Adam and LR-scheduler states, the AMP scaler,
+reward-normalizer statistics, `replay_buffer.pt`, `learning_state.pt` and `resume_state.json`.
+A periodic `step<N>/` includes replay and learning state only with `save_replay_buffer=true`.
+Weights-only checkpoints remain usable for evaluation and policy initialization.
 
-Every checkpoint's `resume_state.json` records the env step, the wandb id and the curriculum state a resume
-needs; resume by passing `agent_load_path=<ckpt> buffer_load_path=<ckpt> step_offset=<N>
-logger.wandb.resume=true logger.wandb.resumeid=<id> ...` to the launcher. Eval and checkpoint points lie on
-an absolute env-step grid, so a resume does not shift them.
+Resume full learning with `agent_load_path=<ckpt> buffer_load_path=<ckpt> step_offset=<N>
+logger.wandb.resume=true logger.wandb.resumeid=<id> ...`, using the actual env step and wandb id in
+`resume_state.json`. The current full format requires matching world count, replay capacity, n-step
+length and gamma. `learning_state.pt` restores Python, NumPy, Torch CPU and visible CUDA generators,
+the independent Gym action sampler, and the adaptive curriculum's gains, histories and partial epoch.
+The visible CUDA layout must match. Eval and checkpoint points stay on the absolute env-step grid;
+the original LR horizon and optimizer age continue.
+
+Physical worlds and episodes start fresh. Per-world return carry, correlated exploration noise and
+pending n-step transitions are cleared, while learned and running statistics are retained. The replay
+stores explicit factual successors for the old fragment's edge, so new episodes cannot become its
+next states. The same sealing occurs when evaluation shares and resets the training worlds; the
+curriculum also drops its previous physical episode lengths while retaining global history. These
+semantics do not claim an identical simulator or CUDA-graph trajectory after restart.
+
+A replay save copies only occupied rows into independent CPU storage; it retains the configured live
+capacity and sampler. At high occupancy, allow host RAM and disk space for that complete occupied
+snapshot. The new run writes `learning-restored.pt` and `learning-restore.json` before collection so
+its actual restored RNG and curriculum state can be compared with the full checkpoint. Old replay
+files lacking the current fragment and learning state are not full learning resumes.
 
 ## Other algorithms
 
@@ -165,7 +183,7 @@ the run once every clip is archived.
 
 ```
 logs/flashsac/<run_name>-<MMDD-HHMMSS>/
-├── step<N>/         networks (+ replay_buffer.pt) + resume_state.json, every `save_checkpoint_per_env_step` env steps
+├── step<N>/         networks (+ replay_buffer.pt + learning_state.pt) + resume_state.json, every `save_checkpoint_per_env_step` env steps
 ├── stop<N>/         SIGUSR1 stop
 ├── final/           networks at the end of the run
 └── success/         first passing rollout per motion

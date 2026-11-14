@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections import deque
 from typing import TYPE_CHECKING
 
@@ -111,6 +112,8 @@ class XfrcAssistCurriculum:
         self._epoch_terminated = 0
         self._prev_ep_len: torch.Tensor | None = None
         self._last_epoch = -1
+        self._control_step_offset = 0
+        self._last_control_step = 0
 
         # group -> [(term index, weight)], resolved once the reward manager exists.
         self._term_idx: dict[str, list[tuple[int, float]]] | None = None
@@ -118,6 +121,57 @@ class XfrcAssistCurriculum:
         self._last_decayed = False
 
         # Seed the per-env gains so the pin uses them from step 0.
+        self._reset_object_gains()
+
+    # ── continuation ────────────────────────────────────────────────────
+
+    def reset_collection(self) -> None:
+        """Replace physical episodes without counting their old lengths as completions."""
+        self._prev_ep_len = None
+
+    def state_dict(self, common_step_counter: int | None = None) -> dict:
+        """Global adaptive state; physical episode lengths are not resumed."""
+        return copy.deepcopy({
+            "curr_gains": self.curr_gains,
+            "curr_gains_lower": self.curr_gains_lower,
+            "gain_history": self.gain_history,
+            "rew_deques": {key: list(values) for key, values in self.rew_deques.items()},
+            "ep_lens": list(self.ep_lens),
+            "completion_rates": list(self.completion_rates),
+            "num_epoch_since_last_decay": self.num_epoch_since_last_decay,
+            "epoch_rew_sum": self._epoch_rew_sum,
+            "epoch_steps": self._epoch_steps,
+            "epoch_achieved": self._epoch_achieved,
+            "epoch_timeout": self._epoch_timeout,
+            "epoch_terminated": self._epoch_terminated,
+            "last_epoch": self._last_epoch,
+            "last_decayed": self._last_decayed,
+            "control_step": (self._last_control_step if common_step_counter is None
+                             else int(common_step_counter) + self._control_step_offset),
+        })
+
+    def load_state_dict(self, state: dict, common_step_counter: int) -> None:
+        """Resume the adaptive clock against a freshly constructed physical world."""
+        state = copy.deepcopy(state)
+        self.curr_gains = state["curr_gains"]
+        self.curr_gains_lower = state["curr_gains_lower"]
+        self.gain_history = state["gain_history"]
+        self.rew_deques = {key: deque(values, maxlen=self.deque_len)
+                           for key, values in state["rew_deques"].items()}
+        self.ep_lens = deque(state["ep_lens"], maxlen=self.deque_len)
+        self.completion_rates = deque(state["completion_rates"], maxlen=self.deque_len)
+        self.num_epoch_since_last_decay = state["num_epoch_since_last_decay"]
+        self._epoch_rew_sum = state["epoch_rew_sum"]
+        self._epoch_steps = state["epoch_steps"]
+        self._epoch_achieved = state["epoch_achieved"]
+        self._epoch_timeout = state["epoch_timeout"]
+        self._epoch_terminated = state["epoch_terminated"]
+        self._last_epoch = state["last_epoch"]
+        self._last_decayed = state["last_decayed"]
+        self._last_control_step = state["control_step"]
+        self._control_step_offset = self._last_control_step - int(common_step_counter)
+        self.reset_collection()
+        self._term_idx = None
         self._reset_object_gains()
 
     # ── reward-term resolution ───────────────────────────────────────────
@@ -157,7 +211,8 @@ class XfrcAssistCurriculum:
 
         self._accumulate_step(env)
 
-        epoch_num = int(env.common_step_counter) // self.num_steps_per_env
+        self._last_control_step = int(env.common_step_counter) + self._control_step_offset
+        epoch_num = self._last_control_step // self.num_steps_per_env
         if epoch_num == self._last_epoch:
             return
         self._last_epoch = epoch_num

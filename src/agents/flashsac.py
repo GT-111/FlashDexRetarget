@@ -397,6 +397,9 @@ class FlashSACAgent(Agent):
         self._alg.replay_buffer.load(os.path.join(path, REPLAY_BUFFER_FILE))
         print(f"\033[32m[FlashSAC]\033[0m Successfully loaded replay buffer from {path}.")
 
+    def reset_collection(self) -> None:
+        self._alg.reset_collection()
+
     def _check_obs_layout(self, path: str) -> None:
         """Refuse a checkpoint whose obs layout differs from this env's: equal-width changes (merged
         future_traj window, split SDF terms) would otherwise load silently with permuted inputs."""

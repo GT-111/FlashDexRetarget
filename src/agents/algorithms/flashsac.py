@@ -112,6 +112,18 @@ class MultiHeadFlashSAC(FlashSAC):
         if self.reward_normalizer is not None:
             self.reward_normalizer.update_reward_stats(reward=rewards, terminated=terminated, truncated=truncated)
 
+    def reset_collection(self) -> None:
+        """Keep learned statistics while replacing the physical episode."""
+        self.replay_buffer.end_collection()
+        self._last_obs = None
+        self._last_actions = None
+        self._cached_noise = None
+        self._noise_repeat_n = 1
+        self._noise_repeat_count = 0
+        if self.reward_normalizer is not None:
+            state = self.reward_normalizer.state_dict()
+            self.reward_normalizer.load_state_dict({**state, "G_r": torch.zeros_like(state["G_r"])})
+
     def _sample_batch(self) -> dict:
         batch = super()._sample_batch()
         if self.obs_layout.compactor is not None:
