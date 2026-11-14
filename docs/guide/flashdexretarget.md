@@ -89,6 +89,21 @@ Native FREE-root scenes instead use `robot.native_scene` and named
 floating hands and passive articulated objects; the stock fixed-root URDF
 binding does not replace it.
 
+Stock USD collision overrides are installed after the scene owner makes nested
+references editable, before material binding and the first physics reset.
+Robot and parked-object edits precede environment cloning; per-world objects,
+including ghost spawns, receive the same selected configuration on their actual
+world path. Procedural support disks keep their direct installation. A `None`
+configuration or field preserves its existing no-override meaning.
+
+The SDK's spawn-time traversal skips instanced collision subtrees. Material
+binding alone cannot install properties that were skipped earlier. Applying the
+configured collision enable/contact/rest offsets after deinstance changes the
+realized physical recipe where those settings were previously ignored. Earlier
+learner/replay results require separate qualification on the corrected source.
+The native USD path supplies no such override and keeps its authored authority;
+this stock correction does not alter XML geometry or native pair-contact facts.
+
 ### Hydra overrides
 
 The defaults below come from `config/` (`envs/`, `runner/`, `eval/`, `logger/`); arguments to the launcher

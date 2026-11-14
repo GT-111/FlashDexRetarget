@@ -319,9 +319,8 @@ class SupportDiskAdapter:
         self._obj.reset(env_ids)
 
 
-def _apply_contact_material(stage, prim_path: str, mat_path: str) -> None:
-    """De-instance the subtree (holosoma recipe) then force-bind the material;
-    converted USDs hide colliders behind instanced references otherwise."""
+def _apply_contact_material(stage, prim_path: str, mat_path: str, collision_props=None) -> None:
+    """Make referenced colliders editable, install their selected properties/material."""
     from pxr import Usd
 
     prim = stage.GetPrimAtPath(prim_path)
@@ -335,6 +334,8 @@ def _apply_contact_material(stage, prim_path: str, mat_path: str) -> None:
         sub = stage.GetPrimAtPath(path)
         if sub:
             sub.SetInstanceable(False)
+    if collision_props is not None:
+        sim_utils.modify_collision_properties(prim_path, collision_props)
     from isaaclab.sim.utils import bind_physics_material
 
     bind_physics_material(prim_path, mat_path)
@@ -425,25 +426,30 @@ def build_isaac_scene(
     mdep = float(px.get("max_depenetration_velocity", 5.0))
     mimp = px.get("max_contact_impulse", None)
     mimp = None if mimp is None else float(mimp)
-    robot = Articulation(
-        _robot_articulation_cfg(
-            meta, robot_asset, bool(cfg.robot.get("self_collision", False)), pos_iters, vel_iters,
-            coff, roff, mdep, mimp,
-        )
+    robot_cfg = _robot_articulation_cfg(
+        meta, robot_asset, bool(cfg.robot.get("self_collision", False)), pos_iters, vel_iters,
+        coff, roff, mdep, mimp,
     )
-    _apply_contact_material(stage, "/World/envs/env_0/Robot", _MAT)
+    robot = Articulation(robot_cfg.replace(
+        spawn=robot_cfg.spawn.replace(collision_props=None)
+    ))
+    _apply_contact_material(
+        stage, "/World/envs/env_0/Robot", _MAT, robot_cfg.spawn.collision_props
+    )
     objects: dict[str, RigidObject] = {}
     if not per_env_mode:
         for slot, spec in enumerate(object_slots):
             park = object_park_position(slot)
-            objects[spec["entity_name"]] = RigidObject(
-                _object_rigid_cfg(
-                    spec["entity_name"], spec["usd_path"], park, pos_iters, vel_iters,
-                    float(spec.get("scale", 1.0)), coff, roff, mdep, mimp,
-                )
+            object_cfg = _object_rigid_cfg(
+                spec["entity_name"], spec["usd_path"], park, pos_iters, vel_iters,
+                float(spec.get("scale", 1.0)), coff, roff, mdep, mimp,
             )
+            objects[spec["entity_name"]] = RigidObject(object_cfg.replace(
+                spawn=object_cfg.spawn.replace(collision_props=None)
+            ))
             _apply_contact_material(
-                stage, f"/World/envs/env_0/{spec['entity_name']}", _MAT_OBJ
+                stage, f"/World/envs/env_0/{spec['entity_name']}", _MAT_OBJ,
+                object_cfg.spawn.collision_props,
             )
 
 
@@ -508,13 +514,14 @@ def build_isaac_scene(
                 )
                 c.func(
                     f"/World/envs/env_{i}/object_{side}",
-                    c,
+                    c.replace(collision_props=None),
                     translation=(0.0, 0.0, -3.0)
                     if ghost
                     else (0.0, 0.15 if side == "left" else 0.0, 0.2),
                 )
                 _apply_contact_material(
-                    stage, f"/World/envs/env_{i}/object_{side}", _MAT_OBJ
+                    stage, f"/World/envs/env_{i}/object_{side}", _MAT_OBJ,
+                    c.collision_props,
                 )
         # Verify per-env spawns landed: a reference clone would compose env_0's
         # object everywhere and the spawner would skip silently.
