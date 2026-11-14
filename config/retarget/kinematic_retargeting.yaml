@@ -8,6 +8,7 @@ dataset: ???
 robot: xhand
 workers: null   # null: half the CPU cores
 usd_gpu: 0
+usd_kit_args: ""   # operator-supplied Kit arguments, forwarded by the existing converter
 
 steps:
   convex: true

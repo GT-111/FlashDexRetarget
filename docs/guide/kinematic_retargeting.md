@@ -118,6 +118,15 @@ penetration is kept. Clips are kept but flagged in `report.csv` (`flags`) on:
 - `usd`: object USDs for Isaac Sim.
 - `sdf`: object SDF grids (`sdf.grid_n`, `sdf.extent`), which must match `commands.object.sdf` of training.
 
+USD conversion inherits the operator's `OMNI_KIT_ACCEPT_EULA` environment value.
+Set it after accepting NVIDIA's terms; the pipeline does not create acceptance.
+`usd_gpu` selects the CUDA visibility mask for the existing converter process.
+`usd_kit_args` (default `""`) forwards extra AppLauncher arguments as one command
+argument. When CUDA and graphics ordinals differ, the resource owner can pass,
+for example, `'usd_kit_args="--/renderer/activeGpu=1"'`. Use the actual Kit GPU
+table and allocation to choose that ordinal; the CUDA mask alone does not
+constrain graphics contexts.
+
 ### `motion.pt` contents
 
 Per-frame arrays are concatenated over clips; clip `i` covers frames `length_starts[i]` to

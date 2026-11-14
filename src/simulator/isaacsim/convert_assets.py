@@ -383,6 +383,7 @@ def convert_robot(force: bool, collision_visual: bool = False, variant: str = "r
     usd_path = os.path.join(out_dir, f"{robot}_{variant}{suffix}.usd")
     if not force and _up_to_date(usd_path, [src_urdf]):
         _log(f"up to date, skipping: {usd_path}")
+        _block_empty_robot_visual_references(usd_path, src_urdf)
         return
     urdf_src = src_urdf
     if collision_visual:
@@ -410,9 +411,38 @@ def convert_robot(force: bool, collision_visual: bool = False, variant: str = "r
     )
     converter = UrdfConverter(cfg)
     _log(f"converted robot -> {converter.usd_path}")
+    _block_empty_robot_visual_references(converter.usd_path, urdf_src)
     sides = ("right", "left") if variant == "bimanual" else (variant,)
     verify_usd(converter.usd_path, expect_links=[f"track_hand_{s}_{f}_tip" for s in sides
                                                 for f in ("thumb", "index", "middle", "ring", "pinky")])
+
+
+def _block_empty_robot_visual_references(usd_path: str, urdf_path: str) -> list[str]:
+    """Block importer references for URDF links that have no visual geometry.
+
+    Isaac Sim 5.1 creates a reference to ``/visuals/<link>`` even for empty
+    wrist-chain and tip frames. The target does not exist, so every cloned hand
+    repeats a composition warning. A stronger empty reference list removes only
+    that arc; physical link, joint, tip and collision prims are left untouched.
+    """
+    from pxr import Usd
+
+    stage = Usd.Stage.Open(usd_path)
+    root_path = stage.GetDefaultPrim().GetPath()
+    blocked = []
+    with Usd.EditContext(stage, stage.GetRootLayer()):
+        for link in ET.parse(urdf_path).getroot().findall("link"):
+            if link.find("visual") is not None:
+                continue
+            path = root_path.AppendChild(link.attrib["name"]).AppendChild("visuals")
+            prim = stage.GetPrimAtPath(path)
+            if prim:
+                # ClearReferences would expose the same weaker importer arc.
+                prim.GetReferences().SetReferences([])
+                blocked.append(str(path))
+    stage.GetRootLayer().Save()
+    _log(f"blocked {len(blocked)} empty URDF visual reference paths")
+    return blocked
 
 
 def verify_usd(usd_path: str, expect_links: list[str] | None = None) -> None:

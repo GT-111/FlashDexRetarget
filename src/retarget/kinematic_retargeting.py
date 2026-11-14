@@ -74,11 +74,12 @@ def main(cfg: DictConfig) -> None:
             build(retargeted, dataset, fps, cfg.pack, names={p.stem for p in kept})
     if steps.usd:
         _log("usd: <object>/.isaac_usd/object.usd")
-        # One Kit process on one GPU: the conversion is CPU work, and Kit otherwise spans every visible GPU.
-        env = dict(os.environ, OMNI_KIT_ACCEPT_EULA="1", MUJOCO_GL=os.environ.get("MUJOCO_GL", "disabled"),
+        # CUDA and graphics ordinals can differ; the operator supplies Kit's mapping.
+        env = dict(os.environ, MUJOCO_GL=os.environ.get("MUJOCO_GL", "disabled"),
                    CUDA_VISIBLE_DEVICES=str(cfg.usd_gpu))
         subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "simulator/isaacsim/convert_assets.py"),
-                        "--data-root", str(dataset.resolve()), "--objects", *ids], env=env, check=True)
+                        "--data-root", str(dataset.resolve()), "--objects", *ids,
+                        "--kit_args=" + str(cfg.usd_kit_args)], env=env, check=True)
     if steps.sdf and not motion.exists():
         _log(f"sdf: skipped, no {motion} yet")
     elif steps.sdf:

@@ -148,6 +148,13 @@ replacement. `scripts/setup.sh` continues to create the author Isaac environment
 
 ## Setup
 
+Before the first Isaac import or USD conversion, read and accept the
+[Isaac Sim license](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/common/licenses-isaac-sim.html)
+and [Omniverse terms](https://docs.omniverse.nvidia.com/enterprise/latest/common/NVIDIA_Omniverse_License_Agreement.html).
+After accepting, export `OMNI_KIT_ACCEPT_EULA=YES` in the operator's shell;
+setup and launchers inherit that choice. On Ubuntu headless hosts, install
+the required GLU system library with `sudo apt-get install libglu1-mesa`.
+
 ```sh
 git clone --recursive https://github.com/Holiday-Robot/FlashDexRetarget.git
 cd FlashDexRetarget
@@ -164,14 +171,16 @@ and the XHAND and Sharpa Wave USDs.
 <details>
 <summary>Troubleshooting</summary>
 
-- Export `OMNI_KIT_ACCEPT_EULA=1` in every shell that imports Isaac Sim (the launchers do); otherwise
+- Keep the accepted `OMNI_KIT_ACCEPT_EULA` in every shell that imports Isaac Sim; otherwise
   even `import isaacsim` waits for a EULA prompt and dies with `EOF when reading a line`.
 - No `libEGL` (headless servers): `export MUJOCO_GL=disabled`.
-- A corrupted shader cache after an interrupted first boot: `rm -rf ~/.cache/ov/Kit`.
+- Keep Kit caches in task-owned node-local storage. Remove a cache only after
+  its task has stopped and no reader uses it; shared HOME caches may serve other jobs.
 - `simulation_app.close()` segfaults on isaacsim 5.1, so the runner exits with `os._exit`; a non-zero
   exit code at the very end of a finished run is expected.
-- `Unresolved reference prim path ... configuration/*_base.usd` warnings while the scene builds concern
-  visual meshes only; physics loads.
+- Empty URDF links can produce unresolved visual references. The converter
+  blocks those empty references while preserving real visuals and the physical
+  graph; generated files alone do not establish successful physics execution.
 - Out of GPU memory: `runner.agent.buffer_device_type=cpu`, or a smaller `runner.agent.buffer_max_length`
   ([GPU memory](docs/guide/flashdexretarget.md#gpu-memory)).
 

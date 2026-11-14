@@ -4,6 +4,7 @@ sim:
   _target_: simulator.isaacsim.create.create_envs_isaac
   runtime_launcher: simulator.isaacsim.runtime.launch
   backend: isaacsim
+  kit_args: ""   # operator-supplied Kit arguments; graphics ordinals can differ from masked CUDA
   dt: 0.0041666667
   robot_gravcomp: 0.0   # fraction of robot link weight lifted at the COM (MJCF uses 0.8)
 

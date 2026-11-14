@@ -10,7 +10,12 @@ class IsaacRuntime:
     def __init__(self, cfg):
         from isaaclab.app import AppLauncher
 
-        self.launcher = AppLauncher({"headless": bool(cfg.get("headless", True))})
+        self.launcher = AppLauncher({
+            "headless": bool(cfg.get("headless", True)),
+            "device": str(cfg.device),
+            "multi_gpu": False,
+            "kit_args": str(cfg.sim.kit_args),
+        })
 
     def close(self):
         # Isaac Sim 5.1 segfaults in app.close(); the normal runner has flushed.

@@ -76,7 +76,7 @@ source "\$(conda info --base)/etc/profile.d/conda.sh"
 conda activate $CONDA_ENV
 
 export MUJOCO_GL=\${MUJOCO_GL:-disabled}
-export OMNI_KIT_ACCEPT_EULA=1
+# Isaac license acceptance is supplied by the operator's shell.
 # The xhand_spec robot the flashdexretarget policies are trained on (assets/robot/xhand/urdf/converted_spec).
 export FDR_ROBOT_USD=\${FDR_ROBOT_USD:-$PROJECT_DIR/assets/robot/xhand/urdf/converted_spec/xhand_bimanual_spec.usd}
 PROJECT_DIR=$PROJECT_DIR
@@ -92,7 +92,7 @@ convert_robot() {   # <usd> <convert_assets.py args>
         echo "[setup] $(basename "$usd") exists"
     else
         echo "[setup] converting $(basename "$usd" .usd) URDF to USD"
-        MUJOCO_GL=disabled OMNI_KIT_ACCEPT_EULA=1 python src/simulator/isaacsim/convert_assets.py --robot "$@"
+        MUJOCO_GL=disabled python src/simulator/isaacsim/convert_assets.py --robot "$@"
     fi
 }
 if [ "$SKIP_ASSETS" = 1 ]; then

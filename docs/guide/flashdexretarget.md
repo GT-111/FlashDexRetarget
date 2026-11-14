@@ -45,7 +45,16 @@ are applied last.
 | `num_envs` | `2048` | parallel environments |
 | `seed` | `42` | random seed |
 | `device` | `cuda:0` | simulation and learner device |
+| `sim.kit_args` | `""` | extra arguments forwarded to the existing Isaac AppLauncher, including the graphics-device selection |
 | `episode_length_s` | `20.0` | episode time limit; an episode also ends with its clip |
+
+With a CUDA visibility mask, `device` addresses the visible CUDA devices while
+Kit's renderer ordinal can refer to the full physical GPU table. The resource
+owner supplies that mapping through `sim.kit_args`, for example
+`'sim.kit_args="--/renderer/activeGpu=1"'` when the selected graphics device is
+ordinal 1 and its masked physics device is `cuda:0`. An empty string preserves
+AppLauncher's default mapping. A CUDA mask alone does not isolate graphics
+contexts; include any auxiliary context in the owning allocation's budget.
 
 **Learner** (`config/runner/flashsac.yaml`)
 
