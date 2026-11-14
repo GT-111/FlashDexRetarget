@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import tempfile
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +27,8 @@ def evaluate(
     ever_state: dict | None = None,
     success_dir: Path | None = None,
     env_step: int = 0,
+    *,
+    outcome_dir: Path,
 ) -> dict[str, float]:
     """Roll the deterministic policy through every eval batch, then turn the callback
     states into metrics."""
@@ -41,7 +47,100 @@ def evaluate(
         raw_eval, eval_cfg, callbacks, states, ever_state,
         success_dir if save_success else None, env_step,
     ))
+    write_current_policy_outcomes(agent, raw_eval, eval_cfg, callbacks, states, metrics,
+                                  outcome_dir=outcome_dir, env_step=env_step)
     return {f"eval/{k}": float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
+
+
+def _json_value(value):
+    if torch.is_tensor(value):
+        return _json_value(value.detach().cpu().tolist())
+    if isinstance(value, dict):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    return value
+
+
+def _outcome_row(columns, index):
+    return {key: (_outcome_row(value, index) if isinstance(value, dict)
+                  else value[index] if isinstance(value, list) else value)
+            for key, value in columns.items()}
+
+
+def write_current_policy_outcomes(
+    agent, raw_eval, eval_cfg, callbacks, states, metrics, *, outcome_dir: Path, env_step: int,
+) -> Path:
+    """Persist every current attempt separately from first/ever-success selection."""
+    library = raw_eval.command_manager.get_term(eval_cfg.command_name).motion_lib
+    names = _motion_names(library)
+    motions = [{"motion_id": motion_id, "motion_name": names[motion_id] if names else None,
+                "callbacks": {}} for motion_id in range(int(library.num_trajectories))]
+    callback_metadata = {}
+    for callback_index, callback in enumerate(callbacks):
+        if id(callback) not in states or not hasattr(callback, "current_policy_outcomes"):
+            continue
+        key = f"{callback_index}:{type(callback).__module__}.{type(callback).__qualname__}"
+        outcome = callback.current_policy_outcomes(states[id(callback)])
+        callback_metadata[key] = _json_value(outcome["metadata"])
+        columns = _json_value(outcome["columns"])
+        for row_index, motion_id in enumerate(outcome["motion_ids"].detach().cpu().tolist()):
+            row = _outcome_row(columns, row_index)
+            row["evaluation_row"] = row_index
+            for criterion in ("full", "object"):
+                failed = row.get(f"{criterion}_failed")
+                if failed is not None:
+                    finite = row.get(f"{criterion}_finite_metrics", row.get("finite_metrics", True))
+                    if not row["scored"]:
+                        row[f"{criterion}_status"] = ["unscored"] * len(failed)
+                    elif not finite:
+                        row[f"{criterion}_status"] = ["nonfinite"] * len(failed)
+                    else:
+                        row[f"{criterion}_status"] = ["fail" if flag else "pass" for flag in failed]
+            motions[motion_id]["callbacks"].setdefault(key, {"attempts": []})["attempts"].append(row)
+        for motion in motions:
+            result = motion["callbacks"].setdefault(key, {"attempts": []})
+            rows = result["attempts"]
+            result["attempt_count"] = len(rows)
+            result["scored_attempt_count"] = sum(bool(row["scored"]) for row in rows)
+            result["unscored_attempt_count"] = len(rows) - result["scored_attempt_count"]
+            result["coverage"] = "not_evaluated" if not rows else "observed" if result["scored_attempt_count"] else "unscored"
+            for criterion in ("full", "object"):
+                statuses = [row[f"{criterion}_status"] for row in rows if f"{criterion}_status" in row]
+                if statuses:
+                    result[f"{criterion}_threshold_counts"] = [
+                        {status: sum(row[index] == status for row in statuses)
+                         for status in ("pass", "fail", "unscored", "nonfinite")}
+                        for index in range(len(statuses[0]))
+                    ]
+    recorded_at = datetime.now(timezone.utc)
+    report = {
+        "selection": "current_policy_all_attempts; independent of first_success_ever archive",
+        "policy_authority": {"kind": "current_in_memory_agent", "deterministic": True,
+                             "agent_class": f"{type(agent).__module__}.{type(agent).__qualname__}",
+                             "training_env_step": int(env_step),
+                             "checkpoint_mapping": "Normal post-evaluation FULL/operation receipt; no checkpoint is inferred here"},
+        "recorded_UTC": recorded_at.isoformat(),
+        "motion_file": getattr(library, "motion_file", None),
+        "selected_motion_count": len(motions), "configured_replicas_per_motion": int(eval_cfg.num_per_motion),
+        "selected_archive_criterion": str(eval_cfg.get("success_criterion", "obj")),
+        "callback_metadata": callback_metadata, "motions": motions,
+        "ordinary_aggregate_metrics": _json_value(metrics),
+        "aggregate_note": "Original aggregate reduction/fallback and SR thresholds remain unchanged; attempt denominators are explicit",
+        "physical_task_or_BOX_success": "UNQUALIFIED by generic tracking or SDF/contact association metrics",
+    }
+    outcome_dir = Path(outcome_dir)
+    outcome_dir.mkdir(parents=True, exist_ok=True)
+    destination = outcome_dir / f"current-policy-{int(env_step):012d}-{recorded_at:%Y%m%dT%H%M%S%fZ}.json"
+    with tempfile.NamedTemporaryFile(mode="w", dir=outcome_dir, prefix=".current-policy-", delete=False) as stream:
+        json.dump(report, stream, indent=2, allow_nan=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(stream.name, destination)
+    return destination
 
 
 # ─── rollout ───────────────────────────────────────────────────────────────────

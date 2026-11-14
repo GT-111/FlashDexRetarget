@@ -269,6 +269,7 @@ class OffPolicyRunner:
             self._agent, self._eval_env, self._eval_cfg, self._device,
             ever_state=self._eval_ever_state, success_dir=self._success_dir,
             env_step=env_step,
+            outcome_dir=self._save_path_base / "evaluation",
         )
 
     def _all_solved(self, eval_metrics: dict[str, float], env_step: int) -> bool:

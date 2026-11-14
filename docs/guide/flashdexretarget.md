@@ -350,6 +350,22 @@ Each clip that passes SR@1.0 (`eval.success_criterion`, default `obj`) is archiv
 `<run>/success/` (`manifest.json` + one rollout `.npz` per motion), and `eval.stop_when_all_solved` ends
 the run once every clip is archived.
 
+Each evaluation also writes `evaluation/current-policy-<env-step>-<UTC>.json`
+under `runner.run_dir`. It includes every selected library motion and every
+observed attempt, including failures, unscored windows and motions absent from
+the plan. Raw metrics, configured thresholds and observed denominators remain
+available; per-motion counts retain all replicas. Existing aggregate metrics
+and SR thresholds stay unchanged. Nonfinite and unsupported operands remain
+explicit, and an empty observation window is not a measured pass.
+
+These reports describe the deterministic in-memory policy at the recorded env
+step, separately from first-passing archives and cumulative ever-success. Bind
+the evaluated policy to its normal post-evaluation FULL through the publication
+receipt; the report infers no checkpoint path. Include `evaluation/` in durable
+run publication. Periodic and final evaluations at the same env step retain
+separate timestamped reports. Native reference tracking and net-link-force/SDF
+association do not certify physical interaction or articulated BOX success.
+
 ## Outputs
 
 ```
@@ -360,6 +376,7 @@ the run once every clip is archived.
 ├── stop<N>/         committed FULL plus consumed stop.request
 ├── final/           networks at the end of the run
 ├── success/         first passing rollout per motion
+├── evaluation/      current-policy per-motion/attempt JSONs, including failures
 ├── learning-restored.pt    actual restored RNG/curriculum before resumed collection
 └── learning-restore.json   restoration scope (last two files on FULL resume)
 ```
@@ -386,5 +403,5 @@ OffPolicyRunner ──► agents.Agent (runner.agent.class_name) — FlashSAC: s
         │ every eval.interval (20M) env steps
         ▼
 evaluation/evaluate.py: deterministic rollout over every clip ──► SR@k, ever-success,
-                        success archive (first passing clip per motion)
+                        current-policy attempts, success archive (first passing clip per motion)
 ```

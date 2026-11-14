@@ -57,6 +57,7 @@ class TrackingPerformance:
         self.valid_steps_per_env = (
             self.cmd.motion_num_frames - self.cmd.motion_steps
         ).clamp(min=0)
+        self.motion_start_steps = self.cmd.motion_steps.clone()
         self.rollout_steps = max(1, int(self.valid_steps_per_env.max().item()))
         self.eval_end = max(self.grace_steps + 1, self.rollout_steps)
         self.threshold_ks_tensor = torch.tensor(self.threshold_ks, device=self.device)
@@ -191,6 +192,7 @@ class TrackingPerformance:
             "spider_pos": sp_pos[sel] if sp_pos is not None else None,
             "spider_rot": sp_rot[sel] if sp_rot is not None else None,
             "motion_ids": self.cmd.motion_ids[sel].clone(),
+            "motion_start_steps": self.motion_start_steps[sel].clone(),
             "metric_sums": {b: self.metric_sums[b][sel] for b in self.per_side_keys},
             "tip_trans_sums": (
                 self.tip_trans_sums[sel] if self.tip_trans_sums is not None else None
@@ -212,6 +214,7 @@ class TrackingPerformance:
                 torch.cat([s["spider_rot"] for s in states], dim=0) if has_sp else None
             ),
             "motion_ids": torch.cat([s["motion_ids"] for s in states], dim=0),
+            "motion_start_steps": torch.cat([s["motion_start_steps"] for s in states], dim=0),
             "metric_sums": {
                 base: torch.cat([s["metric_sums"][base] for s in states], dim=0)
                 for base in self.per_side_keys
@@ -326,6 +329,39 @@ class TrackingPerformance:
     def per_env_motion_ids(self, states: list[dict[str, Any]]) -> torch.Tensor:
         """Motion id per env in the same order as the per-env flags."""
         return self._concat(states)["motion_ids"]
+
+    def current_policy_outcomes(self, states: list[dict[str, Any]]) -> dict:
+        """Actual attempt operands; do not apply aggregate empty-window fallback."""
+        cat = self._concat(states)
+        count = cat["count_per_env"]
+        errors = self._side_errors(cat, count.clamp(min=1.0))
+        finite = torch.stack([torch.isfinite(value).all(-1) for value in errors.values()]).all(0)
+        object_finite = torch.isfinite(errors["obj_trans"]).all(-1) & torch.isfinite(errors["obj_rot_deg"]).all(-1)
+        return {
+            "motion_ids": cat["motion_ids"],
+            "metadata": {
+                "meaning": "current source-reference tracking, not physical interaction success",
+                "side_prefixes": self.side_prefixes, "finger_names": self.finger_names,
+                "grace_steps": self.grace_steps, "threshold_ks": self.threshold_ks,
+                "thresholds": self.thresholds, "absolute_object_criteria": self.obj_criteria,
+                "spider_thresholds": {"position_m": self.spider_pos_m, "rotation_rad": self.spider_rot_rad},
+                "error_units": {"obj_trans": "m", "obj_rot_deg": "deg", "tip_trans": "m", "joint_trans": "m"},
+                "scored_basis": "observed in-window count > 0; no aggregate fallback",
+            },
+            "columns": {
+                "motion_start_step": cat["motion_start_steps"],
+                "remaining_source_steps": cat["valid_steps_per_env"],
+                "observed_steps": count, "scored": count > 0,
+                "full_finite_metrics": finite, "object_finite_metrics": object_finite,
+                "full_failed": self._per_env_fail(cat, count.clamp(min=1.0)),
+                "object_failed": self._per_env_fail_obj(cat, count.clamp(min=1.0)),
+                "per_side_mean_errors": errors,
+                "raw_metric_sums": cat["metric_sums"], "raw_tip_trans_sums": cat["tip_trans_sums"],
+                "raw_action_rate_sum": cat["action_rate_sum"],
+                "spider_position_m": cat["spider_pos"], "spider_rotation_rad": cat["spider_rot"],
+                "spider_pass": self._spider_ok(cat),
+            },
+        }
 
     def reduce_state(self, states: list[dict[str, Any]]) -> dict[str, float]:
         """SR@k + per-side error metrics over the concatenation of per-batch states.
@@ -445,6 +481,7 @@ class NativeArticulatedTrackingPerformance:
         # the first issued endpoint even at dt=0. The cursor is the next target,
         # not the achieved reset frame; the final endpoint still needs scoring.
         self.valid_steps = (command.motion_num_frames - command.motion_steps).clamp_min(0)
+        self.motion_start_steps = command.motion_steps.clone()
         self.rollout_steps = int(self.valid_steps.max())
         self.t = 0
         self.groups = {
@@ -488,13 +525,33 @@ class NativeArticulatedTrackingPerformance:
 
     def collect_state(self, active_mask=None):
         rows = slice(None) if active_mask is None else active_mask
-        return {
+        result = {
             group: {k: v[rows].clone() for k, v in fields.items()}
             for group, fields in (
                 ("sums", self.sums),
                 ("maxima", self.maxima),
                 ("masses", self.masses),
             )
+        }
+        result.update(motion_ids=self.cmd.motion_ids[rows].clone(),
+                      motion_start_steps=self.motion_start_steps[rows].clone(),
+                      valid_steps=self.valid_steps[rows].clone())
+        return result
+
+    def current_policy_outcomes(self, states):
+        raw = {group: {key: torch.cat([s[group][key] for s in states]) for key in self.groups}
+               for group in ("sums", "maxima", "masses")}
+        supported = torch.stack([mass.sum(-1) > 0 for mass in raw["masses"].values()]).any(0)
+        finite = torch.stack([torch.isfinite(value).all(-1) for value in raw["sums"].values()]).all(0)
+        return {
+            "motion_ids": torch.cat([s["motion_ids"] for s in states]),
+            "metadata": {"meaning": "supported native reference errors; no contact/task success",
+                         "grace_steps": self.grace_steps,
+                         "feature_names": {key: names for key, (names, _) in self.groups.items()},
+                         "scored_basis": "at least one observed supported feature; measurement only"},
+            "columns": {"motion_start_step": torch.cat([s["motion_start_steps"] for s in states]),
+                        "remaining_source_steps": torch.cat([s["valid_steps"] for s in states]),
+                        "scored": supported, "finite_metrics": finite, **raw},
         }
 
     def reduce_state(self, states):
@@ -574,6 +631,21 @@ class NativeReferenceTrackingPerformance(NativeArticulatedTrackingPerformance):
 
     def per_env_scored(self, states):
         return torch.cat([(s["observed_steps"] > 0) & ~s["missing"] for s in states])
+
+    def current_policy_outcomes(self, states):
+        result = super().current_policy_outcomes(states)
+        result["metadata"].update(
+            meaning=self.success_criterion_label, thresholds=self.thresholds,
+            threshold_ks=list(self.threshold_ks),
+            scored_basis="observed steps > 0 and no missing required support; native reference tracking only",
+        )
+        result["columns"].update(
+            scored=self.per_env_scored(states), full_failed=self.per_env_fail(states),
+            object_failed=self.per_env_fail_obj(states),
+            observed_steps=torch.cat([s["observed_steps"] for s in states]),
+            missing_required_support=torch.cat([s["missing"] for s in states]),
+        )
+        return result
 
     def reduce_state(self, states):
         result = super().reduce_state(states)

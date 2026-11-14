@@ -30,6 +30,9 @@ class ContactPerformance:
         self.valid_steps_per_env = (
             self.cmd.motion_num_frames - self.cmd.motion_steps
         ).clamp(min=0)
+        self.motion_start_steps = self.cmd.motion_steps.clone()
+        metadata_reader = getattr(env.scene, "tracking_contact_metadata", None)
+        self.measurement_metadata = metadata_reader() if metadata_reader is not None else None
         self.scored_env_mask = self.valid_steps_per_env > self.grace_steps
         if not torch.any(self.scored_env_mask):
             self.scored_env_mask = torch.ones(
@@ -59,6 +62,7 @@ class ContactPerformance:
         self.count_contact = _z()
         self.miss_counter = _z()
         self.miss_max = _z()
+        self.count_per_env = torch.zeros(self.num_envs, device=self.device)
         self.t = 0
 
     def on_step(self, env: Any) -> None:
@@ -70,6 +74,7 @@ class ContactPerformance:
         self.t += 1
         if not torch.any(in_window):
             return
+        self.count_per_env += in_window.to(self.count_per_env.dtype)
 
         cmd = self.cmd
         valid_mask = in_window[:, None].to(torch.float32)
@@ -102,6 +107,9 @@ class ContactPerformance:
         Raw ``valid_steps_per_env`` lets scored basis + fallback span the full concat."""
         sel = slice(None) if active_mask is None else active_mask
         return {
+            "motion_ids": self.cmd.motion_ids[sel].clone(),
+            "motion_start_steps": self.motion_start_steps[sel].clone(),
+            "count_per_env": self.count_per_env[sel],
             "sum_ref_dist": self.sum_ref_dist[sel],
             "sum_pen": self.sum_pen[sel],
             "sum_force": self.sum_force[sel],
@@ -109,6 +117,28 @@ class ContactPerformance:
             "count_contact": self.count_contact[sel],
             "miss_max": self.miss_max[sel],
             "valid_steps_per_env": self.valid_steps_per_env[sel],
+        }
+
+    def current_policy_outcomes(self, states: list[dict[str, Any]]) -> dict:
+        cat = {key: torch.cat([state[key] for state in states]) for key in states[0]}
+        return {
+            "motion_ids": cat["motion_ids"],
+            "metadata": {
+                "meaning": "existing reference-contact gated sensor measurements, not a task-success criterion",
+                "side_prefixes": self.side_prefixes, "finger_names": self.finger_names,
+                "grace_steps": self.grace_steps, "sensor_measurement_authority": self.measurement_metadata,
+                "pair_force_authority": "Only the backend metadata can establish pair-force support; SDF found/proximity and net-link force cannot",
+                "denominators": {"ref_distance": "count_ref", "found_fraction": "count_ref",
+                                 "penetration_and_force": "count_contact"},
+            },
+            "columns": {
+                "motion_start_step": cat["motion_start_steps"],
+                "remaining_source_steps": cat["valid_steps_per_env"],
+                "observed_steps": cat["count_per_env"], "scored": cat["count_per_env"] > 0,
+                "raw_sum_ref_distance_m": cat["sum_ref_dist"], "raw_sum_penetration_m": cat["sum_pen"],
+                "raw_sum_sensor_force_N": cat["sum_force"], "reference_contact_count": cat["count_ref"],
+                "associated_contact_count": cat["count_contact"], "max_miss_streak_steps": cat["miss_max"],
+            },
         }
 
     def reduce_state(self, states: list[dict[str, Any]]) -> dict[str, float]:
