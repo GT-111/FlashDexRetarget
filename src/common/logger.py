@@ -100,9 +100,8 @@ def _resolve_tags(tags_cfg) -> list[str]:
 
 
 def log_metrics(metrics: dict[str, float], step: int) -> None:
-    """Log to wandb (initialized by ``setup_logger``); echo a short head to stdout."""
+    """Log every supplied scalar to wandb and stdout without rounding."""
     if not metrics:
         return
     wandb.log(metrics, step=step)
-    head = {k: round(v, 4) for k, v in list(metrics.items())[:8]}
-    print(f"[train] step={step} {head}")
+    print(f"[train] step={step} {metrics}", flush=True)

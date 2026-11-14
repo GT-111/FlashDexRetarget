@@ -24,6 +24,27 @@ from envs.curriculum.assist import XfrcAssistCurriculum
 from runner.off_policy_runner import LEARNING_STATE_FILE, OffPolicyRunner
 
 
+def test_log_metrics_preserves_all_scalar_values_in_stdout_and_wandb(monkeypatch, capsys):
+    import common.logger as logger
+
+    metrics = {f"episode/reward_{index}": index + .123456789 for index in range(10)}
+    metrics.update({"actor/loss": 1.234567890123456e-8, "critic/loss": .9876543210987654,
+                    "temperature/value": 2.345678901234567e-7})
+    before = metrics.copy()
+    calls = []
+
+    def wandb_log(values, *, step):
+        assert values is metrics and values == before
+        calls.append((values, step))
+
+    monkeypatch.setattr(logger.wandb, "log", wandb_log)
+    logger.log_metrics(metrics, step=19_998_720)
+
+    assert len(calls) == 1 and calls[0][0] is metrics and calls[0][1] == 19_998_720
+    assert metrics == before
+    assert capsys.readouterr().out == f"[train] step=19998720 {before}\n"
+
+
 def _stop_loop(tmp_path, monkeypatch, *, ready=True):
     """Real loop/checkpoint orchestration with explicit small fake numerical writers."""
     import runner.off_policy_runner as runner_module

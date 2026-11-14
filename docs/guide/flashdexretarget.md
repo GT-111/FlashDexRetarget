@@ -229,6 +229,14 @@ body-local point. The default application request is unchanged.
 | `step_offset` | `0` | env step the run starts from (set on resume) |
 | `logger.wandb.resume` / `resumeid` | `false` / `null` | continue an existing wandb run |
 
+`log_metrics` sends the original complete scalar mapping to W&B and immediately
+prints that same mapping to stdout without selecting a prefix or rounding values.
+This preserves already returned actor/critic/temperature losses alongside episode
+metrics in an archived stdout log. Logging cadence and the existing `AverageMeter`
+means stay unchanged. The logger computes no additional metrics; gradient norms
+are not returned by the current FlashSAC update and are therefore not a logged
+series.
+
 `python train.py --overrides commands.motion_file=<pt> --overrides <key>=<value> ...` runs the same
 config without the launcher (XHAND; `--gui` opens the viewport).
 
