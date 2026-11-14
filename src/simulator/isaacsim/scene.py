@@ -106,10 +106,11 @@ class IsaacSceneAdapter:
         self._scene.update(dt)
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        # SDK resets clear persistent wrenches; adapter restoration must be last.
+        self._scene.reset(env_ids)
         entities = self.entities.values() if self._reset_entities is None else self._reset_entities
         for ent in entities:
             ent.reset(env_ids)
-        self._scene.reset(env_ids)
 
 
 def _robot_articulation_cfg(

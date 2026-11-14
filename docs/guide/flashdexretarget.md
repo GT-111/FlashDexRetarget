@@ -185,7 +185,9 @@ write route; an unsupported engine rejects it before harvesting swap data.
 
 Isaac's gravity curriculum calls the actual PhysX global setter, reads its
 vector back and refreshes robot gravity compensation. Resetting a subset does
-not create per-world gravity. Native MjWarp/Newton keep constructor gravity;
+not create per-world gravity. Scene reset clears SDK state before adapters
+restore persistent gravity-compensation requests, so selected rows retain
+those requests through the ordinary next write. Native MjWarp/Newton keep constructor gravity;
 a ramp or different requested vector is unsupported. Editing CPU metadata
 does not update executing dynamics. Actual SDK forwarding and finite gravity
 response are separate qualification gates from CPU adapter tests.

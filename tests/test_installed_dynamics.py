@@ -13,9 +13,11 @@ import torch
 import simulator.isaacsim  # noqa: F401
 
 # isort: split
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_apply_inverse
 from test_isaac_asset_bindings import registered_asset as _registered_asset
 from test_native_backend_ports import _mechanics
+from test_scene_contact_authority import _isaac_scene_type
 
 from envs.commands.motion_tracking.motion_tracking_cfg import ObjectCfg
 from envs.commands.motion_tracking.objects.assist import ObjectAssistMixin
@@ -23,6 +25,7 @@ from envs.commands.motion_tracking.objects.multi_object import MultiObjectMixin
 from envs.commands.motion_tracking.reference.object import ObjectPropertiesMixin
 from envs.curriculum.base import gravity_curriculum, xfrc_curriculum
 from envs.scene.native import NativeRootControlCfg
+from simulator.env import ManagerBasedRlEnv, ManagerEnvCfg
 from simulator.isaacsim.assets import load_robot_asset
 from simulator.isaacsim.entity import ArticulationAdapter, RigidObjectAdapter
 from simulator.isaacsim.sim import IsaacSimAdapter
@@ -506,6 +509,95 @@ def test_actual_global_gravity_curriculum_readback_updates_named_gravcomp(
     adapter.reset(torch.tensor([1]))
     torch.testing.assert_close(writes[-1][0][..., 2], mass * 2)
     assert not hasattr(sim, "model")
+
+
+def test_normal_subset_reset_restores_gravcomp_after_sdk_scene_clears_wrenches(
+    monkeypatch, registered_asset
+):
+    adapter, _, _, _, _, _ = _articulation(registered_asset)
+    # This protocol reproduces the pinned SDK's selected-row wrench clearing;
+    # the manager, scene adapter, articulation adapter and curriculum are real.
+    scheduled = torch.zeros(2, len(adapter.body_names), 3)
+    events, forwarded = [], []
+
+    def sdk_asset_reset(env_ids=None):
+        rows = torch.arange(2) if env_ids is None else env_ids
+        events.append(("asset_clear", tuple(rows.tolist())))
+        scheduled[rows] = 0
+
+    def sdk_wrench(forces, torques, *, body_ids, is_global):
+        assert is_global and not torch.count_nonzero(torques)
+        events.append(("scheduled_wrench", None))
+        scheduled[:, body_ids] = forces
+
+    def sdk_scene_reset(env_ids=None):
+        events.append(("scene_reset", None))
+        sdk_asset_reset(env_ids)
+
+    adapter._art.reset = sdk_asset_reset
+    adapter._art.set_external_force_and_torque = sdk_wrench
+    sdk_scene = SimpleNamespace(
+        cfg=SimpleNamespace(num_envs=2),
+        env_origins=torch.zeros(2, 3),
+        reset=sdk_scene_reset,
+        write_data_to_sim=lambda: forwarded.append(scheduled.clone()),
+    )
+    scene = _isaac_scene_type(monkeypatch)(sdk_scene, "cpu")
+    scene._clock = adapter._clock
+    scene.entities["robot"] = adapter
+    gravity = [0.0, 0.0, -9.81]
+
+    def sdk_set_gravity(value):
+        gravity[:] = value
+
+    monkeypatch.setitem(
+        sys.modules, "carb", SimpleNamespace(Float3=lambda *values: tuple(values))
+    )
+    sim = IsaacSimAdapter(
+        SimpleNamespace(
+            physics_sim_view=SimpleNamespace(
+                get_gravity=lambda: tuple(gravity),
+                set_gravity=sdk_set_gravity,
+            )
+        ),
+        "cpu",
+    )
+    sim.add_gravity_compensator(adapter, 0.5)
+    env = ManagerBasedRlEnv(
+        ManagerEnvCfg(
+            num_envs=2,
+            decimation=4,
+            physics_dt=0.005,
+            curriculum={
+                "gravity": CurriculumTermCfg(
+                    func=gravity_curriculum,
+                    params={"schedule_steps": 0, "full_g": 4.0},
+                )
+            },
+        ),
+        scene,
+        sim,
+        "cpu",
+    )
+    events.clear()
+    env.reset(env_ids=torch.tensor([1]))
+    mass = adapter.body_inertial_properties().mass_kg
+    expected = mass[..., None] * mass.new_tensor([0.0, 0.0, 2.0])
+    assert len(forwarded) == 1
+    torch.testing.assert_close(forwarded[-1][:, adapter._isaac_body_ids], expected)
+    assert all(rows == (1,) for name, rows in events if name == "asset_clear")
+    last_wrench = max(
+        i for i, (name, _) in enumerate(events) if name == "scheduled_wrench"
+    )
+    assert all(
+        i < last_wrench
+        for i, (name, _) in enumerate(events)
+        if name in ("asset_clear", "scene_reset")
+    )
+    assert tuple(gravity) == (0.0, 0.0, -4.0)
+    # The untouched world keeps the GLOBAL gravity update; the selected world's
+    # nonzero request survives the final SDK clear and reaches ordinary write.
+    assert bool((forwarded[-1][..., 2] > 0).all())
 
 
 def test_unsupported_model_swap_rejects_before_harvest_or_fabricated_fields():
