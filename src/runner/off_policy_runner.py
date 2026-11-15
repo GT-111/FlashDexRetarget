@@ -44,6 +44,15 @@ class OffPolicyRunner:
         self._device = str(runner_cfg.device)
         self._n_envs = int(runner_cfg.num_train_envs)
         self._step_offset = int(runner_cfg.get("step_offset", 0))  # env steps done before a resume
+        actor_init = runner_cfg.get("actor_input_extension_init_path")
+        actor_init_config = runner_cfg.get("actor_input_extension_init_config_path")
+        if (actor_init is None) != (actor_init_config is None):
+            raise ValueError("actor input extension requires both checkpoint and parent resolved-config paths")
+        if actor_init is not None and (
+            runner_cfg.agent_load_path is not None or runner_cfg.buffer_load_path is not None
+            or self._step_offset != 0 or runner_cfg.get("ever_state_path") is not None
+        ):
+            raise ValueError("actor input extension requires fresh progress and cannot be combined with resume paths")
         self._updates_per_step = float(runner_cfg.updates_per_interaction_step)
         self._log_every = int(runner_cfg.logging_per_interaction_step) or 0
         # Absolute env-step grids, so a resume does not shift the eval / checkpoint points.
@@ -89,6 +98,14 @@ class OffPolicyRunner:
         self._eval_ever_state: dict = {}
 
         # ── resume ───────────────────────────────────────────────────────────────────
+        if actor_init is not None:
+            authority = self._agent.initialize_actor_input_extension(
+                str((_BASE_DIR / actor_init).resolve()),
+                str((_BASE_DIR / actor_init_config).resolve()),
+                str(self._save_path_base / "config.yaml"),
+            )
+            self._agent.reset_collection()
+            (self._save_path_base / "actor-input-extension.json").write_text(json.dumps(authority, indent=2) + "\n")
         if runner_cfg.agent_load_path is not None:
             self._agent.load(str((_BASE_DIR / runner_cfg.agent_load_path).resolve()))
             if runner_cfg.buffer_load_path is None:

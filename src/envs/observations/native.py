@@ -160,6 +160,26 @@ def build_native_future_reference(
 
 class NativeMotionTrackingObs(MotionTrackingObs):
     @staticmethod
+    @torch.no_grad()
+    def native_source_tip_reference_error(env, command_name):
+        """Current decision goal: supported source-tip error in actual wrist axes.
+
+        Concatenated actual point errors precede their masks. This is separate
+        from the consumed endpoint packet used by reward/recording.
+        """
+        command = env.command_manager.get_term(command_name)
+        reference = command.source_point_reference(command._motion_flat_ids)
+        errors, support = [], []
+        for index, side in enumerate(command._side_list):
+            actual = command.robot.data.site_pos_w[:, command._tip_site_ids[side]]
+            mask = reference["position_support"][side] & torch.isfinite(actual).all(-1)
+            delta = torch.where(mask[..., None], reference["position_w"][side] - actual, 0.0)
+            quat = command.robot_wrist_quat_w[:, index, None].expand(-1, actual.shape[1], -1)
+            errors.append(quat_apply_inverse(quat, delta))
+            support.append(mask)
+        return torch.cat((torch.cat(errors, 1).flatten(1), torch.cat(support, 1).float()), -1)
+
+    @staticmethod
     def native_installed_command_error(env, command_name):
         command = env.command_manager.get_term(command_name)
         installed = action_term(env).installed_control

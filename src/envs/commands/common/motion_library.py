@@ -46,6 +46,8 @@ class MotionLibrary:
         lengths_shifted[0] = 0
         self.length_starts = lengths_shifted.cumsum(0)
 
+        # Independent source masks are unavailable in older native and stock clips.
+        self.native_source_point_position_support: dict[str, torch.Tensor] | None = None
         self._parse_robot_data(motion_dicts)
         self._parse_mano_data(motion_dicts, motion_files)
         self._parse_contact_data(motion_dicts, motion_files)
@@ -123,6 +125,18 @@ class MotionLibrary:
             setattr(self, "native_" + field, {
                 side: _concat([reference[field][side] for reference in references], self.device, dtype=dtype)
                 for side in self.native_root_body_names})
+        source_present = ["source_point_position_support" in reference for reference in references]
+        if any(source_present):
+            if not all(source_present):
+                raise ValueError("a native motion library cannot mix available and unavailable source-point support")
+            self.native_source_point_position_support = {}
+            for side in self.hand_sides:
+                arrays = []
+                for reference, motion in zip(references, motion_dicts, strict=True):
+                    names = reference["source_point_names"][side]
+                    ids = [names.index(str(name)) for name in motion[f"mano_{side}_joint_names"]]
+                    arrays.append(reference["source_point_position_support"][side][:, ids])
+                self.native_source_point_position_support[side] = _concat(arrays, self.device, dtype=torch.bool)
         for field in ("object_entity_name", "object_root_body_name", "object_part_body_names",
                       "object_joint_names"):
             setattr(self, "native_" + field, first[field])

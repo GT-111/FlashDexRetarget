@@ -7,6 +7,7 @@ import importlib.util
 import json
 import random
 import time
+from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,242 @@ from agents.storage.replay_buffer import ReplayBuffer
 from common.utils import capture_rng_state, restore_rng_state
 from envs.curriculum.assist import XfrcAssistCurriculum
 from runner.off_policy_runner import LEARNING_STATE_FILE, OffPolicyRunner
+
+
+def _input_extension_agent(*, added=False, encoded=True, wrong_sides=False):
+    """Tiny real native-shaped actor; no asset, reference, or physical constructor."""
+    base = _agent()
+    cfg = base._cfg
+    del base
+    if encoded:
+        cfg = replace(cfg, traj_encoder={
+            "enable": True, "aggregation": "conv1d", "n_future": 10, "n_sides": 1,
+            "latent_dim": 4, "hidden_dim": 8, "num_layers": 1,
+        })
+    flat = ([["actor", "robot_joint_vel", 3], ["actor", "native_source_tip_reference_error", 4],
+             ["actor", "robot_joint_pos", 3]] if added else
+            [["actor", "robot_joint_pos", 3], ["actor", "robot_joint_vel", 3]])
+    windows = [["future_traj", 40]] if encoded else []
+    info = {
+        "actor_observation_size": (sum(term[2] for term in flat),),
+        "obs_terms": flat + [[name, "native_future_reference", width] for name, width in windows],
+        "encoded_obs_dims": windows, "reward_heads": ["right", "left"],
+        "action_sides": {"right": [0, 1, 2, 6, 7, 8, 12], "left": [3, 4, 5, 9, 10, 11, 13]},
+    }
+    if wrong_sides:
+        info["action_sides"] = {"right": info["action_sides"]["left"], "left": info["action_sides"]["right"]}
+    width = sum(term[2] for term in info["obs_terms"])
+    agent = FlashSACAgent(
+        gym.spaces.Box(-np.inf, np.inf, shape=(width,), dtype=np.float32),
+        gym.spaces.Box(-1, 1, shape=(14,), dtype=np.float32), info, cfg,
+    )
+    return agent, info
+
+
+def _input_extension_config(agent, info, run_dir, overrides=()):
+    cfg = _lifecycle_config([f"run_dir={run_dir}", *overrides])
+    payload = OmegaConf.to_container(cfg, resolve=True)
+    control = {"position_stiffness": 1., "position_damping": 1., "rotation_stiffness": 1.,
+               "rotation_damping": 1., "force_limit_n": None, "torque_limit_nm": None}
+    scene = {
+        "scene_xml_path": "authored-fixture-not-read.xml",
+        "hands": [{"side": side, "entity_name": "robot", "root_body_name": f"{side}_wrist",
+                   "root_joint_name": f"{side}_free", "command_actuator_names": [f"{side}_finger"],
+                   "root_control": dict(control)} for side in ("right", "left")],
+        "object": {"entity_name": "box", "root_body_name": "box_base", "root_joint_name": "box_free",
+                   "parts": [{"name": "base", "body_name": "box_base", "mesh_path": "not-read.obj"}]},
+    }
+    payload["robot"]["native_scene"] = scene
+    payload["actions"] = {
+        "name": "native", "_target_": "envs.actions.native.NativeResidualActionCfg",
+        "entity_name": "robot", "command_name": "motion", "native_scene": scene,
+        "action_scale": 1., "action_offset": 0., "clip": {".*": [-1., 1.]},
+        "translation_residual_m": .1, "rotation_residual_rad": 1., "finger_residual_rad": None,
+        "cutoff_hz": {"wrist_trans": 5., "wrist_rot": 5., "finger": None},
+    }
+    names = [name for group, name, _ in info["obs_terms"] if group == "actor"]
+    payload["obs"] = {
+        "_target_": "envs.observations.native.NativeMotionTrackingObs",
+        "obs_dict": {"actor_obs": names, "critic_obs": names},
+        "encoded_groups": {name: "native_future_reference" for name, _ in info["encoded_obs_dims"]},
+        "obs_params": {"native_future_reference": {"n_future": 10, "stride": 1}},
+        "obs_scales": {}, "noise_scales": {}, "actor_enable_corruption": False,
+        "critic_enable_corruption": False, "nan_policy": "disabled",
+    }
+    payload["runner"]["agent"] = {"class_name": "agents.flashsac.FlashSACAgent", **asdict(agent._cfg)}
+    payload["runner"]["share_actor_critic_obs"] = True
+    cfg = OmegaConf.create(payload)
+    Path(run_dir).mkdir(parents=True)
+    OmegaConf.save(cfg, Path(run_dir) / "config.yaml", resolve=True)
+    return cfg
+
+
+def _feed_input_extension_agent(agent):
+    width = agent._layout.full_dim
+    initial = np.linspace(-.8, .9, 2 * width, dtype=np.float32).reshape(2, width)
+    for frame in range(9):
+        observation = np.sin(initial * (frame + 1) + np.arange(width)[None, :] / 10).astype(np.float32)
+        agent.observe({
+            "observation": observation, "next_observation": observation + .02,
+            "action": np.zeros((2, 14), dtype=np.float32),
+            "reward": np.full((2, 2), .1, dtype=np.float32),
+            "terminated": np.zeros(2, dtype=bool), "truncated": np.zeros(2, dtype=bool),
+        })
+
+
+@pytest.mark.parametrize("encoded", [False, True])
+def test_actor_input_extension_preserves_named_actor_and_learns_new_columns(tmp_path, encoded):
+    parent, old_info = _input_extension_agent(encoded=encoded)
+    _feed_input_extension_agent(parent)
+    parent.update()
+    parent.update()
+    assert parent._alg.update_step == 2 and parent._alg.actor_optimizer.state
+    with torch.no_grad():
+        for tower in parent._alg.actor.sides:
+            norm = tower.embedder.norm
+            norm.weight.copy_(torch.linspace(.6, 1.3, norm.weight.numel()))
+            norm.bias.copy_(torch.linspace(-.2, .15, norm.bias.numel()))
+    checkpoint = tmp_path / "parent-checkpoint"
+    parent.save(str(checkpoint))
+    parent_run = tmp_path / "parent-run"
+    _input_extension_config(parent, old_info, parent_run)
+    child, new_info = _input_extension_agent(added=True, encoded=encoded)
+    child_run = tmp_path / "child-run"
+    _input_extension_config(child, new_info, child_run)
+    fresh = deepcopy(child._alg.save())
+
+    authority = child.initialize_actor_input_extension(
+        str(checkpoint), str(parent_run / "config.yaml"), str(child_run / "config.yaml"),
+    )
+    after = child._alg.save()
+    for key in fresh.keys() - {"actor_state_dict"}:
+        _tree_equal(after[key], fresh[key])
+    assert child._alg.replay_buffer._num_in_buffer == 0
+    assert not child._alg.replay_buffer._n_step_transitions
+    assert child._alg._last_obs is child._alg._last_actions is child._alg._cached_noise is None
+    assert authority["added_flat_terms"] == [["actor", "native_source_tip_reference_error"]]
+    assert not authority["renormalized_at_initialization"]
+
+    old = torch.linspace(-.9, 1.1, 5 * parent._layout.full_dim).reshape(5, -1)
+    new = torch.cat([old[:, 3:6], torch.linspace(-2., 3., 20).reshape(5, 4), old[:, :3], old[:, 6:]], -1)
+    for actual, expected in zip(child._alg.actor.get_mean_and_std(new, training=False),
+                                parent._alg.actor.get_mean_and_std(old, training=False), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(torch.from_numpy(child.act(new, deterministic=True)),
+                               torch.from_numpy(parent.act(old, deterministic=True)), rtol=1e-6, atol=1e-7)
+    future = parent._alg.actor.sides[0].traj_encoder
+    future_width = future.latent_dim if future is not None else 0
+    mapped = [7, 8, 9, 0, 1, 2] + list(range(10, 10 + future_width))
+    before, loaded = parent._alg.actor.state_dict(), child._alg.actor.state_dict()
+    expanded = set()
+    for index, tower in enumerate(child._alg.actor.sides):
+        prefix = f"sides.{index}.embedder."
+        for field, initial in (("weight", 1), ("bias", 0), ("running_mean", 0), ("running_var", 1)):
+            key = prefix + f"norm.{field}"
+            expanded.add(key)
+            torch.testing.assert_close(loaded[key][mapped], before[key], rtol=0, atol=0)
+            torch.testing.assert_close(loaded[key][3:7], torch.full((4,), initial, dtype=loaded[key].dtype),
+                                       rtol=0, atol=0)
+        key = prefix + "w.w.weight"
+        expanded.add(key)
+        torch.testing.assert_close(loaded[key][:, mapped], before[key], rtol=0, atol=0)
+        assert not bool(loaded[key][:, 3:7].any())
+    for key in before.keys() - expanded:
+        torch.testing.assert_close(loaded[key], before[key], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="only available once"):
+        child.initialize_actor_input_extension(str(checkpoint), str(parent_run / "config.yaml"),
+                                               str(child_run / "config.yaml"))
+
+    # The old strict loader still rejects the old layout; a child's same-layout
+    # checkpoint remains an ordinary complete load, without initialization logic.
+    with pytest.raises(ValueError, match="obs layout differs"):
+        child.load(str(checkpoint))
+    saved_child = tmp_path / "child-checkpoint"
+    child.save(str(saved_child))
+    restored, _ = _input_extension_agent(added=True, encoded=encoded)
+    restored.load(str(saved_child))
+    _tree_equal(restored._alg.save(), after)
+
+    _feed_input_extension_agent(child)
+    info = child.update()  # actual registered SAC loss, reducer, Adam, and parameter normalization
+    assert "actor/loss" in info and all(np.isfinite(value) for value in info.values())
+    for tower in child._alg.actor.sides:
+        assert bool(tower.embedder.w.w.weight.grad[:, 3:7].abs().sum() > 0)
+        assert bool(tower.embedder.w.w.weight[:, 3:7].abs().sum() > 0)
+        # Zero input weights give zero first VJP to the new input BN affine.
+        assert not bool(tower.embedder.norm.weight.grad[3:7].any())
+        assert not bool(tower.embedder.norm.bias.grad[3:7].any())
+
+
+@pytest.mark.parametrize("mismatch", ["missing_names", "future_encoder", "future_query", "native_action", "side_scatter"])
+def test_actor_input_extension_rejects_unproven_metadata_before_model_read(tmp_path, monkeypatch, mismatch):
+    parent, old_info = _input_extension_agent()
+    checkpoint = tmp_path / "parent-checkpoint"
+    parent.save(str(checkpoint))
+    parent_run, child_run = tmp_path / "parent-run", tmp_path / "child-run"
+    parent_cfg = _input_extension_config(parent, old_info, parent_run)
+    child, new_info = _input_extension_agent(added=True, wrong_sides=mismatch == "side_scatter")
+    _input_extension_config(child, new_info, child_run)
+    if mismatch == "missing_names":
+        (checkpoint / "obs_layout.json").write_text(json.dumps({"encoded_obs_dims": old_info["encoded_obs_dims"]}))
+        reason = "saved named obs_terms"
+    elif mismatch == "future_encoder":
+        parent_cfg.runner.agent.traj_encoder.n_future = 5
+        reason = "actor configuration: traj_encoder"
+    elif mismatch == "future_query":
+        parent_cfg.obs.obs_params.native_future_reference.stride = 2
+        reason = "future queries"
+    elif mismatch == "native_action":
+        parent_cfg.actions.finger_residual_rad = .2
+        reason = "native action/scene contract"
+    else:
+        reason = "action columns disagree"
+    OmegaConf.save(parent_cfg, parent_run / "config.yaml", resolve=True)
+    monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: pytest.fail("metadata must be checked before model read"))
+    with pytest.raises(ValueError, match=reason):
+        child.initialize_actor_input_extension(str(checkpoint), str(parent_run / "config.yaml"),
+                                               str(child_run / "config.yaml"))
+
+
+def test_runner_routes_actor_input_extension_without_restoring_training_or_ever_state(tmp_path, monkeypatch):
+    import runner.off_policy_runner as owner
+
+    parent, old_info = _input_extension_agent()
+    checkpoint = tmp_path / "parent-checkpoint"
+    parent.save(str(checkpoint))
+    (checkpoint / "resume_state.json").write_text(json.dumps({"ever": {"old": [[1]]}}))
+    parent_run = tmp_path / "parent-run"
+    _input_extension_config(parent, old_info, parent_run)
+    child, new_info = _input_extension_agent(added=True)
+    child_run = tmp_path / "child-run"
+    cfg = _input_extension_config(child, new_info, child_run, [
+        f"actor_input_extension_init_path={checkpoint}",
+        f"actor_input_extension_init_config_path={parent_run / 'config.yaml'}",
+    ])
+    assert cfg.runner.actor_input_extension_init_path == str(checkpoint)
+    assert cfg.runner.actor_input_extension_init_config_path == str(parent_run / "config.yaml")
+    fresh = deepcopy(child._alg.save())
+    flat = SimpleNamespace(reset=lambda: (np.zeros((2, child._layout.full_dim), dtype=np.float32), new_info),
+        current_aux=lambda: None, action_space=gym.spaces.Box(-1, 1, shape=(2, 14), dtype=np.float32))
+    monkeypatch.setattr(owner.FlatObsVecEnv, "from_env", lambda *_args, **_kwargs: flat)
+    monkeypatch.setattr(owner, "build_agent", lambda *_args, **_kwargs: child)
+    monkeypatch.setattr(owner.wandb, "run", None)
+    for name in ("load", "load_buffer"):
+        monkeypatch.setattr(child, name, lambda *_args: pytest.fail("actor initialization must not call resume loaders"))
+    physical = SimpleNamespace(command_manager=SimpleNamespace(get_term=lambda _name: None))
+    env = SimpleNamespace(unwrapped=physical)
+    runner = OffPolicyRunner(env, cfg.runner, cfg.eval, eval_env=SimpleNamespace())
+    for key in fresh.keys() - {"actor_state_dict"}:
+        _tree_equal(child._alg.save()[key], fresh[key])
+    assert runner._step_offset == 0 and not runner._eval_ever_state and runner._nonfinite_steps == 0
+    receipt = json.loads((child_run / "actor-input-extension.json").read_text())
+    assert receipt["actor_only"] and receipt["checkpoint"] == str(checkpoint)
+    for key, value in (("agent_load_path", str(checkpoint)), ("buffer_load_path", str(checkpoint)),
+                       ("step_offset", 2), ("ever_state_path", str(checkpoint / "resume_state.json"))):
+        invalid = OmegaConf.create(OmegaConf.to_container(cfg.runner, resolve=True))
+        invalid[key] = value
+        with pytest.raises(ValueError, match="fresh progress"):
+            OffPolicyRunner(env, invalid, cfg.eval, eval_env=SimpleNamespace())
 
 
 def test_log_metrics_preserves_all_scalar_values_in_stdout_and_wandb(monkeypatch, capsys):

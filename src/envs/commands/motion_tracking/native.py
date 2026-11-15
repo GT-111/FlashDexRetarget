@@ -208,6 +208,127 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         state[..., :3] += origins
         return state
 
+    @torch.no_grad()
+    def source_point_reference(self, ids):
+        """Actual named source tips at supplied flat reference rows, in WORLD meters.
+
+        Source support belongs to observed points, independently of registered
+        target roots/Q. The selected source columns pair with real configured
+        tip sites; absent anatomy is never filled by target FK.
+        """
+        ml = self.motion_lib
+        masks = ml.native_source_point_position_support
+        if masks is None:
+            raise ValueError("native source geometry requires named source-point position support")
+        layout = getattr(self, "_source_tip_point_layout", None)
+        if layout is None:
+            names, sites = {}, {}
+            for side in self._side_list:
+                columns, site_ids = ml.tip_ids[side], self._tip_site_ids[side]
+                if len(columns) != len(site_ids):
+                    raise ValueError("native source tip columns and configured physical tip sites differ")
+                names[side] = tuple(ml.mano_joint_names[side][i] for i in columns.tolist())
+                sites[side] = tuple(self.robot.site_names[i] for i in site_ids)
+            layout = self._source_tip_point_layout = names, sites
+        names, sites = layout
+        positions, support = {}, {}
+        for side in self._side_list:
+            columns = ml.tip_ids[side]
+            value = ml.mano_joint_pos[side][ids][..., columns, :]
+            origins = self._env.scene.env_origins.reshape(
+                (self.num_envs,) + (1,) * (value.ndim - 2) + (3,)
+            )
+            positions[side] = value + origins
+            support[side] = masks[side][ids][..., columns] & torch.isfinite(value).all(-1)
+        return dict(
+            hand_sides=tuple(self._side_list), source_point_names=names,
+            target_site_names=sites, position_w=positions, position_support=support,
+            reference_time_ns=ml.native_time_ns[ids],
+        )
+
+    @torch.no_grad()
+    def source_tip_geometry_facts(self):
+        """One stopped consumed-endpoint packet, shared by reward and recorder.
+
+        The normal substep/reset token owns physical freshness. Command cursor
+        advance alone must not switch the installed packet's source geometry.
+        Decision observations use source_point_reference(current_ids) instead.
+        """
+        if self.motion_lib.native_source_point_position_support is None:
+            return None
+        token = self._sim_obj_cache_token()
+        cached = getattr(self, "_source_tip_geometry_cache", None)
+        if cached is not None and self._source_tip_geometry_token == token:
+            return cached
+        from envs._common import action_term
+
+        installed = action_term(self._env).installed_control
+        execution = installed["installed_valid"].detach().clone()
+        phase = self.reference_phase
+        motion_ids = torch.where(execution, installed["reference_motion_ids"], phase["motion_ids"])
+        steps = torch.where(execution, installed["reference_motion_steps"], phase["motion_steps"])
+        ids = self.motion_lib.length_starts[motion_ids] + steps
+        reference = self.source_point_reference(ids)
+        source, source_support, achieved = [], [], []
+        source_names, target_names, point_sides, offsets = [], [], [], [0]
+        for side in self._side_list:
+            source.append(reference["position_w"][side])
+            source_support.append(reference["position_support"][side])
+            achieved.append(self.robot.data.site_pos_w[:, self._tip_site_ids[side]])
+            names = reference["source_point_names"][side]
+            source_names.extend(names)
+            target_names.extend(reference["target_site_names"][side])
+            point_sides.extend([side] * len(names))
+            offsets.append(offsets[-1] + len(names))
+        source, source_support = torch.cat(source, 1), torch.cat(source_support, 1)
+        achieved = torch.cat(achieved, 1)
+        achieved_support = torch.isfinite(achieved).all(-1)
+        desired_state = self.object_part_reference(ids)
+        live_state = self.sim_object_part_state_w
+        desired_pose = self.motion_lib.native_object_part_pose_support[ids] & torch.isfinite(desired_state[..., :7]).all(-1)
+        live_pose = torch.isfinite(live_state[..., :7]).all(-1)
+
+        def supported_pose(state, mask):
+            identity = torch.zeros_like(state)
+            identity[..., 3] = 1.0
+            return torch.where(mask[..., None], state, identity)
+
+        desired_distance, _, desired_query = self.sdf_query_parts(
+            torch.where(source_support[..., None], source, 0.0),
+            part_state_w=supported_pose(desired_state, desired_pose), return_support=True,
+        )
+        live_distance, _, live_query = self.sdf_query_parts(
+            torch.where(achieved_support[..., None], achieved, 0.0),
+            part_state_w=supported_pose(live_state, live_pose), return_support=True,
+        )
+        desired_query &= source_support[..., None] & desired_pose[:, None]
+        live_query &= achieved_support[..., None] & live_pose[:, None]
+        facts = dict(
+            metadata=dict(
+                schema="native_source_tip_geometry_v1", hand_sides=tuple(self._side_list),
+                hand_offsets=tuple(offsets), point_hand_sides=tuple(point_sides),
+                source_point_names=tuple(source_names), target_site_names=tuple(target_names),
+                part_names=tuple(p.name for p in self.native_layout.object.parts),
+                part_body_names=tuple(p.body_name for p in self.native_layout.object.parts),
+                part_distance_sign=tuple(p.distance_sign for p in self.native_layout.object.parts),
+                position_frame="WORLD_including_env_origin", position_unit="m", distance_unit="m",
+                query_authority="finite_supported_inputs_inside_baked_grid_not_contact_or_surface_coverage",
+                reference_authority="installed_packet_or_reset_pre_advance_reference_phase",
+                execution_authority="native_action_installed_valid_not_backend_executed_control_readback",
+            ),
+            reference_motion_ids=motion_ids, reference_motion_steps=steps,
+            reference_time_ns=reference["reference_time_ns"], execution_valid=execution,
+            source_position_w=source, source_position_support=source_support,
+            achieved_position_w=achieved, achieved_position_support=achieved_support,
+            desired_part_pose_support=desired_pose, live_part_pose_support=live_pose,
+            desired_part_distance_m=torch.where(desired_query, desired_distance, float("nan")),
+            live_part_distance_m=torch.where(live_query, live_distance, float("nan")),
+            desired_part_query_support=desired_query, live_part_query_support=live_query,
+        )
+        self._source_tip_geometry_cache = facts
+        self._source_tip_geometry_token = token
+        return facts
+
     @property
     def ref_object_part_state_w(self):
         return self.object_part_reference(self._motion_flat_ids)
@@ -526,13 +647,13 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             for p in self.native_layout.object.parts
         ]
 
-    def sdf_query_parts(self, world_pts, *, part_state_w=None, env_ids=None):
+    def sdf_query_parts(self, world_pts, *, part_state_w=None, env_ids=None, return_support=False):
         from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, quat_mul
 
         state = self.sim_object_part_state_w if part_state_w is None else part_state_w
         if env_ids is not None:
             state = state[env_ids]
-        distances, gradients = [], []
+        distances, gradients, supports = [], [], []
         for i, part in enumerate(self.native_layout.object.parts):
             body = state[:, i]
             offset = body.new_tensor(part.body_from_mesh_position_m).expand_as(
@@ -546,7 +667,12 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                 -1, world_pts.shape[1], -1
             )
             local = quat_apply_inverse(quat, world_pts - pos[:, None])
-            grid = (local / self._obj_sdf_extent).flip(-1).reshape(1, -1, 1, 1, 3)
+            sample_local = local
+            if return_support:
+                finite = torch.isfinite(local).all(-1)
+                domain = finite & (local.abs() <= self._obj_sdf_extent).all(-1)
+                sample_local = torch.where(finite[..., None], local, 0.0)
+            grid = (sample_local / self._obj_sdf_extent).flip(-1).reshape(1, -1, 1, 1, 3)
             sample = torch.nn.functional.grid_sample(
                 self._part_sdf[i][None], grid, padding_mode="border", align_corners=True
             )
@@ -560,10 +686,13 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                     f"unknown native part distance sign {part.distance_sign!r}"
                 )
             distances.append(distance)
+            if return_support:
+                supports.append(domain & torch.isfinite(distance))
             gradients.append(
                 quat_apply(quat, torch.nn.functional.normalize(grad, dim=-1))
             )
-        return torch.stack(distances, -1), torch.stack(gradients, -2)
+        result = torch.stack(distances, -1), torch.stack(gradients, -2)
+        return (*result, torch.stack(supports, -1)) if return_support else result
 
     def sdf_query(self, world_pts, side, obj_trans=None, obj_quat=None, env_ids=None):
         del side

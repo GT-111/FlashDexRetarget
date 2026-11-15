@@ -154,6 +154,32 @@ Body correspondences use the existing `[robot, MANO role]` pairs, with the robot
 
 All shipped XHand, Sharpa and F1 registrations retain their prior body names, MANO roles and ordering. Stock and native commands use the same nonempty declared level groups for geometry access. Stock metrics follow those groups; native metrics retain their separate registered-root and object-part meanings. This does not add native anatomical metric outputs. F1 retains its seven sparse all-body correspondences and no level groups. Reward selection, source/support authority, controllers, clocks and physics are unchanged.
 
+Native references may carry source geometry availability as the paired fields
+`source_point_names` and `source_point_position_support`, each keyed by the
+actual hand sides. Names address the existing clip's MANO world positions;
+boolean support has shape `[frames, points]` in that named order, independently
+of robot joint and root support. Cropping retains the corresponding mask rows,
+and the motion library aligns masks with its actual MANO point order. An absent
+pair means unavailable source support; a library cannot mix clips with and
+without this modality. These facts do not declare contact or a successful
+interaction, and do not change the default reward or observation selection.
+
+When the native command provides source-tip geometry facts, current-attempt
+recordings retain the consumed reference IDs, exact nanosecond clock, independent
+source/achieved position masks, and named-part distance-query masks. Recorded
+positions use scene-local coordinates; distance values and support keep their
+producer meaning. Flat named-point metadata preserves unilateral hands and
+unequal point counts. Missing facts produce no geometry group. These arrays
+describe geometry queries, not measured contact or task success.
+
+The optional native source-geometry observation `native_source_tip_reference_error` exposes current supported observed source-tip errors in the actual physical wrist axes, followed by their masks. Select it for both actor and critic through the existing observation config. Point counts and source/site names come from the admitted library and physical registrations; registered target-root support or target FK cannot supply source-point support. Old carriers without the named independent mask cannot enable these consumers.
+
+The optional native rewards `native_source_tip_position` (`reward_scales.<name>: scale`, inverse meters) and `native_source_tip_object_bound` (`reward_params.<name>.sigma_m`, meters) adapt the official source-tip position and object-proximity mechanisms. They use the action's consumed reference IDs/steps at the achieved endpoint, while the observation uses the current decision cursor. They are absent from the default recipe. Split-side values share the full supported denominator and conserve the existing two half-weight terms, including unilateral/no-support cases. This is environmental scalar reward, not replay-action actor BC or a new gradient into the reference producer.
+
+The object-bound adaptation queries desired and live named-part SDFs and takes both minima over the same compatible supported part subset. A point with no common admitted part has unavailable reward mass. Domain masks certify only finite samples inside the configured baked grid. They do not certify full source-mesh coverage, signed penetration, force/contact, source engagement or task success; mixed declared distance-sign unions reject. This articulated-SDF adaptation is not a claim of numerical equivalence to the stock visual-vertex reference distance. The ordinary recorder may retain the same detached endpoint operands through `source_tip_geometry_facts`, independently of success.
+
+Adding the observation changes the configured actor/critic graph. Existing strict FULL state cannot silently resume across that change; any declared initializer/new-condition lifecycle belongs to the learning owner. Default observations, reward weights, ABS action semantics, physics, assistance and task criteria are unchanged by merely publishing these methods.
+
 ### Native articulated training assistance
 
 The `native` recipe uses the authored scene's gravity and passive support with no object assistance. Select `--config_name native_assisted` to train with explicit per-part object PD forces and the existing adaptive xfrc curriculum. The robot, physical part names, command actuators and runtime remain selected through the same native configuration. The object retains one FREE base and its passive articulation; training assistance is not an object motor, weld or playback.
@@ -457,6 +483,8 @@ and correlated exploration state. Replay, RNG and curriculum start fresh. Report
 parent optimizer/update age separately from the new run's `step_offset`. Full learning
 restore keeps its existing replay/learning-state owner and resets collection once
 after those owners load.
+
+For a native source-geometry observation extension, set `actor_input_extension_init_path=<parent checkpoint>` and `actor_input_extension_init_config_path=<published parent resolved config.yaml>` in a new run. Keep `agent_load_path=null`, `buffer_load_path=null`, `step_offset=0` and `runner.ever_state_path=null`. This explicit initializer requires the same named native action/scene and future encoder/query contract, maps saved named actor inputs and shifted future columns, and zeros only the added input columns. It retains the actor's running BN state without an initialization-time renormalization; critic/targets, reward statistics, replay, optimizers and learning progress start fresh. Strict FULL does not admit an observation-layout change. After the new condition writes its own FULL, clear both initialization paths and use the ordinary same-condition FULL resume commands. C0 preservation and new-column learning are owning software-test claims only after their actual qualification; later normalization/optimizer behavior is a new learning condition.
 
 Physical worlds and episodes start fresh. Per-world return carry, correlated exploration noise and
 pending n-step transitions are cleared, while learned and running statistics are retained. The replay

@@ -259,6 +259,32 @@ def _check_observation_layout(path: str, encoded_layout: list, obs_terms: list) 
             )
 
 
+def _named_actor_columns(terms: list, encoded_layout: list) -> tuple[dict, int, list]:
+    """Read the ordinary shared flat columns; encoded groups retain their named tail."""
+    if not terms:
+        raise ValueError("actor input extension requires saved named obs_terms")
+    encoded_widths = dict(encoded_layout)
+    observed_widths = dict.fromkeys(encoded_widths, 0)
+    columns, windows, width = {}, [], 0
+    for group, name, count in terms:
+        if count < 0:
+            raise ValueError("named observation widths cannot be negative")
+        if group == "actor" and not windows:
+            key = (group, name)
+            if key in columns:
+                raise ValueError(f"duplicate named actor observation {key}")
+            columns[key] = (width, count)
+            width += count
+        elif group in encoded_widths:
+            windows.append([group, name, count])
+            observed_widths[group] += count
+        else:
+            raise ValueError("actor input extension requires shared actor observations before encoded groups")
+    if observed_widths != encoded_widths:
+        raise ValueError("named encoded observation widths disagree with encoded_obs_dims")
+    return columns, width, windows
+
+
 class FlashSACPolicy:
     """Frozen deterministic acting owner; no learner, critic, reward RMS or replay."""
 
@@ -313,6 +339,8 @@ class FlashSACAgent(Agent):
         self._obs_terms = [list(t) for t in (env_info.get("obs_terms") or [])]
         head_names = self._reward_head_names(cfg, env_info)
         side_action_ids = self._side_action_ids(cfg, env_info, head_names)
+        self._head_names, self._side_action_ids = head_names, side_action_ids
+        self._actor_input_extension_initialized = False
 
         self._action_bias = action_bias.to(self._device)
         self._action_scale = action_scale.to(self._device)
@@ -487,6 +515,120 @@ class FlashSACAgent(Agent):
         return self._alg.update()
 
     # ─── checkpoints ───────────────────────────────────────────────────────────
+
+    def initialize_actor_input_extension(
+        self, path: str, parent_config_path: str, current_config_path: str,
+    ) -> dict[str, Any]:
+        """Initialize a new native observation layout from its named mature actor only.
+
+        Both configurations are ordinary resolved train.py outputs. This is not
+        FULL restore: every non-actor owner keeps its newly constructed state.
+        """
+        if (self._actor_input_extension_initialized or self._alg.update_step
+                or self._alg.replay_buffer._num_in_buffer or self._alg.replay_buffer._n_step_transitions):
+            raise ValueError("actor input extension is only available once before collection or updates")
+        parent = OmegaConf.to_container(OmegaConf.load(parent_config_path), resolve=True)
+        current = OmegaConf.to_container(OmegaConf.load(current_config_path), resolve=True)
+        for config in (parent, current):
+            if (config["runner"]["agent"]["class_name"] != "agents.flashsac.FlashSACAgent"
+                    or not config["runner"]["share_actor_critic_obs"]):
+                raise ValueError("actor input extension requires the shared-observation FlashSAC configuration")
+        if self._layout.actor_dim is not None:
+            raise ValueError("actor input extension requires shared actor/critic observations")
+        for key in ("actor_num_blocks", "actor_hidden_dim", "traj_encoder"):
+            if (parent["runner"]["agent"][key] != current["runner"]["agent"][key]
+                    or current["runner"]["agent"][key] != getattr(self._cfg, key)):
+                raise ValueError(f"actor input extension requires unchanged actor configuration: {key}")
+        for key in ("enable", "side_actors"):
+            if (parent["runner"]["agent"]["reward_heads"][key]
+                    != current["runner"]["agent"]["reward_heads"][key]
+                    or current["runner"]["agent"]["reward_heads"][key]
+                    != (self._cfg.reward_heads or {}).get(key, False)):
+                raise ValueError(f"actor input extension requires unchanged reward-head ownership: {key}")
+        scene = parent["robot"]["native_scene"]
+        if (not scene or scene != current["robot"]["native_scene"]
+                or parent["actions"] != current["actions"]
+                or parent["actions"].get("native_scene") != scene):
+            raise ValueError("actor input extension requires the unchanged named native action/scene contract")
+        # NativeResidualAction groups translations, rotations, then named finger
+        # actuators; MotionLibrary orders admitted source sides right then left.
+        sides = [hand["side"] for hand in scene["hands"]]
+        owners = ([side for side in sides for _ in "xyz"] * 2
+                  + [hand["side"] for hand in scene["hands"] for _ in hand["command_actuator_names"]])
+        head_names = [side for side in ("right", "left") if side in sides]
+        expected_ids = [[i for i, owner in enumerate(owners) if owner == side] for side in head_names]
+        if (len(owners) != self._action_bias.numel()
+                or (self._side_action_ids and (self._head_names != head_names
+                                             or self._side_action_ids != expected_ids))):
+            raise ValueError("actor input extension action columns disagree with the named native scene")
+        parent_obs = {key: value for key, value in parent["obs"].items() if key != "obs_dict"}
+        current_obs = {key: value for key, value in current["obs"].items() if key != "obs_dict"}
+        if parent_obs != current_obs:
+            raise ValueError("actor input extension requires unchanged observation transforms and future queries")
+        with open(os.path.join(path, "obs_layout.json")) as stream:
+            saved_layout = json.load(stream)
+        if saved_layout.get("encoded_obs_dims") != self._encoded_layout:
+            raise ValueError("actor input extension requires unchanged named encoded groups")
+        old_columns, old_width, old_windows = _named_actor_columns(
+            saved_layout.get("obs_terms"), self._encoded_layout,
+        )
+        new_columns, new_width, new_windows = _named_actor_columns(self._obs_terms, self._encoded_layout)
+        if old_windows != new_windows:
+            raise ValueError("actor input extension requires unchanged named future window terms")
+        if new_width + sum(width for _, width in self._encoded_layout) != self._layout.full_dim:
+            raise ValueError("named observations disagree with the constructed actor input")
+        if new_width <= old_width:
+            raise ValueError("actor input extension requires added named flat features")
+        indices = []
+        for key, (_, width) in old_columns.items():
+            if key not in new_columns or new_columns[key][1] != width:
+                raise ValueError(f"actor input extension cannot remove or resize named feature {key}")
+            start, _ = new_columns[key]
+            indices.extend(range(start, start + width))
+
+        loaded = torch.load(os.path.join(path, CHECKPOINT_FILE), map_location="cpu", mmap=True, weights_only=True)
+        prior, target = loaded["actor_state_dict"], self._alg.actor.state_dict()
+        if prior.keys() != target.keys():
+            raise ValueError("actor input extension requires the complete unchanged actor module roster")
+        towers = ([(f"sides.{i}.", tower) for i, tower in enumerate(self._alg.actor.sides)]
+                  if isinstance(self._alg.actor, SideFactoredActor) else [("", self._alg.actor)])
+        expanded = {}
+        for prefix, tower in towers:
+            future_width = (tower.traj_encoder.latent_dim if tower.traj_encoder is not None
+                            else sum(width for _, width in self._encoded_layout))
+            columns = indices + list(range(new_width, new_width + future_width))
+            column_ids = torch.tensor(columns, dtype=torch.long, device=self._device)
+            for field, initial in (("weight", 1), ("bias", 0), ("running_mean", 0), ("running_var", 1)):
+                key = f"{prefix}embedder.norm.{field}"
+                if prior[key].shape != (old_width + future_width,) or target[key].shape != (new_width + future_width,):
+                    raise ValueError(f"named actor columns disagree with input normalization {key}")
+                value = torch.full_like(target[key], initial)
+                value.index_copy_(0, column_ids, prior[key].to(self._device))
+                expanded[key] = value
+            key = f"{prefix}embedder.w.w.weight"
+            if prior[key].shape != (target[key].shape[0], old_width + future_width):
+                raise ValueError(f"named actor columns disagree with first linear layer {key}")
+            value = torch.zeros_like(target[key])
+            value.index_copy_(1, column_ids, prior[key].to(self._device))
+            expanded[key] = value
+        for key, value in prior.items():
+            if value.dtype != target[key].dtype or (key not in expanded and value.shape != target[key].shape):
+                raise ValueError(f"actor input extension changes an existing actor tensor: {key}")
+            if key.endswith(("predictor.action_bias", "predictor.action_scale", "predictor.log_action_scale")):
+                if not torch.equal(value, target[key].cpu()):
+                    raise ValueError(f"actor input extension requires unchanged action affine: {key}")
+        # No normalize_parameters call: it would change retained BN affine values.
+        self._alg.actor.load_state_dict({**prior, **expanded}, strict=True)
+        self._actor_input_extension_initialized = True
+        return {
+            "checkpoint": path, "parent_config": parent_config_path, "current_config": current_config_path,
+            "retained_flat_terms": [list(key) for key in old_columns],
+            "added_flat_terms": [list(key) for key in new_columns if key not in old_columns],
+            "encoded_obs_dims": self._encoded_layout,
+            "actor_only": True, "renormalized_at_initialization": False,
+            "fresh_owners": ["critic_and_targets", "temperature", "optimizers_and_schedulers",
+                             "reward_normalizer", "replay", "collection", "progress"],
+        }
 
     def save(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)

@@ -120,6 +120,27 @@ def native_reference(clip: dict) -> dict | None:
             raise ValueError("native unknown root rates require zero values and independent false support")
         for field in _NATIVE_ROOT_ARRAYS:
             reference[field][side] = state[field]
+    source_fields = ("source_point_names", "source_point_position_support")
+    if any(field in reference for field in source_fields):
+        if not all(field in reference for field in source_fields):
+            raise ValueError("native source-point names and position support must be supplied together")
+        for field in source_fields:
+            reference[field] = dict(reference[field])
+            if set(reference[field]) != set(roots):
+                raise ValueError(f"native reference {field} has different source hand sides")
+        for side in roots:
+            point_names = tuple(str(name) for name in reference["source_point_names"][side])
+            clip_names = tuple(str(name) for name in clip.get(f"mano_{side}_joint_names", MANO_JOINT_NAMES))
+            if (len(set(point_names)) != len(point_names) or len(set(clip_names)) != len(clip_names)
+                    or set(point_names) != set(clip_names)):
+                raise ValueError("native source_point_names must match the distinct actual MANO point names")
+            if np.asarray(clip[f"mano_{side}_joints"]).shape != (frames, len(clip_names), 3):
+                raise ValueError("native source point names differ from the actual MANO point rows")
+            reference["source_point_names"][side] = point_names
+            support = np.asarray(reference["source_point_position_support"][side])
+            if support.shape != (frames, len(point_names)) or support.dtype.kind != "b":
+                raise ValueError("native source_point_position_support requires explicit boolean [frames, points]")
+            reference["source_point_position_support"][side] = support
     parts = names("object_part_body_names")
     if (not parts or not reference["object_entity_name"]
             or reference["object_root_body_name"] not in parts):
@@ -147,6 +168,9 @@ def crop_native_reference(reference: dict, start: int) -> dict:
         result[field] = reference[field][start:]
     for field in _NATIVE_ROOT_ARRAYS:
         result[field] = {side: value[start:] for side, value in reference[field].items()}
+    if "source_point_position_support" in reference:
+        result["source_point_position_support"] = {
+            side: value[start:] for side, value in reference["source_point_position_support"].items()}
     return result
 
 

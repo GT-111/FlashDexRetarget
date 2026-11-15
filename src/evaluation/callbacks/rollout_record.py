@@ -150,6 +150,12 @@ _CONTACT_INTERVAL_ARRAYS = (
     "measurement_support", "sample_recorded", "clock_support",
     "sample_begin_time_s", "sample_end_time_s", "interval_complete",
 )
+_SOURCE_TIP_GEOMETRY_ARRAYS = (
+    "reference_motion_ids", "reference_motion_steps", "reference_time_ns", "execution_valid",
+    "source_position_w", "source_position_support", "achieved_position_w", "achieved_position_support",
+    "desired_part_pose_support", "live_part_pose_support", "desired_part_distance_m", "live_part_distance_m",
+    "desired_part_query_support", "live_part_query_support",
+)
 
 
 class NativeRolloutRecord(RolloutRecord):
@@ -302,6 +308,8 @@ class NativeRolloutRecord(RolloutRecord):
             )
             if "execution_clock" in interval:
                 self.contact_interval_metadata["execution_clock"] = dict(interval["execution_clock"])
+        self._source_tip_geometry_reader = getattr(self.cmd, "source_tip_geometry_facts", None)
+        self.source_tip_geometry_metadata_json = None
         self.native_frames = []
         phase = self.cmd.reference_phase
         self.valid_steps_per_env = (
@@ -383,10 +391,25 @@ class NativeRolloutRecord(RolloutRecord):
                 for key in ("execution_sample_begin_step", "execution_sample_end_step",
                             "execution_clock_support", "execution_interval_complete"):
                     frame["contact_interval"][key] = interval[key].detach().cpu().clone()
+        if self._source_tip_geometry_reader is not None:
+            facts = self._source_tip_geometry_reader()
+            if facts is not None:
+                if self.source_tip_geometry_metadata_json is None:
+                    self.source_tip_geometry_metadata_json = json.dumps({
+                        **facts["metadata"],
+                        "producer_position_frame": facts["metadata"]["position_frame"],
+                        "position_frame": "env-local (scene env_origins subtracted)",
+                    })
+                frame["source_tip_geometry"] = {
+                    field: facts[field].detach().cpu().clone() for field in _SOURCE_TIP_GEOMETRY_ARRAYS
+                }
+                for field in ("source_position_w", "achieved_position_w"):
+                    frame["source_tip_geometry"][field] -= self._env_origins.cpu()[:, None]
         self.native_frames.append(frame)
 
     def collect_state(self, active_mask=None):
         state = super().collect_state(active_mask)
+        state["source_tip_geometry_metadata_json"] = self.source_tip_geometry_metadata_json
         select = slice(None) if active_mask is None else active_mask.cpu()
         state["native_frames"] = [{**frame, "hands": frame["hands"][select],
                                    "hand_twist_w": frame["hand_twist_w"][select],
@@ -397,6 +420,10 @@ class NativeRolloutRecord(RolloutRecord):
                                    "command_motion_ids": frame["command_motion_ids"][select]}
                                   for frame in self.native_frames]
         for selected, frame in zip(state["native_frames"], self.native_frames, strict=True):
+            if "source_tip_geometry" in frame:
+                selected["source_tip_geometry"] = {
+                    field: value[select] for field, value in frame["source_tip_geometry"].items()
+                }
             if "object_assist" in frame:
                 selected["object_assist"] = {field: value[select] for field, value in frame["object_assist"].items()}
             if "installed" in frame:
@@ -448,6 +475,14 @@ class NativeRolloutRecord(RolloutRecord):
                     native_binding_json=np.asarray(json.dumps(binding)),
                     prepared_name=np.asarray(name),
                 )
+                if state["source_tip_geometry_metadata_json"] is not None:
+                    result["source_tip_geometry_metadata_json"] = np.asarray(state["source_tip_geometry_metadata_json"])
+                    for field in _SOURCE_TIP_GEOMETRY_ARRAYS:
+                        # Only positions change frame; distances, masks and consumed clocks stay factual.
+                        array_name = field.removesuffix("_w") if field in ("source_position_w", "achieved_position_w") else field
+                        result["source_tip_geometry_" + array_name] = np.stack([
+                            frame["source_tip_geometry"][field][row].numpy() for frame in frames
+                        ])
                 if self.object_assist_metadata is not None:
                     result["object_assist_metadata_json"] = np.asarray(json.dumps(self.object_assist_metadata))
                     for field in frames[0]["object_assist"]:

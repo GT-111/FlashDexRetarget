@@ -1125,3 +1125,285 @@ def test_registered_body_correspondence_preserves_literal_asset_names(profile):
             field = {1: "_level1_body_ids", 2: "_level2_body_ids", 3: "_levelmid_body_ids"}[level]
             assert len(getattr(command, field).get(side, ())) == (5 if level in expected_levels else 0)
             assert (f"error_level{level}_{side[0]}" in command.metrics) == (level in expected_levels)
+
+
+def _source_geometry_command(widths=(("right", 3), ("left", 5))):
+    """Synthetic observed points/physical sites and real query owners; no solver."""
+    from dataclasses import replace
+
+    from retarget.human_demo import clips as C
+
+    command, env, calls = _command()
+    command._side_list = [side for side, _ in widths]
+    command.native_layout = replace(command.native_layout, hands=tuple(
+        hand for side, _ in widths for hand in command.native_layout.hands if hand.side == side))
+    command._root_body_ids = [0 if side == "left" else 1 for side, _ in widths]
+    env.scene.env_origins = torch.tensor([[2., -1., .5]])
+    command.robot.data.body_link_pos_w += env.scene.env_origins[:, None]
+    command.native_object.data.body_link_pos_w += env.scene.env_origins[:, None]
+    command.robot.data.body_link_quat_w[:] = torch.tensor([2**-.5, 0., 0., 2**-.5])
+    names = list(reversed(C.MANO_JOINT_NAMES))
+    ml = command.motion_lib
+    ml.native_time_ns += 2**60
+    ml.mano_joint_names = {side: names for side, _ in widths}
+    ml.tip_ids, ml.mano_joint_pos, ml.native_source_point_position_support = {}, {}, {}
+    requested = []
+    for side, width in widths:
+        columns = [names.index(f"{finger}_tip") for finger in reversed(C.FINGERS[:width])]
+        ml.tip_ids[side] = torch.tensor(columns)
+        points = torch.zeros(3, len(names), 3)
+        points[..., 0] = torch.arange(3)[:, None] * .1 + torch.arange(len(names))[None] * .003
+        points[..., 1] = torch.arange(len(names))[None] * .002
+        ml.mano_joint_pos[side] = points
+        ml.native_source_point_position_support[side] = torch.ones(3, len(names), dtype=torch.bool)
+        requested.extend((side, i, f"physical/{side}/site-{i}") for i in range(width))
+    command.robot.site_names = tuple(name for _, _, name in reversed(requested))
+    command.robot.data.site_pos_w = torch.zeros(1, len(requested), 3)
+    command._tip_site_ids = {side: [] for side, _ in widths}
+    for side, point, name in requested:
+        column = command.robot.site_names.index(name)
+        command._tip_site_ids[side].append(column)
+        source = ml.mano_joint_pos[side][1, ml.tip_ids[side][point]]
+        shift = .025 if side == "right" else .06
+        command.robot.data.site_pos_w[0, column] = source + env.scene.env_origins[0] + torch.tensor([shift, .01, 0.])
+    command.motion_steps[:] = 1
+    command.reference_phase = dict(motion_ids=torch.tensor([0]), motion_steps=torch.tensor([0]))
+    installed = dict(installed_valid=torch.tensor([True]), reference_motion_ids=torch.tensor([0]),
+                     reference_motion_steps=torch.tensor([1]))
+    term = SimpleNamespace(installed_control=installed)
+    env.action_manager = SimpleNamespace(_terms={"configured_action": term})
+    env._sim_step_counter, command._obj_state_version = 0, 0
+    command._obj_sdf_extent = 2.
+    axis = torch.linspace(-2, 2, 2)
+    grid = torch.zeros(4, 2, 2, 2)
+    grid[0], grid[1] = axis[:, None, None], 1.
+    command._part_sdf = [grid.clone() for _ in command.native_layout.object.parts]
+    return command, env, installed, calls
+
+
+def _source_geometry_observations(env):
+    from mjlab.managers import ObservationManager
+    from omegaconf import OmegaConf
+
+    from envs import build_observations
+
+    recipe = OmegaConf.create(dict(_target_="envs.observations.native.NativeMotionTrackingObs",
+        obs_dict=dict(actor_obs=["native_source_tip_reference_error"],
+                      critic_obs=["native_source_tip_reference_error"])))
+    return ObservationManager(build_observations(recipe, command_name="motion"), env)
+
+
+@pytest.mark.parametrize("widths", [(("right", 3), ("left", 5)), (("left", 3),)],
+                         ids=["bilateral-3-5", "left-only-3"])
+def test_native_source_tip_decision_observation_has_named_independent_support(widths):
+    command, env, installed, _ = _source_geometry_command(widths)
+    side = command._side_list[0]
+    bad = command.motion_lib.tip_ids[side][0]
+    command.motion_lib.native_source_point_position_support[side][1, bad] = False
+    command.motion_lib.mano_joint_pos[side][1, bad] = float("nan")
+    # Registered target-root support is not source-point authority.
+    for name in command._side_list:
+        command.motion_lib.native_root_pose_support[name][1] = False
+    installed["reference_motion_steps"][:] = 0
+    current = command.source_point_reference(command._motion_flat_ids)
+    assert current["source_point_names"][side][0] == command.motion_lib.mano_joint_names[side][bad]
+    assert current["target_site_names"][side] == tuple(command.robot.site_names[i] for i in command._tip_site_ids[side])
+    assert current["reference_time_ns"].dtype == torch.int64
+    assert int(current["reference_time_ns"][0]) == 2**60 + 1_020_000_000
+    manager = _source_geometry_observations(env)
+    observed = manager.compute()
+    total = sum(width for _, width in widths)
+    assert observed["actor"].shape == (1, total * 4)
+    torch.testing.assert_close(observed["actor"], observed["critic"])
+    error, masks = observed["actor"][:, :3 * total].reshape(1, total, 3), observed["actor"][:, 3 * total:]
+    torch.testing.assert_close(error[0, 0], torch.zeros(3))
+    assert masks[0, 0] == 0 and int(masks.sum()) == total - 1
+    # Distinct per-side WORLD errors, expressed in a +90deg actual wrist frame.
+    shift = .025 if side == "right" else .06
+    torch.testing.assert_close(error[0, 1], torch.tensor([-.01, shift, 0.]), atol=1e-6, rtol=1e-6)
+    assert bool(torch.isfinite(observed["actor"]).all())
+    command.motion_lib.native_source_point_position_support = None
+    assert command.source_tip_geometry_facts() is None
+    with pytest.raises(ValueError, match="source-point position support"):
+        NativeMotionTrackingObs.native_source_tip_reference_error(env, "motion")
+    for method, params in ((NativeMotionTrackingRewards.native_source_tip_position, {"scale": 20.}),
+                           (NativeMotionTrackingRewards.native_source_tip_object_bound, {"sigma_m": .01})):
+        with pytest.raises(ValueError, match="source-point position support"):
+            method(env, "motion", **params)
+
+
+def test_native_source_geometry_uses_consumed_packet_at_real_step_and_reset():
+    from mjlab.managers import RewardManager
+    from omegaconf import OmegaConf
+
+    from envs import build_rewards
+    from simulator.env import ManagerBasedRlEnv
+
+    command, protocol, installed, _ = _source_geometry_command()
+    # Normal scene binding and assist initialization, bypassed by this fixture.
+    command.cfg.object.entity_names = {
+        hand.side: command.native_layout.object.entity_name
+        for hand in command.native_layout.hands
+    }
+    command._xfrc_curr_ctrl = None
+    env = object.__new__(ManagerBasedRlEnv)
+    env.scene, env._device = protocol.scene, "cpu"
+    env.scene.num_envs = 1
+    env.cfg = SimpleNamespace(decimation=2, physics_dt=.01, auto_reset=False)
+    env._sim_step_counter, env.common_step_counter = 0, 0
+    env._manual_reset_pending = torch.zeros(1, dtype=torch.bool)
+    env.episode_length_buf, env.extras = torch.zeros(1, dtype=torch.long), {}
+    command._env = env
+    command._eval_mode = True
+    command.cfg.resampling_time_range = (100., 100.)
+    for points in command.motion_lib.mano_joint_pos.values():
+        points.requires_grad_(True)
+    command.time_left, command.command_counter = torch.full((1,), 100.), torch.zeros(1, dtype=torch.long)
+    env.command_manager = SimpleNamespace(get_term=lambda _name: command,
+        compute=lambda dt: command.compute(dt), compute_substep=lambda: None)
+
+    def install():
+        installed["installed_valid"][:] = True
+        installed["reference_motion_ids"][:] = command.motion_ids
+        installed["reference_motion_steps"][:] = command.motion_steps
+
+    env.action_manager = protocol.action_manager
+    env.action_manager.process_action = lambda _action: None
+    env.action_manager.apply_action = install
+    env.sim = SimpleNamespace(begin_control_step=lambda: None, end_control_step=lambda: None,
+        step=lambda: command.robot.data.site_pos_w.add_(torch.tensor([.001, 0., 0.])),
+        forward=lambda: None, sense=lambda: None)
+    env.scene.write_data_to_sim, env.scene.update = lambda: None, lambda dt: None
+    env.termination_manager = SimpleNamespace(compute=lambda: torch.zeros(1, dtype=torch.bool),
+        terminated=torch.zeros(1, dtype=torch.bool), time_outs=torch.zeros(1, dtype=torch.bool))
+    env.event_manager = SimpleNamespace(available_modes=())
+    recipe = OmegaConf.create(dict(_target_="envs.rewards.native.NativeMotionTrackingRewards",
+        reward_weights=dict(native_source_tip_position=.3, native_source_tip_object_bound=.3),
+        reward_scales=dict(native_source_tip_position=20.),
+        reward_params=dict(native_source_tip_object_bound=dict(sigma_m=.01))))
+    env.reward_manager = RewardManager(build_rewards(recipe), env)
+    env.observation_manager = _source_geometry_observations(env)
+    installed["installed_valid"][:] = False
+    with patch.object(command, "sdf_query_parts", wraps=command.sdf_query_parts) as query:
+        reset = command.source_tip_geometry_facts()
+        assert reset["reference_motion_steps"].tolist() == [0] and not bool(reset["execution_valid"].any())
+        assert query.call_count == 2
+        assert NativeMotionTrackingRewards.native_source_tip_position(env, "motion", 20.).item() == 0
+        observations, _, _, _, _ = env.step(torch.zeros(1, 1))
+        endpoint = command.source_tip_geometry_facts()
+        assert query.call_count == 4  # Two total queries shared by both rewards and recorder.
+        assert endpoint is command.source_tip_geometry_facts()
+        assert endpoint["reference_motion_steps"].tolist() == [1]
+        assert command.reference_phase["motion_steps"].tolist() == [1]
+        assert command.motion_steps.tolist() == [2] and env._sim_step_counter == 2
+        assert int(endpoint["reference_time_ns"][0]) == 2**60 + 1_020_000_000
+        assert bool(endpoint["execution_valid"].all())
+        assert not any(value.requires_grad for value in endpoint.values() if isinstance(value, torch.Tensor))
+        current = command.source_point_reference(command._motion_flat_ids)
+        assert int(current["reference_time_ns"][0]) == 2**60 + 1_040_000_000
+        torch.testing.assert_close(observations["actor"], NativeMotionTrackingObs.native_source_tip_reference_error(env, "motion"))
+        old_position = endpoint["achieved_position_w"].clone()
+        env.step(torch.zeros(1, 1))
+        tail = command.source_tip_geometry_facts()
+        assert query.call_count == 6 and tail["reference_motion_steps"].tolist() == [2]
+        assert command.motion_steps.tolist() == [2]  # Real tail clamp, no invented reference row.
+        torch.testing.assert_close(endpoint["achieved_position_w"], old_position)
+        version = command._obj_state_version
+        installed["installed_valid"][:] = False
+        command.reset(torch.tensor([0]))
+        command.compute(0.)
+        assert command._obj_state_version == version + 1
+        reset_again = command.source_tip_geometry_facts()
+        assert query.call_count == 8
+        assert reset_again["reference_motion_steps"].tolist() == [0]
+        assert not bool(reset_again["execution_valid"].any())
+        assert command.motion_steps.tolist() == [1]
+
+
+def test_native_source_part_query_domain_preserves_actual_mesh_chart_and_old_api():
+    from dataclasses import replace
+
+    command, env, _, _ = _source_geometry_command()
+    del env
+    part = replace(command.native_layout.object.parts[0],
+        body_from_mesh_position_m=(.2, .1, 0.),
+        body_from_mesh_quat_wxyz=(2**-.5, 0., 0., 2**-.5))
+    command.native_layout = replace(command.native_layout, object=replace(
+        command.native_layout.object, parts=(part, command.native_layout.object.parts[1])))
+    state = command.sim_object_part_state_w
+    state[:, 0, :3] = torch.tensor([.3, -.2, 0.])
+    state[:, 0, 3:7] = torch.tensor([2**-.5, 0., 0., 2**-.5])
+    state[:, 1, 0] = 5.
+    command._obj_sdf_extent = .5
+    axis = torch.linspace(-.5, .5, 2)
+    grid = torch.zeros(4, 2, 2, 2)
+    grid[0], grid[1] = axis[:, None, None], 1.
+    command._part_sdf = [grid, grid.clone()]
+    # Mesh origin(.2,0,0), WORLD rotation180deg: local x=.1,-.1,.6.
+    points = torch.tensor([[[.1, 0., 0.], [.3, 0., 0.], [-.4, 0., 0.], [float("nan"), 0., 0.]]])
+    distance, gradient, support = command.sdf_query_parts(points, part_state_w=state, return_support=True)
+    torch.testing.assert_close(distance[0, :3, 0], torch.tensor([.1, .1, .5]), atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(gradient[0, 0, 0], torch.tensor([-1., 0., 0.]), atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(gradient[0, 1, 0], torch.tensor([1., 0., 0.]), atol=1e-6, rtol=1e-6)
+    assert support[0, :, 0].tolist() == [True, True, False, False]
+    assert not bool(support[..., 1].any())
+    old_distance, old_gradient = command.sdf_query_parts(points[:, :3], part_state_w=state)
+    torch.testing.assert_close(old_distance, distance[:, :3])
+    torch.testing.assert_close(old_gradient, gradient[:, :3])
+
+
+@pytest.mark.parametrize("widths", [(("right", 3), ("left", 5)), (("left", 3),)],
+                         ids=["bilateral-3-5", "left-only-3"])
+def test_native_source_geometry_reward_split_conserves_supported_mass(widths):
+    from mjlab.managers import RewardManager
+    from omegaconf import OmegaConf
+
+    from envs import build_rewards
+
+    command, env, _, _ = _source_geometry_command(widths)
+    facts = command.source_tip_geometry_facts()
+    n = len(facts["metadata"]["source_point_names"])
+    # Unequal available masses; every side remains on the same global denominator.
+    facts["source_position_support"][:] = False
+    facts["source_position_support"][0, :2] = True
+    if n > 3:
+        facts["source_position_support"][0, 3:7] = True
+    facts["desired_part_query_support"][:] = False
+    facts["live_part_query_support"][:] = False
+    # Disjoint named parts are unavailable, even if independent minima look perfect.
+    facts["desired_part_query_support"][0, 0, 0] = True
+    facts["live_part_query_support"][0, 0, 1] = True
+    facts["desired_part_distance_m"][0, 0] = torch.tensor([.1, .9])
+    facts["live_part_distance_m"][0, 0] = torch.tensor([.9, .1])
+    # Only part1 is common. Minima over different subsets would use the wrong d_ref.
+    facts["desired_part_query_support"][0, 1] = True
+    facts["live_part_query_support"][0, 1, 1] = True
+    facts["desired_part_distance_m"][0, 1] = torch.tensor([0., .2])
+    facts["live_part_distance_m"][0, 1] = torch.tensor([.1, .5])
+    sigma = .2
+    expected_bound = torch.exp(torch.tensor(-.3 / sigma))
+    torch.testing.assert_close(NativeMotionTrackingRewards.native_source_tip_object_bound(env, "motion", sigma), expected_bound[None])
+    with patch.object(command, "source_tip_geometry_facts", return_value=facts):
+        for name, params in (("native_source_tip_position", dict(scale=20.)),
+                             ("native_source_tip_object_bound", dict(sigma_m=sigma))):
+            recipe = dict(_target_="envs.rewards.native.NativeMotionTrackingRewards",
+                reward_weights={name: .3}, reward_params={name: params})
+            whole = RewardManager(build_rewards(OmegaConf.create(recipe)), env).compute(env.step_dt).clone()
+            recipe["split_sides"] = True
+            split = RewardManager(build_rewards(OmegaConf.create(recipe)), env).compute(env.step_dt).clone()
+            torch.testing.assert_close(split, whole)
+            facts["execution_valid"][:] = False
+            assert getattr(NativeMotionTrackingRewards, name)(env, "motion", **params).item() == 0
+            facts["execution_valid"][:] = True
+        facts["source_position_support"][:] = False
+        facts["desired_part_query_support"][:] = False
+        facts["live_part_query_support"][:] = False
+        assert NativeMotionTrackingRewards.native_source_tip_position(env, "motion", 20.).item() == 0
+        assert NativeMotionTrackingRewards.native_source_tip_object_bound(env, "motion", sigma).item() == 0
+    from dataclasses import replace
+
+    parts = command.native_layout.object.parts
+    command.native_layout = replace(command.native_layout, object=replace(
+        command.native_layout.object, parts=(parts[0], replace(parts[1], distance_sign="winding"))))
+    with pytest.raises(ValueError, match="compatible part distance signs"):
+        NativeMotionTrackingRewards.native_source_tip_object_bound(env, "motion", sigma)

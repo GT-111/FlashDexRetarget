@@ -6,6 +6,7 @@ import torch
 from mjlab.utils.lab_api.math import quat_error_magnitude
 
 from .._common import action_term
+from . import _SIDES
 from .motion_tracking import MotionTrackingRewards
 
 
@@ -13,7 +14,52 @@ def _supported_mean(value, support):
     return torch.where(support, value, 0.0).sum(-1) / support.sum(-1).clamp_min(1)
 
 
+def _source_geometry_mean(value, support, metadata, side):
+    """Use the existing builder's half-weight sides and one common denominator."""
+    count = support.sum(-1).clamp_min(1)
+    if side is None:
+        return torch.where(support, value, 0.0).sum(-1) / count
+    if side not in metadata["hand_sides"]:
+        return torch.zeros_like(count, dtype=value.dtype)
+    index = metadata["hand_sides"].index(side)
+    begin, end = metadata["hand_offsets"][index:index + 2]
+    own = torch.where(support[:, begin:end], value[:, begin:end], 0.0).sum(-1)
+    return len(_SIDES) * own / count
+
+
 class NativeMotionTrackingRewards(MotionTrackingRewards):
+    @staticmethod
+    def native_source_tip_position(env, command_name, scale, side=None):
+        """Supported source-tip position mechanism, not a target-Q/BC label."""
+        facts = env.command_manager.get_term(command_name).source_tip_geometry_facts()
+        if facts is None:
+            raise ValueError("native source geometry requires named source-point position support")
+        support = (facts["source_position_support"] & facts["achieved_position_support"]
+                   & facts["execution_valid"][:, None])
+        delta = torch.where(support[..., None], facts["achieved_position_w"] - facts["source_position_w"], 0.0)
+        value = torch.exp(-scale * delta.norm(dim=-1))
+        return _source_geometry_mean(value, support, facts["metadata"], side)
+
+    @staticmethod
+    def native_source_tip_object_bound(env, command_name, sigma_m, side=None):
+        """Declared part-SDF proximity mechanism; never paired contact/penetration."""
+        command = env.command_manager.get_term(command_name)
+        if len({part.distance_sign for part in command.native_layout.object.parts}) != 1:
+            raise ValueError("native source object bound requires compatible part distance signs")
+        facts = command.source_tip_geometry_facts()
+        if facts is None:
+            raise ValueError("native source geometry requires named source-point position support")
+        # Minima must describe the SAME admitted named-part subset for each point.
+        common = (facts["desired_part_query_support"] & facts["live_part_query_support"]
+                  & facts["desired_part_pose_support"][:, None] & facts["live_part_pose_support"][:, None])
+        support = (common.any(-1) & facts["source_position_support"]
+                   & facts["achieved_position_support"] & facts["execution_valid"][:, None])
+        desired = torch.where(common, facts["desired_part_distance_m"], float("inf")).amin(-1)
+        actual = torch.where(common, facts["live_part_distance_m"], float("inf")).amin(-1)
+        excess = torch.where(support, actual - desired, 0.0).clamp_min(0.0)
+        value = torch.exp(-excess / sigma_m)
+        return _source_geometry_mean(value, support, facts["metadata"], side)
+
     @staticmethod
     def native_command_bc(env, command_name, scale, side=None):
         command = env.command_manager.get_term(command_name)

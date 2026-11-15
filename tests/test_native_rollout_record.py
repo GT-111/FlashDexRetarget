@@ -560,3 +560,204 @@ def test_available_native_hands_survive_prepared_pack_library_and_factual_export
     bad_binding = {**binding, "hands": {}}
     with pytest.raises(ValueError, match="actual motion library sides"):
         NativeRolloutRecord(binding=bad_binding).on_start(env)
+
+
+def _source_geometry_protocol(env, command, hand_sides, part_names, part_body_names):
+    """Stopped public endpoint facts; no geometry/SDF/physics is calculated here."""
+    widths = tuple(index + 2 for index, _side in enumerate(hand_sides))
+    offsets = [0]
+    for width in widths:
+        offsets.append(offsets[-1] + width)
+    point_sides = tuple(side for side, width in zip(hand_sides, widths, strict=True) for _ in range(width))
+    metadata = dict(schema="native_source_tip_geometry_v1", hand_sides=tuple(hand_sides), hand_offsets=offsets,
+        point_hand_sides=point_sides,
+        source_point_names=tuple(f"source_{side}_{index}" for side, width in zip(hand_sides, widths, strict=True)
+                                 for index in range(width)),
+        target_site_names=tuple(f"actual_{side}_site_{index}" for side, width in zip(hand_sides, widths, strict=True)
+                                for index in range(width)),
+        part_names=tuple(part_names), part_body_names=tuple(part_body_names),
+        part_distance_sign=tuple("unsigned" for _ in part_names), position_frame="WORLD includes env origin once",
+        position_unit="m", distance_unit="m", query_authority="synthetic in-domain facts, not contact truth",
+        reference_authority="consumed installed packet or actual reset reference_phase")
+    trace = []
+
+    def facts():
+        phase = command.reference_phase
+        batch, points, parts = env.num_envs, len(point_sides), len(part_names)
+        ids = command.motion_lib.length_starts[phase["motion_ids"]] + phase["motion_steps"]
+        local = (torch.arange(points * 3, dtype=torch.float64).reshape(1, points, 3) / 8
+                 + torch.arange(batch, dtype=torch.float64)[:, None, None] * 64
+                 + phase["motion_steps"][:, None, None] / 4)
+        source = local + env.scene.env_origins[:, None]
+        source_support = torch.ones(batch, points, dtype=torch.bool)
+        source_support[:, 1] = False
+        achieved_support = torch.ones_like(source_support)
+        achieved_support[:, 0] = False
+        desired_pose = torch.ones(batch, parts, dtype=torch.bool)
+        desired_pose[:, 0] = False
+        live_pose = torch.ones_like(desired_pose)
+        desired_query = source_support[:, :, None] & desired_pose[:, None, :]
+        live_query = achieved_support[:, :, None] & live_pose[:, None, :]
+        desired_query[:, 0, -1] = False
+        live_query[:, -1, 0] = False
+        distance = torch.arange(points * parts, dtype=torch.float64).reshape(1, points, parts).expand(batch, -1, -1) / 32
+        controls = [env.action_manager.get_term(name).installed_control for name in env.action_manager.active_terms
+                    if hasattr(env.action_manager.get_term(name), "installed_control")]
+        execution = controls[0]["installed_valid"].clone() if controls else phase["motion_steps"] > 0
+        result = dict(metadata=metadata, reference_motion_ids=phase["motion_ids"].clone(),
+            reference_motion_steps=phase["motion_steps"].clone(), reference_time_ns=command.motion_lib.native_time_ns[ids],
+            execution_valid=execution, source_position_w=source, source_position_support=source_support,
+            achieved_position_w=source + .5, achieved_position_support=achieved_support,
+            desired_part_pose_support=desired_pose, live_part_pose_support=live_pose,
+            desired_part_distance_m=distance.clone(), live_part_distance_m=distance + .125,
+            desired_part_query_support=desired_query, live_part_query_support=live_query)
+        trace.append(dict(facts=result, local=local.clone()))
+        return result
+
+    command.source_tip_geometry_facts = facts
+    return metadata, trace
+
+
+@pytest.mark.parametrize("hand_sides", [("left",), ("right",), ("right", "left")],
+                         ids=["left", "right", "ragged-bilateral"])
+def test_source_tip_geometry_active_mask_and_unscored_attempt_reopen(tmp_path, hand_sides):
+    from dexforge_adaptation.flashdex_retarget import load_flashdex_current_attempt
+
+    from evaluation.callbacks.success_export import export_current_attempts
+
+    env, binding = _prepared_native_recorder_fixture(tmp_path, hand_sides=hand_sides)
+    command = env.command_manager.get_term("motion")
+    binding.update(producer_identity={"method": "synthetic geometry serialization, not physics"},
+        scene_identity={"fixture": True},
+        assistance_receipt={"evaluation_external_wrenches_cleared": True, "evaluation_object_playback": False})
+    for hand in binding["hands"].values():
+        hand["command_joint_names"] = {"driver": hand["physical_joint_names"]["driver"]}
+    env.num_envs = 3
+    env.scene.env_origins = torch.tensor([[8., 16., 24.], [32., 40., 48.], [56., 64., 72.]], dtype=torch.float64)
+    for entity in (command.robot, *env.scene.values()):
+        for field, value in vars(entity.data).items():
+            if isinstance(value, torch.Tensor):
+                setattr(entity.data, field, value.repeat((env.num_envs,) + (1,) * (value.ndim - 1)))
+    env.action_manager.action = env.action_manager.action.repeat(env.num_envs, 1)
+    command.sim_obj_trans_w = command.sim_obj_trans_w.repeat(env.num_envs, 1, 1)
+    command.sim_obj_quat_w = command.sim_obj_quat_w.repeat(env.num_envs, 1, 1)
+    command.motion_ids = command.motion_ids.repeat(env.num_envs)
+    command.motion_steps = command.motion_steps.repeat(env.num_envs)
+    command.reference_phase = {key: value.repeat(env.num_envs) for key, value in command.reference_phase.items()}
+    clock_origin = 2**60 + 37
+    command.motion_lib.native_time_ns += clock_origin
+    metadata, trace = _source_geometry_protocol(env, command, hand_sides,
+        tuple(binding["object_part_names"]), tuple(part["body_name"] for part in binding["object_parts"].values()))
+    callback = NativeRolloutRecord(binding=binding)
+    callback.on_start(env)
+    assert len(trace) == 1  # Reset is one endpoint, not an extra setup query.
+    # A producer can reuse its current scratch without changing a saved row.
+    trace[0]["facts"]["source_position_w"][:] = -999.
+    trace[0]["facts"]["source_position_support"][:] = False
+    command.reference_phase["motion_steps"][:] = 1
+    command.motion_steps[:] = 2
+    callback.on_step(env)
+    assert len(trace) == 2
+    state = callback.collect_state(torch.tensor([False, True, True]))
+    # Collected batch metadata cannot be replaced by a later callback batch.
+    callback.source_tip_geometry_metadata_json = "not this collected batch"
+    manifest, motions = export_current_attempts(tmp_path / "unscored-attempts", callback, [state], [
+        dict(motion_id=0, evaluation_row=0, batch_index=0, env_index=1),
+        dict(motion_id=0, evaluation_row=1, batch_index=0, env_index=2)],
+        env_step=0, motion_names=["synthetic-stage"], motion_file=command.motion_lib.motion_file,
+        num_per_motion=3, evaluation_id="geometry-serialization",
+        frozen_authority={"kind": "unscored geometry protocol, no success predicate"},
+        evaluation_report=tmp_path / "unscored-current-policy.json")
+    assert motions[0]["attempts"][2]["recording"]["reason"] == "attempt_not_evaluated"
+    for index, original_env in enumerate((1, 2)):
+        if len(hand_sides) == 2:
+            arrays = load_flashdex_current_attempt(manifest, attempt_id=f"m00000-a{index:05d}").arrays
+        else:
+            # The general fork export permits one side; the Core bridge is bilateral.
+            recording = motions[0]["attempts"][index]["recording"]
+            with np.load(manifest.parent / recording["rollout"], allow_pickle=False) as archive:
+                arrays = {name: archive[name] for name in archive.files}
+        saved = json.loads(str(arrays["source_tip_geometry_metadata_json"]))
+        assert saved["hand_sides"] == list(hand_sides)
+        assert saved["hand_offsets"] == metadata["hand_offsets"]
+        assert saved["source_point_names"] == list(metadata["source_point_names"])
+        assert saved["target_site_names"] == list(metadata["target_site_names"])
+        assert saved["part_names"] == list(binding["object_part_names"])
+        assert saved["position_frame"] == "env-local (scene env_origins subtracted)"
+        assert saved["producer_position_frame"] == metadata["position_frame"]
+        for field in ("reference_motion_ids", "reference_motion_steps", "reference_time_ns"):
+            assert arrays["source_tip_geometry_" + field].dtype == np.int64
+        np.testing.assert_array_equal(arrays["source_tip_geometry_reference_motion_steps"], [0, 1])
+        np.testing.assert_array_equal(arrays["command_motion_steps"], [1, 2])
+        np.testing.assert_array_equal(arrays["source_tip_geometry_reference_time_ns"],
+                                      [clock_origin, clock_origin + 20_000_000])
+        np.testing.assert_array_equal(arrays["source_tip_geometry_execution_valid"], [False, True])
+        expected = np.stack([row["local"][original_env].numpy() for row in trace])
+        np.testing.assert_array_equal(arrays["source_tip_geometry_source_position"], expected)
+        np.testing.assert_array_equal(arrays["source_tip_geometry_achieved_position"], expected + .5)
+        assert arrays["source_tip_geometry_source_position"].dtype == np.float64
+        assert arrays["source_tip_geometry_source_position_support"][0, 0]
+        assert not arrays["source_tip_geometry_source_position_support"][:, 1].any()
+        assert not arrays["source_tip_geometry_achieved_position_support"][:, 0].any()
+        for field in ("source_position_support", "achieved_position_support", "desired_part_pose_support",
+                      "live_part_pose_support", "desired_part_query_support", "live_part_query_support"):
+            assert arrays["source_tip_geometry_" + field].dtype == bool
+        for field in ("desired_part_pose_support", "live_part_pose_support", "desired_part_distance_m",
+                      "live_part_distance_m", "desired_part_query_support", "live_part_query_support"):
+            np.testing.assert_array_equal(arrays["source_tip_geometry_" + field][1],
+                                          trace[1]["facts"][field][original_env].numpy())
+        assert arrays["source_tip_geometry_desired_part_distance_m"].shape == (
+            2, len(metadata["source_point_names"]), len(metadata["part_names"]))
+        assert not any(key.endswith("position_w") for key in arrays if key.startswith("source_tip_geometry_"))
+
+
+def test_source_tip_geometry_uses_real_consumed_phase_through_final_endpoint(tmp_path):
+    from dexforge_adaptation.flashdex_retarget import flashdex_source_mapping
+
+    clock_origin = 2**60 + 37
+    source = flashdex_source_mapping(source_id="arctic", source_revision="fixture", source_unit_id="fixture",
+        source_episode_index=174, fold="train", source_frame_index=(0, 1, 2),
+        source_time_ns=(clock_origin, clock_origin + 20_000_000, clock_origin + 40_000_000),
+        selected_source_frame_index=(0, 1, 2), prepared_source_ordinal=(0., 1., 2.),
+        prepared_elapsed_time_ns=(0, 20_000_000, 40_000_000),
+        clock_authority="synthetic exact reference clock", processing={"fixture": True})
+    binding = dict(producer_identity={"method": "synthetic recorder phase protocol"},
+        scene_identity={"fixture": True}, scene_from_source_world=np.eye(4).tolist(),
+        assistance_receipt={"evaluation_external_wrenches_cleared": True, "evaluation_object_playback": False},
+        hands={side: dict(body_name=side + "_root", command_joint_names={"driver": side + "_driver"},
+                         physical_joint_names={"driver": side + "_driver"}) for side in ("left", "right")},
+        object_part_names=["base", "lid"], object_parts={name: dict(entity_name="object", body_name=body)
+            for name, body in (("base", "object_root"), ("lid", "object_lid"))}, clips={"fixture": source})
+    trace = []
+
+    def setup(env, command):
+        command.motion_lib.native_time_ns = (
+            command.motion_lib.native_time_ns - command.motion_lib.native_time_ns[0] + clock_origin
+        )
+        parts = command.native_layout.object.parts
+        _metadata, rows = _source_geometry_protocol(env, command, command._side_list,
+            tuple(part.name for part in parts), tuple(part.body_name for part in parts))
+        trace.append(rows)
+
+    manifest = record_reference_phase_fixture(tmp_path, binding, native=True, setup_scene=setup)
+    archive = json.loads(manifest.read_text())
+    with np.load(manifest.parent / archive["saved"][0]["rollout"], allow_pickle=False) as arrays:
+        np.testing.assert_array_equal(arrays["recorded_motion_steps"], [0, 1, 2])
+        np.testing.assert_array_equal(arrays["command_motion_steps"], [1, 2, 2])
+        np.testing.assert_array_equal(arrays["source_tip_geometry_reference_motion_ids"], [0, 0, 0])
+        np.testing.assert_array_equal(arrays["source_tip_geometry_reference_motion_steps"], [0, 1, 2])
+        np.testing.assert_array_equal(arrays["source_tip_geometry_reference_time_ns"],
+            [clock_origin, clock_origin + 20_000_000, clock_origin + 40_000_000])
+        np.testing.assert_array_equal(arrays["source_tip_geometry_execution_valid"], [False, True, True])
+        assert arrays["source_tip_geometry_source_position_support"][0].any()
+        assert len(trace[0]) == 3
+
+
+def test_source_tip_geometry_absent_modality_exports_no_invented_group(tmp_path):
+    env, binding = _prepared_native_recorder_fixture(tmp_path, hand_sides=("right",))
+    command = env.command_manager.get_term("motion")
+    command.source_tip_geometry_facts = lambda: None
+    callback = NativeRolloutRecord(binding=binding)
+    callback.on_start(env)
+    arrays = callback.rollout_arrays([callback.collect_state()], 0)
+    assert not any(key.startswith("source_tip_geometry_") for key in arrays)

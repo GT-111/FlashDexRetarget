@@ -80,6 +80,25 @@ def _reader(path, *, joint_names=("left_a", "left_mimic", "right_b")):
     return module.MotionLibrary(str(path), robot, finger_names=C.FINGERS, device="cpu")
 
 
+def _with_source_point_support(clip):
+    native = clip["native_reference"]
+    native["source_point_names"], native["source_point_position_support"] = {}, {}
+    base_names = C.MANO_JOINT_NAMES
+    frames, points = C.num_frames(clip), len(base_names)
+    positions = np.arange(frames * points * 3, dtype=np.float32).reshape(frames, points, 3) / 1000
+    for side_index, side in enumerate(C.sides(clip)):
+        clip_names = base_names[::-1]
+        source_names = base_names[side_index + 1:] + base_names[:side_index + 1]
+        clip[f"mano_{side}_joint_names"] = np.asarray(clip_names)
+        clip[f"mano_{side}_joints"] = positions[:, [base_names.index(name) for name in clip_names]]
+        support = np.ones((frames, points), bool)
+        support[0, base_names.index("thumb_tip")] = False
+        support[2, base_names.index("index_tip")] = False
+        native["source_point_names"][side] = source_names
+        native["source_point_position_support"][side] = support[:, [base_names.index(name) for name in source_names]]
+    return clip
+
+
 def _mesh(dataset):
     mesh = dataset / "objects/synthetic-mesh/visual.obj"
     mesh.parent.mkdir(parents=True)
@@ -276,6 +295,85 @@ def test_native_boundary_rejects_clock_row_support_and_actual_joint_identity_mis
         _reader(path, joint_names=("left_a", "left_mimic", "unrelated_joint"))
 
 
+def test_source_point_masks_follow_crop_pack_and_actual_mano_name_order(tmp_path):
+    original = _with_source_point_support(_clip())
+    cropped = _crop(original, 1)
+    path = _pack(tmp_path, cropped)
+    library = _reader(path)
+    native = original["native_reference"]
+    assert library.native_source_point_position_support is not None
+    np.testing.assert_array_equal(library.native_time_ns, native["time_ns"][1:])
+    packed = torch.load(path, weights_only=False)
+    for side in C.sides(original):
+        source_names = native["source_point_names"][side]
+        canonical = [source_names.index(name) for name in C.MANO_JOINT_NAMES]
+        actual = library.native_source_point_position_support[side]
+        np.testing.assert_array_equal(actual, native["source_point_position_support"][side][1:, canonical])
+        assert actual.dtype == torch.bool
+        assert library.mano_joint_names[side] == list(C.MANO_JOINT_NAMES)
+        np.testing.assert_array_equal(library.mano_joint_pos[side], C.joints(original, side)[1:])
+        assert actual[0].all() and not library.native_root_pose_support[side][0]
+        assert not actual[1, C.MANO_JOINT_NAMES.index("index_tip")]
+        assert library.native_root_pose_support[side][1]
+        carried = packed["motion_native_reference"][0]
+        assert carried["source_point_names"][side] == source_names
+        np.testing.assert_array_equal(carried["source_point_position_support"][side],
+                                      native["source_point_position_support"][side][1:])
+
+
+def test_absent_source_point_modality_remains_unavailable_for_native_and_stock(tmp_path):
+    for native in (True, False):
+        clip = _clip()
+        if not native:
+            del clip["native_reference"]
+        directory = tmp_path / ("native" if native else "stock")
+        directory.mkdir()
+        library = _reader(_pack(directory, clip))
+        assert library.native_source_point_position_support is None
+
+
+def test_source_point_boundary_rejects_unpaired_sides_names_and_nonboolean_rows(tmp_path):
+    for invalid in ("unpaired", "side", "duplicate", "unknown", "shape", "numeric", "point_rows"):
+        clip = _with_source_point_support(_clip())
+        native = clip["native_reference"]
+        names = native["source_point_names"]["left"]
+        if invalid == "unpaired":
+            del native["source_point_names"]
+            message = "supplied together"
+        elif invalid == "side":
+            del native["source_point_position_support"]["left"]
+            message = "different source hand sides"
+        elif invalid == "duplicate":
+            native["source_point_names"]["left"] = names[:-1] + (names[0],)
+            message = "distinct actual MANO point names"
+        elif invalid == "unknown":
+            native["source_point_names"]["left"] = names[:-1] + ("not_a_source_point",)
+            message = "distinct actual MANO point names"
+        elif invalid == "shape":
+            native["source_point_position_support"]["left"] = np.ones((2, len(names)), bool)
+            message = "explicit boolean"
+        elif invalid == "numeric":
+            native["source_point_position_support"]["left"] = np.ones((3, len(names)), np.float32)
+            message = "explicit boolean"
+        else:
+            clip["mano_left_joints"] = clip["mano_left_joints"][:, :-1]
+            message = "actual MANO point rows"
+        with TestCase().assertRaisesRegex(ValueError, message):
+            C.native_reference(clip)
+
+
+def test_native_reader_rejects_mixed_source_point_modality_presence(tmp_path):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    dataset = tmp_path / "dataset"
+    _mesh(dataset)
+    C.save_clip(prepared / "supported.npz", _with_source_point_support(_clip()))
+    C.save_clip(prepared / "unavailable.npz", _clip())
+    build(prepared, dataset, 60., SimpleNamespace(vel_sigma=2., contact_threshold=.015))
+    with TestCase().assertRaisesRegex(ValueError, "mix available and unavailable source-point support"):
+        _reader(dataset / "motion.pt")
+
+
 if __name__ == "__main__":
     # Match the existing native-contract harness; the author env needs no pytest install.
     import sys
@@ -290,6 +388,10 @@ if __name__ == "__main__":
         test_actual_native_pack_and_reader_keep_names_independent_support_and_exact_clock,
         test_actual_crop_pack_and_reopen_keep_native_rows_static_names_and_source_inventory,
         test_native_boundary_rejects_clock_row_support_and_actual_joint_identity_mismatch,
+        test_source_point_masks_follow_crop_pack_and_actual_mano_name_order,
+        test_absent_source_point_modality_remains_unavailable_for_native_and_stock,
+        test_source_point_boundary_rejects_unpaired_sides_names_and_nonboolean_rows,
+        test_native_reader_rejects_mixed_source_point_modality_presence,
     )
     selected = set(sys.argv[1:]) if len(sys.argv) > 1 else {case.__name__ for case in cases}
     for case in cases:
