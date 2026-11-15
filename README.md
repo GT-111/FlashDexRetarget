@@ -247,6 +247,14 @@ freeze retains WandB `0.15.12`; installing that older pin in native pulls
 native requirements normally, including WandB's dependencies; do not reuse the
 author freeze or skip WandB dependency resolution.
 
+The native profile pins NumPy `1.26.4` so its ordinary trusted NPZ reader can
+load object-valued native references written with NumPy 2. NumPy `1.26.1`
+added the required [`numpy._core` pickle stubs](https://numpy.org/doc/2.0/release/1.26.1-notes.html#numpy-core-submodule-stubs);
+`1.26.4` retains Python 3.12 support within the same 1.26 series. The author
+Python 3.11 freeze keeps its recorded NumPy `1.26.0`. Use a fresh native
+environment and the normal reader; preserve existing exported clips and
+their provenance when qualifying a profile change.
+
 For a manually managed native environment, create a fresh Python 3.12 venv.
 Keep the recorded FlashSAC source in `third_party/rsl_rl_flashsac`; a normal
 checkout initializes that submodule, while an admitted source publication may
