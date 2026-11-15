@@ -15,12 +15,12 @@ from hydra.utils import instantiate
 from mjlab.rl import RslRlVecEnvWrapper
 from omegaconf import DictConfig
 
-from agents import Agent
+from agents import Policy
 from evaluation.callbacks.success_export import export_current_attempts, export_success
 
 
 def evaluate(
-    agent: Agent,
+    agent: Policy,
     eval_env: RslRlVecEnvWrapper,
     eval_cfg: DictConfig,
     device: str,
@@ -182,7 +182,7 @@ def write_current_policy_outcomes(
 
 # ─── rollout ───────────────────────────────────────────────────────────────────
 def _rollout(
-    agent: Agent, eval_env: RslRlVecEnvWrapper, callbacks: list, device: str,
+    agent: Policy, eval_env: RslRlVecEnvWrapper, callbacks: list, device: str,
     *, attempt_rows: list[dict[str, int]] | None = None,
 ) -> dict[int, list]:
     """Reset + deterministic inference over every eval batch;

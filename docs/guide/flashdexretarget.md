@@ -446,6 +446,8 @@ The runner config picks the algorithm: `runner=flashsac` (the default). A new al
 `src/agents/<name>.py` implementing `agents.Agent` (`src/agents/base.py`) plus `config/runner/<name>.yaml`
 with `defaults: [base, _self_]`, `algorithm: <name>` (checkpoints go to `logs/<name>/`) and
 `runner.agent.class_name`.
+Its `Agent.load_policy` must load that same registered acting architecture for
+frozen evaluation without constructing the algorithm's training owners.
 
 ## Evaluation
 
@@ -479,6 +481,65 @@ receipt; the report infers no checkpoint path. Include `evaluation/` in durable
 run publication. Periodic and final evaluations at the same env step retain
 separate timestamped reports. Native reference tracking and net-link-force/SDF
 association do not certify physical interaction or articulated BOX success.
+
+### Evaluate a frozen checkpoint without replay
+
+Activate the selected runtime's existing environment, then use the public entry
+with the checkpoint's resolved scene and learner configuration. Use a new or
+empty output directory and record the committed executable source separately
+from the checkpoint producer:
+
+```sh
+FLASH_SOURCE_REF=<committed-evaluator-source-sha> python evaluate.py \
+    --checkpoint /path/to/checkpoint \
+    --config_path /path/to/resolved-config-directory --config_name evaluation \
+    --overrides run_dir=/path/to/new-evaluation \
+    --overrides runner.run_dir=/path/to/new-evaluation
+```
+
+`--config_name` is the YAML stem, and `--overrides` may be repeated for ordinary
+Hydra overrides. Preserve the checkpoint's robot, motion roster, observation and
+action layouts, physics, evaluation reset, thresholds and assistance settings.
+The config still selects the existing runtime and environment factory; this
+entry adds no environment profile or alternative actor architecture.
+
+The registered `runner.agent.class_name` supplies a policy-only loader.
+FlashSAC uses the same actor builder as normal learning and strictly restores
+its complete `actor_state_dict`, including running BatchNorm and trajectory
+encoder buffers. It applies the same observation-layout checks and action
+affine coordinates. Policy loading constructs no critic, optimizer, reward
+normalizer or replay and restores no saved curriculum or RNG state. The ordinary
+environment factory still creates its configured managers and uses the existing
+evaluation transitions. The common `flashsac.pt` tensor container is CPU-mapped;
+only the actor state is installed in the acting module. Neither
+`replay_buffer.pt` nor `learning_state.pt` is opened.
+
+One ordinary flat-wrapper metadata reset supplies the real environment layout
+and configured command identity before scoring. The evaluator keeps its normal
+scoring and exit resets. The config seed starts a fresh process; this does not
+replay the saved simulator or training RNG state. `resume_state.json` supplies
+the checkpoint's actual training env step; do not substitute a nominal save or
+decision grid. Bind the checkpoint producer and the committed executable
+revision separately in the operation receipt. Keep experiment-specific motion
+rosters, criteria and checkpoint outcomes in that operation's evidence; the
+public criteria above remain the default configuration's authority.
+
+The entry writes `evaluation-entry.json` and the ordinary all-motion
+`evaluation/current-policy-<actual-env-step>-<UTC>.json`. Failed, unscored and
+absent attempts remain in their existing denominators. It does not load
+first-success or ever-success state or select a success-only archive. This CLI
+writes the ordinary scalar report; the explicit all-attempt recording API below
+retains its separate selection contract.
+
+Keep training and evaluation assistance distinct. Active reference-centered
+object PD assistance differs from passive support. With
+`eval.env.disable_object_pin=true`, ordinary shared evaluation disables the
+command's pin/controller and submits its existing wrench clear. The entry
+records the configured flag and actual command pin state before/during/after
+evaluation. These are request/flag facts: accepted or applied
+object wrench remains UNKNOWN when the scene exposes no public readback.
+Net-link force/SDF association and a tracking pass do not establish exact
+hand-part forces, successful interaction, F1/BOX or cross-hand transfer.
 
 For a frozen checkpoint comparison, the public `evaluate` call accepts
 `recording_dir` and `frozen_authority={"checkpoint": ..., "source_revision": ...}`.

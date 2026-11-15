@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import random
 import time
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -684,3 +686,195 @@ def test_training_entry_cleanup_preserves_success_and_failure_status(monkeypatch
     assert events[-2] == "logger_close"
     if failure != "create_envs":
         assert events[-4:-2] == ["train_close", "eval_close"]
+
+
+def _frozen_policy_fixture(*, encoded_window=False):
+    """Small real registered actor, including the stock side/trajectory contracts."""
+    base = _agent()
+    cfg = base._cfg
+    del base
+    encoded = [["future_traj", 12]] if encoded_window else []
+    width = 6 + sum(dim for _, dim in encoded)
+    if encoded_window:
+        cfg = replace(cfg, traj_encoder={
+            "enable": True, "aggregation": "maxpool", "n_future": 3, "n_sides": 2,
+            "latent_dim": 4, "hidden_dim": 8, "num_layers": 1,
+        })
+    observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(width,), dtype=np.float32)
+    action_space = gym.spaces.Box(
+        low=np.array([-2., -.5, .2, -3.], dtype=np.float32),
+        high=np.array([1., 2., 1.5, -1.], dtype=np.float32), dtype=np.float32,
+    )
+    info = {
+        "actor_observation_size": (6,), "encoded_obs_dims": encoded,
+        "obs_terms": [["actor", "state", 6]] + [[name, "window", dim] for name, dim in encoded],
+        "reward_heads": ["right", "left"],
+        "action_sides": {"right": [2, 0], "left": [3, 1]},
+    }
+    agent = FlashSACAgent(observation_space, action_space, info, cfg)
+    env = SimpleNamespace(share_obs=True, single_observation_space=observation_space,
+                          single_action_space=action_space)
+    config = OmegaConf.create({"class_name": "agents.flashsac.FlashSACAgent", **asdict(cfg)})
+    return agent, env, info, config
+
+
+@pytest.mark.parametrize("encoded_window", [False, True])
+def test_policy_only_load_matches_normal_actor_and_statistics_without_training_owners(
+    tmp_path, monkeypatch, encoded_window,
+):
+    import agents.flashsac as owner
+    from agents import load_policy
+
+    agent, env, info, cfg = _frozen_policy_fixture(encoded_window=encoded_window)
+    width = env.single_observation_space.shape[-1]
+    observations = torch.linspace(-.7, .8, 5 * width).reshape(5, width)
+    # Populate the actual actor's running statistics; a fresh unnormalized actor
+    # cannot accidentally match the saved policy on these observations.
+    agent._alg.actor.get_mean_and_std(
+        agent._alg.actor.flatten_obs(agent._layout.actor_input(observations)), training=True,
+    )
+    expected = agent.act(observations, deterministic=True)
+    checkpoint = tmp_path / "full"
+    agent.save(str(checkpoint))
+    saved_actor = {name: tensor.clone() for name, tensor in agent._alg.actor.state_dict().items()}
+    cfg.buffer_compact_obs = True  # live inference must not allocate replay or a compactor
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Policy-only load constructed a training/replay owner")
+
+    for name in ("build_flashsac", "MultiHeadCritic", "ReplayBuffer", "MultiHeadFlashSAC"):
+        monkeypatch.setattr(owner, name, forbidden)
+    monkeypatch.setattr(torch.optim, "Adam", forbidden)
+    original_load, loads = torch.load, []
+
+    def load(path, **kwargs):
+        loads.append((Path(path).name, kwargs))
+        return original_load(path, **kwargs)
+
+    monkeypatch.setattr(torch, "load", load)
+    policy = load_policy(cfg, env, info, "motion", str(checkpoint))
+    np.testing.assert_array_equal(policy.act(observations, deterministic=True), expected)
+    assert loads == [("flashsac.pt", {"map_location": "cpu", "mmap": True, "weights_only": True})]
+    for name, value in policy.actor.state_dict().items():
+        torch.testing.assert_close(value, saved_actor[name], rtol=0, atol=0)
+    assert all(not parameter.requires_grad for parameter in policy.actor.parameters())
+    assert not policy.checkpoint_authority["replay_loaded"]
+    assert not policy.checkpoint_authority["critic_constructed"]
+    with pytest.raises(ValueError, match="deterministic"):
+        policy.act(observations, deterministic=False)
+
+
+def test_policy_only_load_rejects_equal_width_layout_change_before_model_read(tmp_path, monkeypatch):
+    from agents import load_policy
+
+    agent, env, info, cfg = _frozen_policy_fixture(encoded_window=True)
+    agent.save(str(tmp_path))
+    incompatible = {**info, "encoded_obs_dims": [["different_window", 12]]}
+    monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: pytest.fail("layout must be checked first"))
+    with pytest.raises(ValueError, match="encoded obs"):
+        load_policy(cfg, env, incompatible, "motion", str(tmp_path))
+    incompatible = {**info, "obs_terms": [["actor", "a", 3], ["actor", "b", 3],
+                                         ["future_traj", "window", 12]]}
+    with pytest.raises(ValueError, match="obs layout differs"):
+        load_policy(cfg, env, incompatible, "motion", str(tmp_path))
+
+
+def test_policy_only_load_rejects_incomplete_saved_actor(tmp_path):
+    from agents import load_policy
+
+    agent, env, info, cfg = _frozen_policy_fixture()
+    agent.save(str(tmp_path))
+    model = torch.load(tmp_path / "flashsac.pt", weights_only=True)
+    model["actor_state_dict"].pop(next(iter(model["actor_state_dict"])))
+    torch.save(model, tmp_path / "flashsac.pt")
+    with pytest.raises(RuntimeError, match="Missing key"):
+        load_policy(cfg, env, info, "motion", str(tmp_path))
+
+
+def test_frozen_evaluation_entry_routes_public_policy_and_ordinary_evaluator(tmp_path, monkeypatch):
+    import agents
+    import common.utils as utils
+    import envs
+    import simulator.runtime as runtime_owner
+    from envs.vec_env import FlatObsVecEnv
+
+    evaluation_owner = importlib.import_module("evaluation.evaluate")
+
+    source = Path(__file__).resolve().parents[1] / "evaluate.py"
+    spec = importlib.util.spec_from_file_location("frozen_evaluation_entry", source)
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    events = []
+    checkpoint = tmp_path / "full"
+    checkpoint.mkdir()
+    (checkpoint / "resume_state.json").write_text(json.dumps({"env_step": 39_290_880}))
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    run_dir = tmp_path / "run"
+    cfg = OmegaConf.create({
+        "run_dir": str(run_dir), "seed": 42, "device": "cpu", "headless": True,
+        "runner": {"share_actor_critic_obs": True,
+                   "agent": {"class_name": "agents.flashsac.FlashSACAgent"}},
+        "eval": {"command_name": "native_reference", "num_per_motion": 1,
+                 "env": {"disable_object_pin": True},
+                 "command": {"sampling_mode": "start", "noise_to_initial_level": 0., "start_frame": 0}},
+    })
+    OmegaConf.save(cfg, config_dir / "eval.yaml")
+    command = SimpleNamespace(cfg=SimpleNamespace(object=SimpleNamespace(pin_objects=True)))
+    def get_command(name):
+        assert name == "native_reference"
+        return command
+
+    raw = SimpleNamespace(
+        command_manager=SimpleNamespace(get_term=get_command), num_envs=3,
+        eval_num_motions=3, eval_num_batches=1, physics_dt=1 / 240, step_dt=1 / 60,
+    )
+    train = SimpleNamespace(unwrapped=raw, close=lambda: events.append("train_close"))
+
+    def enter_eval():
+        events.append("ordinary_enter_eval")
+        command.cfg.object.pin_objects = False
+
+    evaluated = SimpleNamespace(unwrapped=raw, enter_eval=enter_eval,
+                                close=lambda: events.append("eval_close"))
+    flat = SimpleNamespace(single_observation_space=SimpleNamespace(shape=(6,)),
+                           single_action_space=SimpleNamespace(shape=(4,)),
+                           reset=lambda: (events.append("metadata_reset"), {"obs_terms": []}))
+    policy = SimpleNamespace(checkpoint_authority={"checkpoint_directory": str(checkpoint),
+                                                 "replay_loaded": False})
+    monkeypatch.setattr(runtime_owner, "launch_runtime", lambda _cfg: SimpleNamespace(
+        close=lambda *, exit_code: events.append(("runtime_close", exit_code))))
+    monkeypatch.setattr(utils, "set_seed", lambda seed: events.append(("seed", seed)))
+    monkeypatch.setattr(utils, "configure_torch_backends", lambda: None)
+    monkeypatch.setattr(envs, "create_envs", lambda _cfg, *, device: (train, evaluated))
+    def make_flat(actual_env, *, command: object, share_obs, reward_heads):
+        assert actual_env is raw and command is get_command("native_reference")
+        assert share_obs is True and reward_heads is None
+        return flat
+
+    monkeypatch.setattr(FlatObsVecEnv, "from_env", make_flat)
+
+    def load(_cfg, actual_env, info, name, path):
+        assert actual_env is flat and info == {"obs_terms": []} and name == "native_reference"
+        assert path == str(checkpoint)
+        events.append("public_load_policy")
+        return policy
+
+    def evaluate(actual_policy, actual_env, _cfg, device, **kwargs):
+        assert actual_policy is policy and actual_env is evaluated and device == "cpu"
+        assert kwargs == {"ever_state": None, "success_dir": None, "env_step": 39_290_880,
+                          "outcome_dir": run_dir / "evaluation"}
+        assert not command.cfg.object.pin_objects
+        events.append("ordinary_evaluate")
+        return {"eval/SR": 0.}
+
+    monkeypatch.setattr(agents, "load_policy", load)
+    monkeypatch.setattr(evaluation_owner, "evaluate", evaluate)
+    entry.run(argparse.Namespace(config_path=str(config_dir), config_name="eval", overrides=[],
+                                 checkpoint=str(checkpoint)))
+    assert events == [("seed", 42), "metadata_reset", "public_load_policy", "ordinary_enter_eval",
+                      "ordinary_evaluate", "train_close", "eval_close", ("runtime_close", 0)]
+    result = json.loads((run_dir / "evaluation-entry.json").read_text())
+    assert result["status"] == "COMPLETED_CURRENT_POLICY_EVALUATION"
+    assert result["training_env_step"] == 39_290_880 and result["pin_during_eval"] is False
+    assert result["wrench_measurement"].startswith("UNKNOWN")

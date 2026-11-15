@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 
@@ -12,6 +12,12 @@ if TYPE_CHECKING:
     from omegaconf import DictConfig
 
     from envs.vec_env import FlatObsVecEnv
+
+
+class Policy(Protocol):
+    """The existing evaluator needs only deterministic actions, not a learner."""
+
+    def act(self, obs: Any, deterministic: bool = False) -> np.ndarray: ...
 
 
 class Agent(ABC):
@@ -24,6 +30,14 @@ class Agent(ABC):
         cls, cfg: DictConfig, env: FlatObsVecEnv, env_info: dict[str, Any], command_name: str
     ) -> Agent:
         """Construct from ``runner.agent``; may adjust ``cfg`` in place (the runner logs it after)."""
+
+    @classmethod
+    @abstractmethod
+    def load_policy(
+        cls, cfg: DictConfig, env: FlatObsVecEnv, env_info: dict[str, Any],
+        command_name: str, checkpoint: str,
+    ) -> Policy:
+        """Restore the frozen acting owner without replay, critic or optimizer construction."""
 
     @abstractmethod
     def act(self, obs: Any, deterministic: bool = False) -> np.ndarray:
