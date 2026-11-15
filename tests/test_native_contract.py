@@ -2,6 +2,7 @@
 
 import xml.etree.ElementTree as ET
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -151,6 +152,68 @@ def test_native_conversion_inputs_preserve_subtree_inertials_and_one_articulated
     assert not static.findall(".//freejoint") + static.findall(".//joint[@type='free']")
 
 
+def test_native_file_meshes_resolve_from_each_generated_xml(tmp_path):
+    import mujoco
+
+    layout, _ = _scene(tmp_path)
+    tree = ET.parse(layout.scene_xml_path)
+    tree.getroot().find("compiler").set("meshdir", "input_meshes")
+    asset = ET.SubElement(tree.getroot(), "asset")
+    expected = {}
+    vertices = [
+        (-.03, -.02, -.01), (.03, -.02, -.01),
+        (.03, .02, -.01), (-.03, .02, -.01),
+        (-.03, -.02, .01), (.03, -.02, .01),
+        (.03, .02, .01), (-.03, .02, .01),
+    ]
+    faces = [
+        (1, 3, 2), (1, 4, 3), (5, 6, 7), (5, 7, 8),
+        (1, 2, 6), (1, 6, 5), (4, 8, 7), (4, 7, 3),
+        (1, 5, 8), (1, 8, 4), (2, 3, 7), (2, 7, 6),
+    ]
+    contents = "".join(
+        f"{prefix} {' '.join(map(str, values))}\n"
+        for prefix, rows in (("v", vertices), ("f", faces)) for values in rows
+    )
+    for side, scale in (("left", "1.2 .8 1.1"), ("right", ".9 1.3 .7")):
+        mesh_file = tmp_path / "input_meshes" / side / "palm.obj"
+        mesh_file.parent.mkdir(parents=True)
+        mesh_file.write_text(contents)
+        expected[side] = (mesh_file, scale)
+        # Both supported source forms reach the same compiled writer. Left and
+        # right have the same basename in different original asset directories.
+        file = str(mesh_file) if side == "right" else f"{side}/palm.obj"
+        ET.SubElement(asset, "mesh", name=f"{side}_palm", file=file, scale=scale)
+        geom = tree.getroot().find(f".//body[@name='{side}_root']/geom")
+        geom.attrib.pop("size")
+        geom.attrib.update(type="mesh", mesh=f"{side}_palm")
+    tree.write(layout.scene_xml_path)
+    paths = write_native_mjcf_assets(layout, {
+        "static": str(tmp_path / "converted/environment/static.usd"),
+        "articulations": {b.entity_name: str(tmp_path / "converted" / b.entity_name / "asset.usd")
+                          for b in layout.articulations},
+    })
+    for side, (original, scale) in expected.items():
+        xml_path = Path(paths[f"hand_{side}"])
+        saved = ET.parse(xml_path).getroot()
+        compiler = saved.find("compiler")
+        assert compiler.get("meshdir", "") == ""
+        meshes = saved.findall("asset/mesh")
+        assert len(meshes) == 1 and meshes[0].get("name") == f"{side}_palm"
+        mesh = meshes[0]
+        assert not Path(mesh.get("file")).is_absolute()
+        # Match the pinned parser's string concatenation before normalization;
+        # Path(base) / absolute would hide the original duplicated-prefix defect.
+        importer_path = f"{xml_path.parent}/{compiler.get('meshdir', '')}/{mesh.get('file')}"
+        assert Path(importer_path).resolve() == original
+        np.testing.assert_array_equal(np.fromstring(mesh.get("scale"), sep=" "),
+                                      np.fromstring(scale, sep=" "))
+        assert original.read_text() == contents
+        compiled = mujoco.MjModel.from_xml_path(str(xml_path))
+        assert compiled.nmesh == 1
+        assert compiled.mesh(0).name == f"{side}_palm"
+
+
 def test_native_inline_mesh_roundtrip_keeps_body_local_convex_envelope(tmp_path):
     import mujoco
 
@@ -174,15 +237,20 @@ def test_native_inline_mesh_roundtrip_keeps_body_local_convex_envelope(tmp_path)
     original = mujoco.MjModel.from_xml_path(layout.scene_xml_path)
     paths = write_native_mjcf_assets(layout, {
         "static": str(tmp_path / "converted/static.usd"),
-        "articulations": {b.entity_name: str(tmp_path / "converted" / (b.entity_name + ".usd"))
+        "articulations": {b.entity_name: str(tmp_path / "converted" / b.entity_name / "asset.usd")
                           for b in layout.articulations},
     })
     saved_xml = ET.parse(paths["object"]).getroot()
     mesh = saved_xml.find("asset/mesh[@name='inline_hull']")
     assert mesh.get("vertex") is None and mesh.get("scale") == "1 1 1"
-    from pathlib import Path
-
-    obj = Path(mesh.get("file")).read_text().splitlines()
+    assert not Path(mesh.get("file")).is_absolute()
+    xml_path = Path(paths["object"])
+    compiler = saved_xml.find("compiler")
+    assert compiler.get("meshdir", "") == ""
+    importer_path = f"{xml_path.parent}/{compiler.get('meshdir', '')}/{mesh.get('file')}"
+    obj_path = Path(importer_path).resolve()
+    assert obj_path == tmp_path / "converted/native_meshes/inline_hull.obj"
+    obj = obj_path.read_text().splitlines()
     assert any(line.startswith("f ") for line in obj)
     saved = mujoco.MjModel.from_xml_path(paths["object"])
 

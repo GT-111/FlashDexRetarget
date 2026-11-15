@@ -105,6 +105,14 @@ For a supported equality `q_f - q_f0 = p0 + p1 * (q_d - q_d0)`, the USD mimic eq
 
 Inline native MJCF meshes are materialized with the actual compiled triangle faces and their compiled geom chart. This retains the authored convex envelope, local placement and scale without applying mesh recentering twice. It does not convert the original object task surface into a collision mesh or replace the original part/SDF surface with the compiled hull. The object remains one articulation, with its source passive hinge, gravity and authored support; no object motion assistance is added.
 
+Each split MJCF has an empty meshdir and mesh references relative to that
+generated XML. This preserves original file-backed assets and compiled inline
+hulls while matching the pinned Isaac5.1 importer path rules. Source mesh files
+are not renamed or modified. The importer itself may create a temporary sibling
+directory beside a resolved mesh; source file preservation does not imply
+readonly-directory support. Successful conversion and installed constraint
+response require their separate runtime qualification.
+
 Converted and externally supplied native USDs pass the same read-only named-body/joint, FREE-root, limit, mimic instance/reference-axis and follower-drive admission before the first physics parse. An absent own DriveAPI adds no position-drive authority; present passive drives must have zero stiffness, and present mimic drives must have zero stiffness and damping. The pinned normal BOX import itself authors its source zero-stiffness drive. USD admission and software forwarding tests are separate from actual installed property/constraint response, which needs a pinned-Isaac F1/BOX qualification; stock XHand SAC results do not qualify these native assets. Isaac net-link force and SDF proximity remain distinct from native solved hand-part pair forces.
 
 Stock USD collision overrides are installed after the scene owner makes nested

@@ -343,6 +343,7 @@ def write_native_mjcf_assets(layout, assets) -> dict[str, str]:
     bodies whose original inertial was derived from multiple collision geoms.
     Inline hulls use compiled triangles and geom poses in one declared chart.
     Body transforms and supported passive equalities are retained.
+    Mesh files resolve relative to each generated importer XML, with no meshdir.
     This function compiles metadata only; it does not create MjData or step.
     """
     from pathlib import Path
@@ -433,6 +434,11 @@ def write_native_mjcf_assets(layout, assets) -> dict[str, str]:
                 document.remove(element)
         output = Path(usd).with_suffix(".xml")
         output.parent.mkdir(parents=True, exist_ok=True)
+        # Isaac's MJCF parser prefixes XML directory + meshdir even for absolute
+        # mesh filenames. The original input and generated hulls are absolute;
+        # bind both to this XML after pruning its actual retained mesh roster.
+        for mesh in document.findall("asset/mesh[@file]"):
+            mesh.set("file", os.path.relpath(mesh.get("file"), output.parent))
         ET.ElementTree(document).write(output, encoding="utf-8", xml_declaration=True)
         outputs[name] = str(output)
     return outputs
