@@ -176,7 +176,7 @@ python - "$PROFILE" <<'PY'
 import importlib.metadata as md
 import sys
 
-packages = ["torch", "rsl-rl-lib", "rsl-rl-flashsac", "tensordict", "FlashDexRetarget"]
+packages = ["torch", "numpy", "rsl-rl-lib", "rsl-rl-flashsac", "tensordict", "FlashDexRetarget"]
 packages += ["isaacsim", "isaaclab"] if sys.argv[1] == "isaac" else ["mujoco", "mujoco-warp", "warp-lang", "newton"]
 if sys.argv[1] == "newton":
     packages += ["dexforge-core", "dexforge-tracking"]

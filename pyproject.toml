@@ -30,7 +30,7 @@ dependencies = [
   "isaaclab==2.3.0",
   "torch==2.7.0",               # +cu128
   "warp-lang==1.10.1",
-  "numpy==1.26.0",
+  "numpy==1.26.4",
   "scipy==1.15.3",
   "trimesh==4.5.1",
   "coacd==1.0.10",              # data preparation only (src/retarget/object/obj_convex_decompose.py)

@@ -1,5 +1,6 @@
-# Pinned freeze of the working IsaacSim-backend env `DexManip_isaac` (py3.11): isaacsim 5.1.0.0,
-# isaaclab 2.3.0, torch 2.7.0 cu128, warp-lang 1.10.1. Install with --no-deps (docs/setup_isaac.md).
+# Isaac author-stack baseline (Python3.11): Sim5.1.0.0/Lab2.3.0, Torch2.7cu128/Warp1.10.1.
+# NumPy1.26.4 adds normal NumPy2-pickle interoperability; historical1.26.0
+# qualification remains bound to its own receipt. Install --no-deps via README Setup.
 absl-py==2.3.1
 accessible-pygments==0.0.5
 aioboto3==15.1.0
@@ -129,7 +130,7 @@ myst-parser==4.0.1
 nest-asyncio==1.5.6
 networkx==3.3
 numba==0.59.1
-numpy==1.26.0
+numpy==1.26.4
 nvidia-cublas-cu12==12.8.3.14
 nvidia-cuda-cupti-cu12==12.8.57
 nvidia-cuda-nvrtc-cu12==12.8.61
