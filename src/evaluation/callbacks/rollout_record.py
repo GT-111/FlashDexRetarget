@@ -472,8 +472,8 @@ class NativeRolloutRecord(RolloutRecord):
                     result["native_physics_time_s"] = np.array([float(frame["physics_time_s"][row]) for frame in frames])
                     result["native_physics_reset_time_s"] = np.asarray(float(frames[0]["physics_time_s"][row]))
                     result["native_physics_clock_metadata_json"] = np.asarray(json.dumps(dict(
-                        authority="actual per-world solver floating-point time at achieved endpoint",
-                        origin="first recorded reset sample; absolute solver time retained",
+                        authority="actual endpoint physical time from the owning scene; backend identity records engine authority",
+                        origin="first recorded reset sample; raw backend time retained",
                         source_clock="independent original int64 source/reference clocks",
                         elapsed_time_ns="nominal control elapsed time from recorded reset",
                     )))

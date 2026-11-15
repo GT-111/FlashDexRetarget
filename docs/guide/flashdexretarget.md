@@ -282,6 +282,13 @@ This schedule is distinct from the accumulated floating solver counter and from
 an exact sum of binary device dt. Missing advances remain unsupported; recorder
 row numbers alone cannot supply execution evidence.
 
+Isaac's scene clock reads `SimulationContext.current_time` as FP64 values
+repeated across clone worlds. This is the SDK's global physics-step callback
+time; partial entity resets leave it unchanged. Each factual tape retains its
+actual reset epoch. It is separate from source/reference time, nominal control
+elapsed time and an accepted-step ledger. Exact hand–part pair forces and their
+intervals remain unavailable from Isaac net-link/SDF views.
+
 The readouts borrow stopped views of fixed storage until the next control,
 state change or reset. Capacity comes from `decimation`. Reset or authored
 state installation discards affected rows; physical restore preserves its

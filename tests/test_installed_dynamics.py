@@ -542,7 +542,7 @@ def test_normal_subset_reset_restores_gravcomp_after_sdk_scene_clears_wrenches(
         reset=sdk_scene_reset,
         write_data_to_sim=lambda: forwarded.append(scheduled.clone()),
     )
-    scene = _isaac_scene_type(monkeypatch)(sdk_scene, "cpu")
+    scene = _isaac_scene_type(monkeypatch)(sdk_scene, "cpu", SimpleNamespace(current_time=0.0))
     scene._clock = adapter._clock
     scene.entities["robot"] = adapter
     gravity = [0.0, 0.0, -9.81]

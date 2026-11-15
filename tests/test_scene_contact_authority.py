@@ -149,7 +149,7 @@ def test_manager_binds_complete_independent_commands_before_observations(monkeyp
         backend_scene = SimpleNamespace(
             cfg=SimpleNamespace(num_envs=1), env_origins=torch.zeros(1, 3)
         )
-        scene = adapter_type(backend_scene, "cpu")
+        scene = adapter_type(backend_scene, "cpu", SimpleNamespace(current_time=0.0))
         bank, views = _bank()
         scene._tracking_banks["left"] = bank
         scene.sensors.update(views)
@@ -395,3 +395,29 @@ def test_normal_recorder_distinguishes_unavailable_pair_force_from_measured_zero
             assert np.isnan(arrays["hand_part_force_bearing_distance_max_m"]).all()
         else:
             assert not any(name.startswith("hand_part_") for name in arrays.files)
+
+
+def test_isaac_scene_clock_reads_global_sdk_time_through_partial_entity_reset(monkeypatch):
+    adapter_type = _isaac_scene_type(monkeypatch)
+    reset_rows = []
+    context = SimpleNamespace(current_time=7.125000000000007)
+    backend_scene = SimpleNamespace(
+        cfg=SimpleNamespace(num_envs=3), env_origins=torch.zeros(3, 3),
+        reset=lambda rows: reset_rows.append(rows.clone()),
+    )
+    scene = adapter_type(backend_scene, "cpu", context)
+    before = scene.physics_time_s()
+    assert before.dtype == torch.float64 and before.shape == (3,)
+    assert before.tolist() == [context.current_time] * 3
+    rows = torch.tensor([2, 0])
+    scene.reset(rows)
+    assert torch.equal(reset_rows[0], rows)
+    assert torch.equal(scene.physics_time_s(), before)
+    # This is a stopped SDK protocol value, deliberately unlike nominal manager time.
+    context.current_time = 7.148456789012345
+    after = scene.physics_time_s()
+    assert after.tolist() == [context.current_time] * 3
+    assert before.tolist() == [7.125000000000007] * 3
+    assert scene.backend_identity["physics_clock"]["scope"] == "scene-global time repeated over cloned environments"
+    assert scene.hand_part_contact_facts() is None
+    assert scene.hand_part_contact_interval_facts() is None

@@ -350,7 +350,7 @@ def test_measurement_callback_and_current_report_use_all_samples_and_real_denomi
 
 def test_isaac_net_link_and_sdf_views_do_not_create_interval_pair_force_support(monkeypatch):
     sim, _scene = _sim()
-    adapter = _isaac_scene_type(monkeypatch)(SimpleNamespace(), "cpu")
+    adapter = _isaac_scene_type(monkeypatch)(SimpleNamespace(), "cpu", SimpleNamespace(current_time=0.0))
     env = _callback_env(sim, adapter)
     events = []
     isaac = IsaacSimAdapter(SimpleNamespace(step=lambda render: events.append("step")), "cpu")

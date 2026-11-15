@@ -52,8 +52,19 @@ def _alllink_bodies_by_side(cfg) -> dict[str, list[str]]:
 class IsaacSceneAdapter:
     """Duck-typed mjlab ``Scene``: name lookup, origins, step-loop hooks."""
 
-    def __init__(self, scene: InteractiveScene, device: str) -> None:
-        self.backend_identity = {"backend": "isaacsim", "solver": "PhysX"}
+    def __init__(
+        self, scene: InteractiveScene, device: str, sim_ctx: sim_utils.SimulationContext
+    ) -> None:
+        self.backend_identity = {
+            "backend": "isaacsim", "solver": "PhysX",
+            "physics_clock": {
+                "authority": "Isaac Sim SimulationContext.current_time physics-step callback accumulation",
+                "scope": "scene-global time repeated over cloned environments",
+                "partial_reset": "entity reset does not reset the global SDK clock",
+                "continuation": "raw callback clock; no accepted-step ledger or opaque solver snapshot",
+            },
+        }
+        self._sim_ctx = sim_ctx
         self.root_wrench_application = {
             "frame": "WORLD", "point": "root_link_COM",
             "recorded_wrench_point": "root_link_COM",
@@ -81,6 +92,12 @@ class IsaacSceneAdapter:
     def hand_part_contact_interval_facts(self):
         """Exact pair-force intervals are unavailable from net-link/SDF views."""
         return None
+
+    def physics_time_s(self):
+        """Raw scene-global SDK physics time, repeated over the clone-world axis."""
+        return torch.full(
+            (self.num_envs,), self._sim_ctx.current_time, dtype=torch.float64, device=self.device
+        )
 
     @property
     def num_envs(self) -> int:
@@ -622,7 +639,7 @@ def build_isaac_scene(
     # 0.0 matches every run before the fix (resets cleared it); 0.8 is the MJCF gravcomp.
     sim_adapter.add_gravity_compensator(robot_adapter, float(cfg.sim.get("robot_gravcomp", 0.0)))
 
-    scene_adapter = IsaacSceneAdapter(scene, device)
+    scene_adapter = IsaacSceneAdapter(scene, device, sim_ctx)
     scene_adapter._clock = clock
     scene_adapter.entities[cfg.robot.entity_name] = robot_adapter
     for name in support_views:
@@ -901,7 +918,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     clock = _FreshnessClock()
     sim = IsaacSimAdapter(sim_ctx, device, render=not bool(cfg.get("headless", True)))
     sim._clock = clock
-    adapter = IsaacSceneAdapter(scene, device)
+    adapter = IsaacSceneAdapter(scene, device, sim_ctx)
     adapter._clock = clock
     adapter.native_layout = layout
     hands = {}

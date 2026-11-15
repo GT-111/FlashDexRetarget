@@ -407,3 +407,59 @@ def test_prepared_native_recorder_rejects_different_reference_source_or_placemen
         provenance["authority"] = "achieved_state"
     with pytest.raises(ValueError, match="imported frame/scene lineage"):
         NativeRolloutRecord(binding=binding).on_start(env)
+
+
+def test_isaac_callback_clock_survives_ordinary_native_recorder_and_reader(monkeypatch, tmp_path):
+    from dexforge_adaptation.flashdex_retarget import load_flashdex_current_attempt
+    from test_scene_contact_authority import _isaac_scene_type
+
+    from evaluation.callbacks.success_export import export_current_attempts
+
+    env, binding = _prepared_native_recorder_fixture(tmp_path)
+    binding.update(
+        producer_identity={"method": "synthetic clock protocol, not physical execution"},
+        scene_identity={"fixture": True},
+        assistance_receipt={"evaluation_external_wrenches_cleared": True, "evaluation_object_playback": False},
+    )
+    for hand in binding["hands"].values():
+        hand["command_joint_names"] = {"driver": hand["physical_joint_names"]["driver"]}
+    command = env.command_manager.get_term("motion")
+    sdk_scene = SimpleNamespace(
+        cfg=SimpleNamespace(num_envs=env.num_envs), env_origins=env.scene.env_origins,
+    )
+    context = SimpleNamespace(current_time=7.125000000000007)
+    scene = _isaac_scene_type(monkeypatch)(sdk_scene, "cpu", context)
+    scene.entities.update(env.scene)
+    env.scene = scene
+    callback = NativeRolloutRecord(binding=binding)
+    callback.on_start(env)
+    times = [context.current_time, 7.144999999552972, 7.165000123456789]
+    for row, time_s in enumerate(times[1:], 1):
+        context.current_time = time_s
+        command.reference_phase["motion_steps"][:] = row
+        command.motion_steps[:] = min(row + 1, 2)
+        callback.on_step(env)
+    state = callback.collect_state()
+    manifest, _motions = export_current_attempts(
+        tmp_path / "clock-attempts", callback, [state],
+        [dict(motion_id=0, evaluation_row=0, batch_index=0, env_index=0)],
+        env_step=17, motion_names=["synthetic-stage"], motion_file=command.motion_lib.motion_file,
+        num_per_motion=1, evaluation_id="clock-protocol",
+        frozen_authority={"checkpoint": "synthetic-not-a-policy.pt", "source_revision": "protocol-only"},
+        evaluation_report=tmp_path / "current-policy.json",
+    )
+    recorded = load_flashdex_current_attempt(manifest, attempt_id="m00000-a00000")
+    arrays = recorded.arrays
+    assert arrays["native_physics_time_s"].dtype == np.float64
+    np.testing.assert_array_equal(arrays["native_physics_time_s"], times)
+    assert arrays["native_physics_reset_time_s"] == times[0]
+    np.testing.assert_array_equal(arrays["elapsed_time_ns"], [0, 20_000_000, 40_000_000])
+    np.testing.assert_array_equal(arrays["recorded_motion_steps"], [0, 1, 2])
+    metadata = json.loads(str(arrays["native_backend_metadata_json"]))
+    assert metadata["physics_clock"] == scene.backend_identity["physics_clock"]
+    clock = json.loads(str(arrays["native_physics_clock_metadata_json"]))
+    assert "owning scene" in clock["authority"]
+    assert clock["origin"] == "first recorded reset sample; raw backend time retained"
+    assert "native_execution_steps" not in arrays
+    assert "hand_part_interval_metadata_json" not in arrays
+    assert "hand_part_contact_metadata_json" not in arrays
