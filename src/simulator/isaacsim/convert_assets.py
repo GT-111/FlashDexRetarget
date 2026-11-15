@@ -442,6 +442,11 @@ def convert_native_scene(config_path: str) -> None:
     """Use the pinned Isaac Lab MJCF converter, never the rigid density path."""
     from pathlib import Path
 
+    from isaacsim.core.utils.extensions import enable_extension
+
+    if not enable_extension("isaacsim.asset.importer.mjcf"):
+        raise RuntimeError("Isaac native conversion could not enable isaacsim.asset.importer.mjcf")
+
     from isaaclab.sim.converters import MjcfConverter, MjcfConverterCfg
     from omegaconf import OmegaConf
 

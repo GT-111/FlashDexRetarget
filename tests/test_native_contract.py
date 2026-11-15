@@ -267,6 +267,13 @@ def test_native_affine_import_units_admission_and_normal_conversion_caller(monke
     OmegaConf.save(OmegaConf.create({"robot": {"native_scene": mapping},
                                     "sim": {"native_assets": assets}}), config)
     events = []
+    extensions = ModuleType("isaacsim.core.utils.extensions")
+    extensions.enable_extension = Mock(
+        side_effect=lambda name: (events.append(("enable", name)) or True)
+    )
+    for name in ("isaacsim", "isaacsim.core", "isaacsim.core.utils"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    monkeypatch.setitem(sys.modules, "isaacsim.core.utils.extensions", extensions)
     converters = ModuleType("isaaclab.sim.converters")
     converters.MjcfConverterCfg = lambda **kwargs: SimpleNamespace(**kwargs)
     converters.MjcfConverter = lambda cfg: events.append(("convert", cfg))
@@ -276,13 +283,22 @@ def test_native_affine_import_units_admission_and_normal_conversion_caller(monke
     complete = Mock(side_effect=lambda path, meta: events.append(("complete", meta)))
     monkeypatch.setattr(convert_assets, "complete_native_usd", complete)
     convert_assets.convert_native_scene(str(config))
-    assert [kind for kind, _ in events] == ["convert", "complete"] * 3 + ["convert"]
+    assert events[0] == ("enable", "isaacsim.asset.importer.mjcf")
+    assert [kind for kind, _ in events[1:]] == ["convert", "complete"] * 3 + ["convert"]
     assert [meta.free_roots[0].body_name for kind, meta in events if kind == "complete"] == [
         b.root_body_name for b in layout.articulations
     ]
     configs = [cfg for kind, cfg in events if kind == "convert"]
     assert [cfg.fix_base for cfg in configs] == [False, False, False, True]
     assert all(cfg.import_inertia_tensor and not cfg.make_instanceable for cfg in configs)
+    # Failed activation is a conversion capability failure, never a retry with
+    # an absent ImportConfig or another simulator/version.
+    events.clear()
+    extensions.enable_extension.side_effect = None
+    extensions.enable_extension.return_value = False
+    with pytest.raises(RuntimeError, match="could not enable isaacsim.asset.importer.mjcf"):
+        convert_assets.convert_native_scene(str(config))
+    assert events == []
     # This CPU case proves connected dispatch and units, not USD/PhysX response.
 
 

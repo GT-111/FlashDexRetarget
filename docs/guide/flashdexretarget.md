@@ -93,6 +93,12 @@ binding does not replace it.
 
 The native Isaac profile converts the configured MJCF subtrees through the existing `convert_assets.py --native-scene-config <resolved-native-config>` entry. It retains separate FREE hand articulations and one FREE object articulation with its original passive hinge. The scene's named body, actuator and part bindings remain the source of the dimensions and addresses.
 
+After the normal Isaac launch, the native converter enables
+`isaacsim.asset.importer.mjcf` through the public extension manager before using
+the Lab converter. Extension discovery alone does not register its Kit commands;
+failed activation stops conversion. This dependency belongs to native MJCF
+conversion and leaves the stock URDF and direct MjWarp/Newton routes unchanged.
+
 The currently supported scalar import chart is hinge/slide joints with zero authored joint references. Supported mimic constraints are active affine joint equalities between limited revolute joints in the same FREE articulation, with one passive follower and a nonzero driver coefficient. Nonlinear, constant-only, cross-articulation, inactive and other equality constraints are rejected before conversion. Nonzero scalar references are also rejected; the current F1/BOX recipe uses zero references. This boundary does not claim that the importer preserves a nonzero-reference joint frame.
 
 For a supported equality `q_f - q_f0 = p0 + p1 * (q_d - q_d0)`, the USD mimic equation is `q_f + gearing * q_d + offset = 0`: `gearing = -p1`, and `offset` is the negative affine offset in degrees. Source limits are retained instead of expanded to accommodate the constraint. Mimic followers have zero own position-drive stiffness/damping. Their original passive damping is authored as the PhysX angular viscous coefficient in torque-seconds per degree (`D * pi / 180`), and runtime joint-property installation preserves this separation. This is an explicit PhysX realization; it is not a claim of numerical equivalence to MuJoCo's soft equality solver.
