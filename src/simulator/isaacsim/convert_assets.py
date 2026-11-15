@@ -204,11 +204,17 @@ def _materialize_native_inline_meshes(document, model, directory) -> None:
 
 
 def _native_usd_views(usd_path, meta):
-    from pxr import Usd, UsdPhysics
+    from pxr import Usd
 
     stage = Usd.Stage.Open(str(usd_path))
     if stage is None:
         raise ValueError(f"cannot open native USD: {usd_path}")
+    return _native_usd_stage_views(stage, meta)
+
+
+def _native_usd_stage_views(stage, meta):
+    from pxr import Usd, UsdPhysics
+
     bodies, joints, roots = {}, {}, []
     for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
         if prim.HasAPI(UsdPhysics.RigidBodyAPI):
@@ -234,14 +240,41 @@ def _native_usd_views(usd_path, meta):
     return stage, bodies, joints
 
 
+def _complete_native_articulation_roots(stage) -> None:
+    from pxr import Usd, UsdPhysics
+
+    prims = tuple(stage.Traverse(Usd.TraverseInstanceProxies()))
+    mechanical_paths = []
+    for prim in prims:
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI) or prim.IsA(UsdPhysics.Joint):
+            mechanical_paths.append(prim.GetPath())
+        if prim.IsA(UsdPhysics.Joint):
+            joint = UsdPhysics.Joint(prim)
+            mechanical_paths.extend(joint.GetBody0Rel().GetTargets())
+            mechanical_paths.extend(joint.GetBody1Rel().GetTargets())
+    for prim in prims:
+        if (not prim.HasAPI(UsdPhysics.ArticulationRootAPI)
+                or any(path.HasPrefix(prim.GetPath()) for path in mechanical_paths)):
+            continue
+        # Isaac5.1 addWorldGeomsAndSites authors both APIs even when its
+        # non-rigid scaffold has no bodies or joints. Keep the prim and every
+        # other property; actual mechanical roots remain strictly admitted.
+        prim.RemoveAPI(UsdPhysics.ArticulationRootAPI)
+        prim.RemoveAppliedSchema("PhysxArticulationAPI")
+
+
 def complete_native_usd(usd_path, meta) -> None:
     """Install the native constraints missing from pinned MJCF import, pre-parse."""
     from omni.physx.bindings._physx import (
         JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR,
     )
-    from pxr import PhysxSchema, Sdf, UsdPhysics
+    from pxr import PhysxSchema, Sdf, Usd, UsdPhysics
 
-    stage, _, joints = _native_usd_views(usd_path, meta)
+    stage = Usd.Stage.Open(str(usd_path))
+    if stage is None:
+        raise ValueError(f"cannot open native USD: {usd_path}")
+    _complete_native_articulation_roots(stage)
+    stage, _, joints = _native_usd_stage_views(stage, meta)
     for i, name in enumerate(meta.joint_names):
         prim = joints[name]
         joint = (UsdPhysics.RevoluteJoint(prim) if prim.IsA(UsdPhysics.RevoluteJoint)

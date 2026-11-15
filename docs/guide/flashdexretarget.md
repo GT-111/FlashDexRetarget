@@ -113,6 +113,14 @@ directory beside a resolved mesh; source file preservation does not imply
 readonly-directory support. Successful conversion and installed constraint
 response require their separate runtime qualification.
 
+Native conversion completes importer-authored articulation APIs before strict
+admission. Isaac5.1 can mark a disconnected, non-rigid world-geometry scaffold
+as an articulation root. Completion removes only its articulation APIs when it
+has no rigid-body/joint descendants or joint-endpoint involvement; it preserves
+the prim, its other attributes and referenced source layers. Actual mechanical
+roots remain subject to the one-declared-FREE-root requirement. Read-only
+admission of an external USD does not perform this normalization.
+
 Converted and externally supplied native USDs pass the same read-only named-body/joint, FREE-root, limit, mimic instance/reference-axis and follower-drive admission before the first physics parse. An absent own DriveAPI adds no position-drive authority; present passive drives must have zero stiffness, and present mimic drives must have zero stiffness and damping. The pinned normal BOX import itself authors its source zero-stiffness drive. USD admission and software forwarding tests are separate from actual installed property/constraint response, which needs a pinned-Isaac F1/BOX qualification; stock XHand SAC results do not qualify these native assets. Isaac net-link force and SDF proximity remain distinct from native solved hand-part pair forces.
 
 Stock USD collision overrides are installed after the scene owner makes nested
