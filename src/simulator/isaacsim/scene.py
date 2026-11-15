@@ -863,13 +863,30 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
             assets[binding.entity_name] = Articulation(
                 _native_articulation_cfg(binding, meta, cfg)
             )
+    from pxr import UsdPhysics
+
     contacts = {}
     for hand in layout.hands:
+        asset_path = assets[hand.entity_name].cfg.prim_path
+        entity_path = next(
+            path
+            for path in sim_utils.find_matching_prim_paths(asset_path, stage=scene.stage)
+            if path.startswith(f"{scene.env_prim_paths[0]}/")
+        )
+        bodies = {
+            prim.GetName(): prim
+            for prim in sim_utils.get_all_matching_child_prims(
+                entity_path,
+                predicate=lambda prim: prim.HasAPI(UsdPhysics.RigidBodyAPI),
+                stage=scene.stage,
+            )
+        }
         for body in cfg.robot.contact_links[hand.side]:
             metadata[hand.entity_name].body_names.index(body)
+            relative_path = str(bodies[body].GetPath()).removeprefix(entity_path)
             contacts[body] = ContactSensor(
                 ContactSensorCfg(
-                    prim_path=f"/World/envs/env_.*/{hand.entity_name}/{body}",
+                    prim_path=f"{asset_path}{relative_path}",
                     update_period=0.0,
                 )
             )

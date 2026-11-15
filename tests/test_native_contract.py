@@ -495,6 +495,126 @@ def test_native_isaac_scene_keeps_mimic_viscous_and_passive_hinge_authority(monk
     assert torch.get_default_dtype() == original_default_dtype
 
 
+def test_native_isaac_contacts_resolve_named_rigid_descendants_before_reset(monkeypatch, tmp_path):
+    import sys
+    from types import ModuleType
+
+    import pytest
+    from omegaconf import OmegaConf
+    from test_scene_contact_authority import _isaac_scene_type
+
+    layout, mapping = _scene(tmp_path)
+    metadata = load_robot_mjcf_meta(layout.scene_xml_path)
+    scene_module = sys.modules[_isaac_scene_type(monkeypatch).__module__]
+    rigid_api = object()
+    pxr = ModuleType("pxr")
+    pxr.UsdPhysics = SimpleNamespace(RigidBodyAPI=rigid_api)
+    monkeypatch.setitem(sys.modules, "pxr", pxr)
+    roots = {
+        "hand_left": "/World/envs/env_.*/Imports/receiver_A",
+        "hand_right": "/World/envs/env_.*/Ports/receiver_B",
+        "object": "/World/envs/env_.*/Scene/passive_object",
+    }
+    left = roots["hand_left"].replace("env_.*", "env_0")
+    right = roots["hand_right"].replace("env_.*", "env_0")
+    stage = object()
+    events = []
+    checked_rigid_paths = []
+
+    class Prim:
+        def __init__(self, path, rigid):
+            self.path, self.rigid = path, rigid
+
+        def GetName(self):
+            return self.path.rsplit("/", 1)[1]
+
+        def GetPath(self):
+            return self.path
+
+        def HasAPI(self, api):
+            assert api is rigid_api
+            checked_rigid_paths.append(self.path)
+            return self.rigid
+
+    prims = [
+        Prim(left + "/left_root", False),  # Same-name wrapper is not a body.
+        Prim(left + "/left_root/left_root", True),
+        Prim(left + "/left_root/Digits/left_follower", True),
+        Prim(right + "/Rig/right_root", False),
+        Prim(right + "/Rig/Roots/right_root", True),
+        Prim(right + "/Rig/right_second", True),
+        Prim("/World/unrelated/left_root", True),
+    ]
+
+    def find_paths(regex, *, stage):
+        assert stage is native_scene.stage
+        events.append(("find", regex))
+        return [regex.replace("env_.*", "env_1"), regex.replace("env_.*", "env_0")]
+
+    def find_children(path, predicate, *, stage):
+        assert stage is native_scene.stage and path in (left, right)
+        events.append(("bodies", path))
+        return [prim for prim in prims
+                if prim.path.startswith(path + "/") and predicate(prim)]
+
+    native_scene = SimpleNamespace(
+        stage=stage, env_prim_paths=["/World/envs/env_0", "/World/envs/env_1"],
+        articulations={}, rigid_objects={}, sensors={},
+        clone_environments=lambda **kw: events.append(("clone", kw)),
+        filter_collisions=lambda **kw: events.append(("filter", kw)),
+    )
+    monkeypatch.setattr(scene_module, "InteractiveScene", lambda cfg: native_scene)
+    monkeypatch.setattr(scene_module, "InteractiveSceneCfg", lambda **kw: SimpleNamespace(**kw))
+    monkeypatch.setattr(scene_module, "_native_articulation_cfg",
+                        lambda binding, meta, cfg: SimpleNamespace(prim_path=roots[binding.entity_name]))
+    monkeypatch.setattr(scene_module, "Articulation", lambda cfg: SimpleNamespace(cfg=cfg))
+    monkeypatch.setattr(scene_module, "ContactSensorCfg", lambda **kw: SimpleNamespace(**kw))
+    monkeypatch.setattr(scene_module, "ContactSensor", lambda cfg: SimpleNamespace(cfg=cfg))
+    for name in ("UsdFileCfg", "DomeLightCfg"):
+        monkeypatch.setattr(scene_module.sim_utils, name,
+                            lambda **kw: SimpleNamespace(func=lambda *args: None), raising=False)
+    monkeypatch.setattr(scene_module.sim_utils, "find_matching_prim_paths", find_paths, raising=False)
+    monkeypatch.setattr(scene_module.sim_utils, "get_all_matching_child_prims", find_children, raising=False)
+    cfg = OmegaConf.create({
+        "robot": {"native_scene": mapping, "contact_links": {
+            "left": ["left_root", "left_follower"],
+            "right": ["right_root", "right_second"],
+        }},
+        "scene": {"num_envs": 2, "env_spacing": 1.0},
+        "sim": {"native_assets": {"static": "unused-static.usd"}},
+    })
+
+    class AtReset(RuntimeError):
+        pass
+
+    def stop_at_reset():
+        events.append(("reset",))
+        raise AtReset
+
+    # Exercise the production builder through sensor registration, before SDK reset.
+    with pytest.raises(AtReset):
+        scene_module._build_native_isaac_scene(
+            cfg, SimpleNamespace(reset=stop_at_reset), "cpu", metadata,
+        )
+    expected = {
+        "left_root": roots["hand_left"] + "/left_root/left_root",
+        "left_follower": roots["hand_left"] + "/left_root/Digits/left_follower",
+        "right_root": roots["hand_right"] + "/Rig/Roots/right_root",
+        "right_second": roots["hand_right"] + "/Rig/right_second",
+    }
+    assert {name: sensor.cfg.prim_path for name, sensor in native_scene.sensors.items()} == {
+        f"_native_contact_{name}": path for name, path in expected.items()
+    }
+    assert all(sensor.cfg.update_period == 0.0 for sensor in native_scene.sensors.values())
+    assert checked_rigid_paths == [prim.path for prim in prims[:-1]]
+    assert events == [
+        ("find", roots["hand_left"]), ("bodies", left),
+        ("find", roots["hand_right"]), ("bodies", right),
+        ("clone", {"copy_from_source": False}),
+        ("filter", {"global_prim_paths": []}), ("reset",),
+    ]
+
+
 def test_actual_native_action_derives_dimensions_and_records_accepted_supported_targets(
     tmp_path,
 ):

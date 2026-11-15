@@ -128,6 +128,13 @@ Runtime damping, armature and friction tensors use the dtype of their actual
 SDK destination buffers. Shared compiled metadata retains its original numeric
 precision; this boundary does not change Torch's global default dtype.
 
+Native contact sensors resolve their configured body names against the actual
+spawned asset's rigid-body prims before reset. Their paths retain the asset's
+environment regex and the imported body's relative hierarchy. An importer
+wrapper with the same name as a body is not the physical contact address.
+Contact reporter activation remains enabled; resolving an address does not
+qualify installed reporter behavior or hand–part force measurement.
+
 Stock USD collision overrides are installed after the scene owner makes nested
 references editable, before material binding and the first physics reset.
 Robot and parked-object edits precede environment cloning; per-world objects,
