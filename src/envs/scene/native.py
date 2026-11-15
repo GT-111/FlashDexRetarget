@@ -102,12 +102,23 @@ class NativeSceneCfg:
 
 
 def bind_native_scene_config(cfg, *, constructor_gravity_world_m_per_s2) -> NativeSceneCfg:
-    """Admit one static native recipe against its compiled constructor gravity."""
+    """Admit a native recipe with fixed constructor gravity and explicit force assistance."""
     from omegaconf import open_dict
 
     layout = NativeSceneCfg.from_mapping(cfg.robot.native_scene)
-    if cfg.curriculum:
+    assisted = bool(cfg.commands.object.pin_objects)
+    if cfg.curriculum and not assisted:
         raise ValueError("native producer uses the declared static unassisted recipe; curriculum must be empty")
+    if set(cfg.curriculum) - {"xfrc_curriculum_adaptive"}:
+        raise ValueError("native assistance admits only xfrc_curriculum_adaptive; gravity remains the compiled constructor value")
+    if assisted:
+        obj = cfg.commands.object
+        if obj.pin_mode != "xfrc":
+            raise ValueError("native object assistance requires the explicit xfrc force mode")
+        if len({part.body_name for part in layout.object.parts}) != len(layout.object.parts):
+            raise ValueError("native assistance requires one declared reference part per actual body")
+        if obj.perturb.enabled or obj.xfrc.implicit_damping or float(obj.xfrc.contact_scale) != 1.0:
+            raise ValueError("native xfrc supports explicit PD without perturbation, implicit damping or contact scaling")
     gravity = tuple(float(value) for value in constructor_gravity_world_m_per_s2)
     for hand in layout.hands:
         control = hand.root_control
@@ -121,8 +132,6 @@ def bind_native_scene_config(cfg, *, constructor_gravity_world_m_per_s2) -> Nati
         cfg.commands.object.entity_names = {
             h.side: layout.object.entity_name for h in layout.hands
         }
-    if cfg.commands.object.pin_objects:
-        raise ValueError("native object task requires pin_objects=false")
     if cfg.commands.object.support_disks.enable:
         raise ValueError("native scene uses its authored static support")
     return layout

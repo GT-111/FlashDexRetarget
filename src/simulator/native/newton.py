@@ -27,6 +27,8 @@ class NewtonPlant(NativePlant):
         self.backend.assert_torch_device_identity(device)
         self._init_buffers(self.backend.model, num_envs, device, contact_pairs)
         self._state = self.backend.public_state_torch()
+        self._world_ids = torch.arange(num_envs, device=device)
+        self._body_ids = torch.arange(1, self.model.nbody, device=device)
         self.effort = torch.zeros(num_envs, self.model.nv, device=device)
         self.identity = {
             "backend": "newton", "solver": "SolverMuJoCo",
@@ -47,11 +49,17 @@ class NewtonPlant(NativePlant):
     def set_state(self, env_ids, qpos, qvel):
         self._state = self.backend.set_state_torch(env_ids, qpos=qpos, qvel=qvel)
         self.effort[env_ids] = 0
+        self.external_body_wrench_w[env_ids] = 0
         self.invalidate_contacts(env_ids)
 
     def advance(self):
         self.prepare_contact_substep()
         sample_time = self.physics_time()
+        self.backend.set_body_wrench_w_torch(
+            self._world_ids, body_ids=self._body_ids,
+            forces=self.external_body_wrench_w[:, 1:, :3],
+            torques=self.external_body_wrench_w[:, 1:, 3:],
+        )
         result = self.backend.step_torch(self.control, nsteps=1)
         self._state = result.public_state
         if result.applied_joint_effort is None:

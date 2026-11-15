@@ -71,6 +71,7 @@ class NativePlantSnapshot:
     contact_support: torch.Tensor
     control: torch.Tensor
     contact_sample_time_s: torch.Tensor
+    external_body_wrench_w: torch.Tensor
 
 
 class NativePlant(ABC):
@@ -82,6 +83,9 @@ class NativePlant(ABC):
         self.contact_pairs = contact_pairs
         self.contact_interval = None
         self.control = torch.zeros(self.num_envs, model.nu, device=device)
+        # Public native-body order, WORLD force then torque at each body COM.
+        # This independent external input never creates an actuator/DOF.
+        self.external_body_wrench_w = torch.zeros(self.num_envs, model.nbody, 6, device=device)
         self.contact_support = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
         self.contact_sample_time_s = torch.full((self.num_envs,), float("nan"), dtype=torch.float64, device=device)
         self.contact_facts = {
@@ -155,11 +159,13 @@ class NativePlant(ABC):
             self.capture_physics(),
             {n: {k: v.clone() for k, v in f.items()} for n, f in self.contact_facts.items()},
             self.contact_support.clone(), self.control.clone(), self.contact_sample_time_s.clone(),
+            self.external_body_wrench_w.clone(),
         )
 
     def restore(self, snapshot):
         self.restore_physics(snapshot.physics)
         self.control.copy_(snapshot.control)
+        self.external_body_wrench_w.copy_(snapshot.external_body_wrench_w)
         self.contact_support.copy_(snapshot.contact_support)
         self.contact_sample_time_s.copy_(snapshot.contact_sample_time_s)
         for name, facts in snapshot.contact_facts.items():

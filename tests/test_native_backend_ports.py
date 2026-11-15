@@ -179,7 +179,15 @@ def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_
     facts = {"normal_force_n": torch.tensor([2., 0.]),
              "force_bearing_contact_present": torch.tensor([True, False]),
              "force_bearing_distance_max_m": torch.tensor([.003, float("nan")])}
+    def body_wrench(rows, *, body_ids, forces, torques):
+        events.append("body_wrench")
+        torch.testing.assert_close(rows, torch.arange(2))
+        torch.testing.assert_close(body_ids, torch.arange(1, model.nbody))
+        torch.testing.assert_close(forces[:, :, 0], torch.full((2, model.nbody - 1), 3.0))
+        torch.testing.assert_close(torques[:, :, 2], torch.full((2, model.nbody - 1), -2.0))
+
     backend.get_physics_time_torch.side_effect = physics_time
+    backend.set_body_wrench_w_torch.side_effect = body_wrench
     backend.step_torch.side_effect = step
     backend.get_body_pair_contact_facts.return_value = facts
     hand, part = [model.body(name).id for name in ("left_root", "base")]
@@ -190,8 +198,10 @@ def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_
     assert args[0] == "newton" and isinstance(args[1], NativeSceneSpec)
     assert args[1].model_file == layout.scene_xml_path and args[1].collision_generation is None
     assert args[2:] == (2, .005) and kwargs == {"device": "cpu", "cuda_graph": True}
+    plant.external_body_wrench_w[:, 1:, 0] = 3.0
+    plant.external_body_wrench_w[:, 1:, 5] = -2.0
     plant.advance()
-    assert events == ["time", "step"]
+    assert events == ["time", "body_wrench", "step"]
     torch.testing.assert_close(plant.contact_sample_time_s, torch.tensor([7.125, 3.25], dtype=torch.float64),
                                rtol=0, atol=0)
     assert plant.contact_support.tolist() == [True, True]
@@ -223,6 +233,7 @@ class _ProtocolPlant(NativePlant):
         self.q[env_ids] = torch.tensor(self.model.qpos0, dtype=self.q.dtype)
         self.v[env_ids] = 0
         self.control[env_ids] = 0
+        self.external_body_wrench_w[env_ids] = 0
         self._time[env_ids] = 0
         self.invalidate_contacts(env_ids)
 

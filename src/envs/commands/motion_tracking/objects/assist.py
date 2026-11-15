@@ -16,6 +16,30 @@ if TYPE_CHECKING:
     from mjlab.entity import Entity
 
 
+def object_pose_pd_wrench(
+    state_w, reference_w, inertia_com_body, *, kp_pos, kd_pos, kp_rot, kd_rot,
+    rot_inertia_scale,
+):
+    """Body-origin tracking error; WORLD force/torque requests at that body's COM.
+
+    Leading dimensions may include configured parts. Inertia is about COM in
+    the body frame; the actual body orientation rotates it exactly once.
+    """
+    force = kp_pos * (reference_w[..., :3] - state_w[..., :3]) + kd_pos * (
+        reference_w[..., 7:10] - state_w[..., 7:10]
+    )
+    rotation_error = axis_angle_from_quat(quat_mul(
+        reference_w[..., 3:7], quat_conjugate(state_w[..., 3:7]),
+    ))
+    rotation = matrix_from_quat(state_w[..., 3:7])
+    inertia_world = rotation @ inertia_com_body @ rotation.transpose(-1, -2)
+    angular_acceleration = kp_rot * rotation_error + kd_rot * (
+        reference_w[..., 10:13] - state_w[..., 10:13]
+    )
+    torque = torch.einsum("...ij,...j->...i", inertia_world, angular_acceleration) if rot_inertia_scale else angular_acceleration
+    return force, torque, inertia_world
+
+
 class ObjectAssistMixin:
     def _init_object_assist(self) -> None:
         # Per-env assist gains from the curriculum; None = scalar cfg gains.
@@ -28,9 +52,12 @@ class ObjectAssistMixin:
         self._xfrc_curr_ctrl = None
 
     def apply_substep(self) -> None:
-        """Per-physics-substep hook (mjlab_ext._env): re-evaluate the assist PD."""
-        if self.cfg.object.pin_objects and self.has_objects:
-            self._apply_object_assist()
+        """Re-evaluate PD, or clear persistent requests, before every solve."""
+        if self.has_objects:
+            if self.cfg.object.pin_objects:
+                self._apply_object_assist()
+            else:
+                self.clear_object_wrenches()
 
     def _apply_object_assist(self) -> None:
         """Assist wrench from the current object state; also run per substep."""
@@ -93,42 +120,27 @@ class ObjectAssistMixin:
                         ref_lin_vel = torch.zeros_like(sim_lin_vel)
                         ref_ang_vel = torch.zeros_like(sim_ang_vel)
 
-                    # ── Linear PD ──────────────────────────────────────────────────
-                    force = kp_pos * (ref_trans - sim_trans) + kd_pos * (
-                        ref_lin_vel - sim_lin_vel
-                    )
-
-                    # ── Rotational PD ──────────────────────────────────────────────
-                    delta_q = quat_mul(ref_quat, quat_conjugate(sim_quat))
-                    axis_angle = axis_angle_from_quat(delta_q)
-
-                    # Both paths map an angular acceleration to torque via I_world.
-                    I_body = self._obj_inertia_body(side).to(dtype=sim_quat.dtype)
-                    R_sim = matrix_from_quat(sim_quat)  # (B, 3, 3)
-                    I_world = R_sim @ I_body @ R_sim.transpose(-1, -2)  # (B, 3, 3)
-
                     omega_rot = float(xfrc.omega_rot)
                     if omega_rot > 0.0:
-                        zeta_rot = float(xfrc.zeta_rot)
                         s_rot = self._contact_assist_scale(side)
                         w = omega_rot if s_rot is None else omega_rot * s_rot
-                        kp_rot_eff = w * w
-                        kd_rot_eff = 2.0 * zeta_rot * w
-                        ang_err = ref_ang_vel - sim_ang_vel
-                        torque = kp_rot_eff * torch.einsum(
-                            "bij,bj->bi", I_world, axis_angle
-                        ) + kd_rot_eff * torch.einsum("bij,bj->bi", I_world, ang_err)
+                        rotational_kp, rotational_kd = w * w, 2.0 * float(xfrc.zeta_rot) * w
+                        inertia_scale = True
                     else:
-                        # Scaling an equivalent frequency by s means kp *= s^2, kd *= s.
                         s_rot = self._contact_assist_scale(side)
                         if s_rot is not None:
                             kp_rot = kp_rot * s_rot * s_rot
                             kd_rot = kd_rot * s_rot
-                        ang_accel = kp_rot * axis_angle + kd_rot * (ref_ang_vel - sim_ang_vel)
-                        if xfrc.rot_inertia_scale:
-                            torque = torch.einsum("bij,bj->bi", I_world, ang_accel)
-                        else:
-                            torque = ang_accel
+                        rotational_kp, rotational_kd = kp_rot, kd_rot
+                        inertia_scale = xfrc.rot_inertia_scale
+                    force, torque, I_world = object_pose_pd_wrench(
+                        torch.cat((sim_trans, sim_quat, sim_lin_vel, sim_ang_vel), -1),
+                        torch.cat((ref_trans, ref_quat, ref_lin_vel, ref_ang_vel), -1),
+                        self._obj_inertia_body(side).to(dtype=sim_quat.dtype),
+                        kp_pos=kp_pos, kd_pos=kd_pos,
+                        kp_rot=rotational_kp, kd_rot=rotational_kd,
+                        rot_inertia_scale=inertia_scale,
+                    )
 
                     # ── Clamp, implicit damping, perturbation ──────────────────────
                     if force_range is not None:

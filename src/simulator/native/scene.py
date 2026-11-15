@@ -134,9 +134,19 @@ class NativeArticulation(FloatingRootView, NamedArticulationView):
         )
         self._sim.plant.control[:, self._root_drives] = value
 
+    def write_external_wrench_to_sim(self, forces, torques, env_ids=None, body_ids=None):
+        """Replace detached WORLD body-COM requests, independently of native motors."""
+        rows = self._sim.rows(env_ids)
+        ids = range(len(self.body_names)) if body_ids is None else body_ids
+        native = torch.as_tensor(self._body_ids[list(ids)], device=self.device, dtype=torch.long)
+        self._sim.plant.external_body_wrench_w[rows[:, None], native[None]] = torch.cat(
+            (forces.detach(), torques.detach()), -1,
+        )
+
     def clear_external_wrenches(self, env_ids=None):
+        rows = self._sim.rows(env_ids)
+        self._sim.plant.external_body_wrench_w[rows[:, None], self._body_ids] = 0
         if len(self._root_drives):
-            rows = self._sim.rows(env_ids)
             self._sim.plant.control[rows[:, None], self._root_drives] = 0
 
     def reset(self, env_ids=None):

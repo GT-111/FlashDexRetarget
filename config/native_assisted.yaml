@@ -1,0 +1,46 @@
+# Explicit training assistance for the ordinary native task; evaluation clears it.
+defaults:
+  - native
+  - _self_
+
+commands:
+  object:
+    pin_objects: true
+    pin_mode: xfrc
+    xfrc:
+      omega_rot: 0.0
+      rot_inertia_scale: true
+      vel_feedforward: true
+      contact_scale: 1.0
+      implicit_damping: false
+
+# Reuse the existing adaptive controller. These groups select the actual native
+# objectives; stock rigid-object reward names do not exist in this task.
+curriculum:
+  xfrc_curriculum_adaptive:
+    params:
+      kp_init: 80.0
+      kv_init: 5.0
+      force_range: 50.0
+      wait_epochs: 100
+      deque_len: 30
+      num_steps_per_env: 32
+      decay_cooldown_epochs: 40
+      kp_zero_thres: 0.05
+      kp_lower_zero_thres: 0.1
+      rot_stiffness_mult: 96.0
+      kp_floor: 0.0
+      kv_floor: 0.0
+      completion_thres: 0.65
+      dialback_completion_thres: 0.5
+      dialback_min_epochs: 500
+      completion_term: motion_clip_ended
+      seed: ${seed}
+      reward_terms:
+        task: [native_object_part_pose, native_object_articulation]
+        imi: [native_root_pose]
+        bc: [native_command_bc]
+      rew_thresholds: {task: 0.6, imi: 0.01, bc: 0.01}
+      upper_ratios: {kp: 0.9, kv: 0.9, fr: 1.0}
+      lower_ratios: {kp: 0.8, kv: 0.8, fr: 1.0}
+      dialback_ratios: {kp: 0.98, kv: 0.98, fr: 0.98}

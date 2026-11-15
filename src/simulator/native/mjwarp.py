@@ -38,6 +38,7 @@ class MjWarpPlant(NativePlant):
             self._solved_effort = wp.to_torch(self._data.qfrc_actuator)
             self.effort = torch.zeros_like(self._solved_effort)
             self._ctrl = wp.to_torch(self._data.ctrl)
+            self._xfrc_applied = wp.to_torch(self._data.xfrc_applied)
             self._reset_mask = wp.zeros(num_envs, dtype=wp.bool, device=device)
             self._contact_ids = wp.array(np.arange(self._data.naconmax, dtype=np.int32), device=device)
             self._contact_forces = wp.zeros(self._data.naconmax, dtype=wp.spatial_vector, device=device)
@@ -68,6 +69,7 @@ class MjWarpPlant(NativePlant):
             mask[env_ids] = True
             self._mjw.reset_data(self._model, self._data, reset=self._reset_mask)
             self.control[env_ids] = 0
+            self.external_body_wrench_w[env_ids] = 0
             self.effort[env_ids] = 0
             self.invalidate_contacts(env_ids)
 
@@ -75,6 +77,8 @@ class MjWarpPlant(NativePlant):
         with self._scope():
             self._qpos[env_ids] = qpos
             self._qvel[env_ids] = qvel
+            self.external_body_wrench_w[env_ids] = 0
+            self._xfrc_applied[env_ids] = 0
             self.effort[env_ids] = 0
             self.invalidate_contacts(env_ids)
             self.forward()
@@ -84,6 +88,7 @@ class MjWarpPlant(NativePlant):
             self.prepare_contact_substep()
             sample_time = self.physics_time()
             self._ctrl.copy_(self.control)
+            self._xfrc_applied.copy_(self.external_body_wrench_w)
             self._mjw.step(self._model, self._data)
             self.effort.copy_(self._solved_effort)
             torch._assert_async((self._wp.to_torch(self._data.overflow) == 0).all(), "MJWarp contact/constraint capacity exceeded")

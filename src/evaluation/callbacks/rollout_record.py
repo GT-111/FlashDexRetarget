@@ -237,6 +237,19 @@ class NativeRolloutRecord(RolloutRecord):
             self.object_joint_metadata = dict(entity_name=self.cmd.native_layout.object.entity_name,
                 joint_names=list(self.cmd.native_object.joint_names),
                 authority="observed simulator scalar state; independent from reference support")
+        self._object_assist_reader = getattr(self.cmd, "object_assist_facts", None)
+        self.object_assist_metadata = None
+        if self._object_assist_reader is not None:
+            facts = self._object_assist_reader()
+            names = [part["body_name"] for part in self.binding["object_parts"].values()]
+            self._object_assist_columns = [facts["body_names"].index(name) for name in names]
+            self.object_assist_metadata = {key: facts[key] for key in (
+                "authority", "unsupported_velocity", "force_unit", "torque_unit", "clock",
+            )}
+            self.object_assist_metadata.update(
+                body_names=names, sampling="last submitted physics substep, not interval mean or measured force",
+                reset="no submitted substep: zero request and false submission support",
+            )
         self.backend_metadata = getattr(env.scene, "backend_identity", None)
         self._physics_time_reader = getattr(env.scene, "physics_time_s", None)
         self._contact_reader = getattr(env.scene, "hand_part_contact_facts", None)
@@ -318,6 +331,16 @@ class NativeRolloutRecord(RolloutRecord):
             "command_motion_ids": self.cmd.motion_ids.detach().to("cpu", torch.int64).clone(),
             "pinning": pinning, "curriculum": curriculum,
         }
+        if self._object_assist_reader is not None:
+            facts = self._object_assist_reader()
+            frame["object_assist"] = {
+                key: facts[key][:, self._object_assist_columns].detach().cpu().clone()
+                for key in ("force_w", "torque_w", "pose_support", "linear_rate_support", "angular_rate_support")
+            }
+            frame["object_assist"].update({
+                key: facts[key].detach().cpu().clone()
+                for key in ("submission_support", "sample_time_s", "clock_support")
+            })
         if self.installed_term is not None:
             control = self.installed_term.installed_control
             frame["installed"] = {field: control[field].detach().to("cpu").clone()
@@ -360,6 +383,8 @@ class NativeRolloutRecord(RolloutRecord):
                                    "command_motion_ids": frame["command_motion_ids"][select]}
                                   for frame in self.native_frames]
         for selected, frame in zip(state["native_frames"], self.native_frames, strict=True):
+            if "object_assist" in frame:
+                selected["object_assist"] = {field: value[select] for field, value in frame["object_assist"].items()}
             if "installed" in frame:
                 selected["installed"] = {field: value[select] for field, value in frame["installed"].items()}
             if "object_joint_pos" in frame:
@@ -406,6 +431,12 @@ class NativeRolloutRecord(RolloutRecord):
                     native_binding_json=np.asarray(json.dumps(binding)),
                     prepared_name=np.asarray(name),
                 )
+                if self.object_assist_metadata is not None:
+                    result["object_assist_metadata_json"] = np.asarray(json.dumps(self.object_assist_metadata))
+                    for field in frames[0]["object_assist"]:
+                        result["object_assist_" + field] = np.stack([
+                            frame["object_assist"][field][row].numpy() for frame in frames
+                        ])
                 if self.installed_metadata is not None:
                     result["installed_control_metadata_json"] = np.asarray(json.dumps(self.installed_metadata))
                     for field in _INSTALLED_ARRAYS:

@@ -228,6 +228,7 @@ class ManagerBasedRlEnv:
         for _ in range(self.cfg.decimation):
             self._sim_step_counter += 1
             self.action_manager.apply_action()
+            self.command_manager.compute_substep()
             self.scene.write_data_to_sim()
             self.sim.step()
             self._bump_clock()

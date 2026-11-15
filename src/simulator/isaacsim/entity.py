@@ -258,28 +258,47 @@ class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
         self._default_joint_pos[:] = torch.as_tensor(
             meta.joint_default, dtype=torch.float32, device=device
         )
+        self._external_force_w = torch.zeros(b, len(self.body_names), 3, device=device)
+        self._external_torque_w = torch.zeros_like(self._external_force_w)
 
     def write_root_state_to_sim(self, root_state, env_ids=None) -> None:
         self._art.write_root_link_state_to_sim(root_state, env_ids=env_ids)
         self._clock.bump()
 
-    def clear_external_wrenches(self, env_ids=None):
-        count = self._art.num_instances if env_ids is None else len(env_ids)
-        zero = torch.zeros(count, len(self.body_names), 3, device=self.device)
+    def _submit_external_wrenches(self):
+        # Lab derives has_external_wrench from the submitted slice. Submit the
+        # complete request so clearing one world cannot disable the others.
         self._art.set_external_force_and_torque(
-            zero, zero.clone(), body_ids=self._isaac_body_ids.tolist(),
-            env_ids=env_ids, is_global=True,
+            self._external_force_w, self._external_torque_w,
+            body_ids=self._isaac_body_ids.tolist(), is_global=True,
         )
 
-    def _write_root_wrench(self, force, torque):
-        pos, _ = self._body_pose()
-        forces = torch.zeros_like(pos)
-        torques = torch.zeros_like(pos)
-        forces[:, 0] = force
-        torques[:, 0] = torque
-        self._art.set_external_force_and_torque(
-            forces, torques, body_ids=self._isaac_body_ids.tolist(), is_global=True,
+    def write_external_wrench_to_sim(self, forces, torques, env_ids=None, body_ids=None):
+        """Replace named WORLD forces/torques at the actual body COMs."""
+        rows = torch.arange(self._art.num_instances, device=self.device) if env_ids is None else env_ids
+        ids = torch.arange(len(self.body_names), device=self.device) if body_ids is None else torch.as_tensor(
+            body_ids, device=self.device, dtype=torch.long,
         )
+        self._external_force_w[rows[:, None], ids[None]] = forces.detach()
+        self._external_torque_w[rows[:, None], ids[None]] = torques.detach()
+        self._submit_external_wrenches()
+
+    def clear_external_wrenches(self, env_ids=None):
+        rows = slice(None) if env_ids is None else env_ids
+        self._external_force_w[rows] = 0
+        self._external_torque_w[rows] = 0
+        self._submit_external_wrenches()
+
+    def reset(self, env_ids=None):
+        super().reset(env_ids)
+        self.clear_external_wrenches(env_ids)
+
+    def _write_root_wrench(self, force, torque):
+        self._external_force_w.zero_()
+        self._external_torque_w.zero_()
+        self._external_force_w[:, 0] = force
+        self._external_torque_w[:, 0] = torque
+        self._submit_external_wrenches()
 
 
 
@@ -397,7 +416,10 @@ class RigidObjectAdapter:
         forces: torch.Tensor,
         torques: torch.Tensor,
         env_ids: torch.Tensor | None = None,
+        body_ids=None,
     ) -> None:
+        if body_ids is not None and list(body_ids) != [0]:
+            raise ValueError("a rigid object wrench selects its sole named body")
         f = forces.reshape(-1, 1, 3)
         t = torques.reshape(-1, 1, 3)
         # Apply at the COM (mujoco xfrc parity); FDR_PIN_AT_COM=0

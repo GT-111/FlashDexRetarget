@@ -28,6 +28,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             )
         super().__init__(cfg, env)
         self._bind_native_reference()
+        self._init_native_object_assist()
 
     @property
     def object_distance_sign(self) -> str:
@@ -407,12 +408,113 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         self.clear_object_wrenches(env_ids)
         self._obj_state_version = getattr(self, "_obj_state_version", 0) + 1
 
+    def _init_native_object_assist(self):
+        shape = (self.num_envs, len(self.native_layout.object.parts), 3)
+        self._assist_force_w = torch.zeros(shape, device=self.device)
+        self._assist_torque_w = torch.zeros_like(self._assist_force_w)
+        self._assist_last_force_w = torch.zeros_like(self._assist_force_w)
+        self._assist_last_torque_w = torch.zeros_like(self._assist_force_w)
+        self._assist_pose_support = torch.zeros(shape[:-1], dtype=torch.bool, device=self.device)
+        self._assist_linear_rate_support = torch.zeros_like(self._assist_pose_support)
+        self._assist_angular_rate_support = torch.zeros_like(self._assist_pose_support)
+        self._assist_submission_support = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._assist_sample_time_s = torch.full((self.num_envs,), float("nan"), dtype=torch.float64, device=self.device)
+        self._assist_clock_support = torch.zeros_like(self._assist_submission_support)
+
     def _apply_object_assist(self):
-        if self.cfg.object.pin_objects:
-            raise ValueError("native articulated task has no object pose assistance")
+        from .objects.assist import object_pose_pd_wrench
+
+        obj = self.native_object
+        if not self.cfg.object.pin_objects:
+            self._assist_force_w.zero_()
+            self._assist_torque_w.zero_()
+            obj.clear_external_wrenches()
+            return
+        if self.cfg.object.pin_mode != "xfrc":
+            raise ValueError("native object assistance requires the explicit xfrc force mode")
+        xfrc = self.cfg.object.xfrc
+        state = self.sim_object_part_state_w
+        reference = self.ref_object_part_state_w
+        ml, ids = self.motion_lib, self._motion_flat_ids
+        support = ml.native_object_part_pose_support[ids]
+        # Unknown poses never enter quaternion math. Unknown velocity targets
+        # mean zero feedforward, not an observed zero source rate.
+        reference = torch.where(support[..., None], reference, state).clone()
+        linear_support = ml.native_object_part_linear_velocity_support[ids] & support
+        angular_support = ml.native_object_part_angular_velocity_support[ids] & support
+        reference[..., 7:10] = torch.where(linear_support[..., None], reference[..., 7:10], 0.0)
+        reference[..., 10:13] = torch.where(angular_support[..., None], reference[..., 10:13], 0.0)
+        if not xfrc.vel_feedforward:
+            reference[..., 7:] = 0.0
+
+        def gain(name, scalar):
+            current = getattr(self, name)
+            return float(scalar) if current is None else current.reshape(self.num_envs, 1, -1)
+
+        kp_rot = gain("_xfrc_kp_rot_env", xfrc.kp.rot)
+        kd_rot = gain("_xfrc_kv_rot_env", xfrc.kd.rot)
+        inertia_scale = xfrc.rot_inertia_scale
+        if xfrc.omega_rot > 0.0:
+            kp_rot, kd_rot = float(xfrc.omega_rot) ** 2, 2.0 * float(xfrc.zeta_rot) * float(xfrc.omega_rot)
+            inertia_scale = True
+        inertia = obj.body_inertial_properties().inertia_com_body_kg_m2[:, self._part_body_ids]
+        force, torque, _ = object_pose_pd_wrench(
+            state, reference, inertia,
+            kp_pos=gain("_xfrc_kp_pos_env", xfrc.kp.pos),
+            kd_pos=gain("_xfrc_kv_pos_env", xfrc.kd.pos),
+            kp_rot=kp_rot, kd_rot=kd_rot, rot_inertia_scale=inertia_scale,
+        )
+        if self._xfrc_force_range is not None:
+            force = force.clamp(-self._xfrc_force_range, self._xfrc_force_range)
+            torque = torque.clamp(-self._xfrc_force_range, self._xfrc_force_range)
+        self._assist_force_w.copy_(torch.where(support[..., None], force, 0.0).detach())
+        self._assist_torque_w.copy_(torch.where(support[..., None], torque, 0.0).detach())
+        obj.write_external_wrench_to_sim(
+            self._assist_force_w, self._assist_torque_w, body_ids=self._part_body_ids,
+        )
+
+    def apply_substep(self):
+        self._apply_object_assist()
+        # Bounded last-substep submitted-request evidence. This is neither a
+        # measured force nor a whole-control-interval average.
+        self._assist_last_force_w.copy_(self._assist_force_w)
+        self._assist_last_torque_w.copy_(self._assist_torque_w)
+        ml, ids = self.motion_lib, self._motion_flat_ids
+        self._assist_pose_support.copy_(ml.native_object_part_pose_support[ids])
+        self._assist_linear_rate_support.copy_(ml.native_object_part_linear_velocity_support[ids])
+        self._assist_angular_rate_support.copy_(ml.native_object_part_angular_velocity_support[ids])
+        self._assist_submission_support[:] = True
+        clock = getattr(self._env.scene, "physics_time_s", None)
+        if clock is not None:
+            sample = clock().detach()
+            self._assist_sample_time_s.copy_(sample)
+            self._assist_clock_support.copy_(torch.isfinite(sample))
+
+    def object_assist_facts(self):
+        return dict(
+            body_names=tuple(part.body_name for part in self.native_layout.object.parts),
+            force_w=self._assist_last_force_w, torque_w=self._assist_last_torque_w,
+            submission_support=self._assist_submission_support,
+            pose_support=self._assist_pose_support,
+            linear_rate_support=self._assist_linear_rate_support,
+            angular_rate_support=self._assist_angular_rate_support,
+            sample_time_s=self._assist_sample_time_s, clock_support=self._assist_clock_support,
+            authority="last_physics_substep_submitted_WORLD_body_COM_wrench_not_measured_force",
+            unsupported_velocity="zero feedforward target; independent source rate support remains false",
+            force_unit="N", torque_unit="N m", clock="actual_solver_substep_begin_when_available",
+        )
 
     def clear_object_wrenches(self, env_ids=None):
         self.native_object.clear_external_wrenches(env_ids)
+        rows = slice(None) if env_ids is None else env_ids
+        for value in (self._assist_force_w, self._assist_torque_w,
+                      self._assist_last_force_w, self._assist_last_torque_w):
+            value[rows] = 0
+        for value in (self._assist_submission_support, self._assist_pose_support,
+                      self._assist_linear_rate_support, self._assist_angular_rate_support,
+                      self._assist_clock_support):
+            value[rows] = False
+        self._assist_sample_time_s[rows] = float("nan")
 
     def _init_object_sdf(self, cfg):
         from utils.sdf import bake_object_sdf_grid

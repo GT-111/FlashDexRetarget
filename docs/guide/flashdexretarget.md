@@ -138,6 +138,16 @@ learner/replay results require separate qualification on the corrected source.
 The native USD path supplies no such override and keeps its authored authority;
 this stock correction does not alter XML geometry or native pair-contact facts.
 
+### Native articulated training assistance
+
+The `native` recipe uses the authored scene's gravity and passive support with no object assistance. Select `--config-name native_assisted` to train with explicit per-part object PD forces and the existing adaptive xfrc curriculum. The robot, physical part names, command actuators and runtime remain selected through the same native configuration. The object retains one FREE base and its passive articulation; training assistance is not an object motor, weld or playback.
+
+The configured PD acts at actual body COMs in WORLD axes. Its linear error uses body-origin pose/velocity, and its rotational inertia is the installed COM inertia expressed in the body frame. Unsupported reference poses receive no force; unsupported velocities use zero feedforward with false independent rate support. Native assistance currently admits the explicit PD/adaptive recipe, not dynamic gravity, contact-dependent scaling, perturbation or implicit damping.
+
+Object PD is recomputed before every configured physics substep. This is a changed force-update recipe for assisted runs; checkpoints and replay qualified with an earlier update schedule retain their own producer identity and should not be described as numerically equivalent. Changing assistance creates a new physical learning condition. The existing `agent_load_path` can warm compatible actor/critic/optimizer state with `buffer_load_path=null`; strict FULL continuation requires the same curriculum and numerical owners.
+
+Ordinary evaluation disables pinning, removes the adaptive controller and clears external object requests. The native recorder reports last-substep **submitted** body-COM force/torque separately from actual pair contacts; it does not measure total delivered force or certify physical task success. Passive tables and gravity remain active. Use the frozen task/family evaluator for articulated opening/closing, contact coverage and complete-horizon outcomes.
+
 ### Hydra overrides
 
 The defaults below come from `config/` (`envs/`, `runner/`, `eval/`, `logger/`); arguments to the launcher

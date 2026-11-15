@@ -182,6 +182,7 @@ def _command(*, rigid=False):
     )
     command.metrics = {}
     command._bind_native_reference()
+    command._init_native_object_assist()
     command._init_metrics()
     env.command_manager = SimpleNamespace(get_term=lambda name: command)
     return command, env, calls
@@ -456,6 +457,8 @@ def test_native_object_wrench_clear_uses_actual_bodies_not_rigid_api(tmp_path):
     adapter.device = "cpu"
     adapter.body_names = ["object_root", "object_lid"]
     adapter._isaac_body_ids = torch.tensor([3, 1])
+    adapter._external_force_w = torch.ones(2, 2, 3)
+    adapter._external_torque_w = torch.full((2, 2, 3), 2.0)
     adapter._art = SimpleNamespace(
         num_instances=2,
         set_external_force_and_torque=lambda f, t, **kw: calls.append(
@@ -464,7 +467,9 @@ def test_native_object_wrench_clear_uses_actual_bodies_not_rigid_api(tmp_path):
     )
     adapter.clear_external_wrenches(torch.tensor([1]))
     force, torque, kwargs = calls.pop()
-    assert force.shape == (1, 2, 3) and not force.any() and not torque.any()
+    assert force.shape == (2, 2, 3)
+    assert not force[1].any() and not torque[1].any()
+    assert force[0].eq(1.0).all() and torque[0].eq(2.0).all()
     assert kwargs["body_ids"] == [3, 1] and kwargs["is_global"] is True
     command, _, _ = _command()
     command._env.scene["object"] = adapter
