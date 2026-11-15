@@ -538,8 +538,16 @@ The entry writes `evaluation-entry.json` and the ordinary all-motion
 `evaluation/current-policy-<actual-env-step>-<UTC>.json`. Failed, unscored and
 absent attempts remain in their existing denominators. It does not load
 first-success or ever-success state or select a success-only archive. This CLI
-writes the ordinary scalar report; the explicit all-attempt recording API below
-retains its separate selection contract.
+writes the ordinary scalar report by default. Add `--recording_dir /path/to/new-recordings`
+to retain every actual attempt through the existing recording API. This selection
+requires `FLASH_SOURCE_REF`; the entry binds the checkpoint it loaded, its actual
+training env step, the executable revision and the policy loader receipt. Select
+the desired rollout recorder in `eval.callbacks`. `NativeRolloutRecord` additionally
+requires its explicit source, named-body and joint binding; the whole robot root
+is not substituted for either wrist. The existing recorder's scene-local position
+and WORLD link-twist conventions remain unchanged. A new capture is a new
+measurement sweep of the frozen policy, not a reconstruction of an earlier scalar
+report.
 
 Keep training and evaluation assistance distinct. Active reference-centered
 object PD assistance differs from passive support. With

@@ -17,6 +17,11 @@ from omegaconf import OmegaConf  # noqa: E402
 
 
 def run(args: argparse.Namespace) -> None:
+    source_revision = os.environ.get("FLASH_SOURCE_REF")
+    recording_dir = (None if args.recording_dir is None
+                     else Path(args.recording_dir).expanduser().resolve())
+    if recording_dir is not None and not source_revision:
+        raise ValueError("--recording_dir requires FLASH_SOURCE_REF for the actual executable revision")
     OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
     config_dir = (Path(__file__).resolve().parent / args.config_path).resolve()
     with hydra.initialize_config_dir(version_base=None, config_dir=str(config_dir)):
@@ -37,7 +42,8 @@ def run(args: argparse.Namespace) -> None:
         "training_env_step": env_step,
         "resume_state": resume,
         "executable_source": str(Path(__file__).resolve()),
-        "executable_source_revision": os.environ.get("FLASH_SOURCE_REF"),
+        "executable_source_revision": source_revision,
+        "factual_recording_dir": None if recording_dir is None else str(recording_dir),
         "training_resume_fields": "Not consumed: this entry does not construct a runner or load learning/replay state.",
         "assistance_scope": "Saved training curriculum and evaluation pin authority are separate.",
         "wrench_measurement": "UNKNOWN: no accepted/applied object-wrench readback is exposed by the ordinary evaluation interface.",
@@ -105,6 +111,11 @@ def run(args: argparse.Namespace) -> None:
                 policy, eval_env, cfg.eval, cfg.device,
                 ever_state=None, success_dir=None, env_step=env_step,
                 outcome_dir=run_dir / "evaluation",
+                recording_dir=recording_dir,
+                frozen_authority=(None if recording_dir is None else {
+                    "checkpoint": str(checkpoint), "source_revision": source_revision,
+                    "training_env_step": env_step, "policy": policy.checkpoint_authority,
+                }),
             )
             print(f"[evaluation] training_env_step={env_step} {metrics}", flush=True)
             authority["status"] = "COMPLETED_CURRENT_POLICY_EVALUATION"
@@ -131,6 +142,7 @@ def run(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--recording_dir", help="Retain every attempt with the configured rollout recorder")
     parser.add_argument("--config_path", default="config")
     parser.add_argument("--config_name", default="flashdexretarget")
     parser.add_argument("--overrides", action="append", default=[])

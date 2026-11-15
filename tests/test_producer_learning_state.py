@@ -826,7 +826,8 @@ def test_policy_only_load_rejects_incomplete_saved_actor(tmp_path):
         load_policy(cfg, env, info, "motion", str(tmp_path))
 
 
-def test_frozen_evaluation_entry_routes_public_policy_and_ordinary_evaluator(tmp_path, monkeypatch):
+@pytest.mark.parametrize("recording", [False, True])
+def test_frozen_evaluation_entry_routes_public_policy_and_ordinary_evaluator(tmp_path, monkeypatch, recording):
     import agents
     import common.utils as utils
     import envs
@@ -895,21 +896,36 @@ def test_frozen_evaluation_entry_routes_public_policy_and_ordinary_evaluator(tmp
         events.append("public_load_policy")
         return policy
 
+    recording_dir = run_dir / "recordings" if recording else None
+    frozen_authority = (None if recording_dir is None else {
+        "checkpoint": str(checkpoint), "source_revision": "selected-executable-fixture",
+        "training_env_step": 39_290_880, "policy": policy.checkpoint_authority,
+    })
+
     def evaluate(actual_policy, actual_env, _cfg, device, **kwargs):
         assert actual_policy is policy and actual_env is evaluated and device == "cpu"
         assert kwargs == {"ever_state": None, "success_dir": None, "env_step": 39_290_880,
-                          "outcome_dir": run_dir / "evaluation"}
+                          "outcome_dir": run_dir / "evaluation", "recording_dir": recording_dir,
+                          "frozen_authority": frozen_authority}
         assert not command.cfg.object.pin_objects
         events.append("ordinary_evaluate")
         return {"eval/SR": 0.}
 
     monkeypatch.setattr(agents, "load_policy", load)
     monkeypatch.setattr(evaluation_owner, "evaluate", evaluate)
-    entry.run(argparse.Namespace(config_path=str(config_dir), config_name="eval", overrides=[],
-                                 checkpoint=str(checkpoint)))
+    args = argparse.Namespace(config_path=str(config_dir), config_name="eval", overrides=[],
+                              checkpoint=str(checkpoint), recording_dir=recording_dir)
+    monkeypatch.delenv("FLASH_SOURCE_REF", raising=False)
+    if recording:
+        with pytest.raises(ValueError, match="requires FLASH_SOURCE_REF"):
+            entry.run(args)
+        assert not events and not run_dir.exists()
+        monkeypatch.setenv("FLASH_SOURCE_REF", "selected-executable-fixture")
+    entry.run(args)
     assert events == [("seed", 42), "metadata_reset", "public_load_policy", "ordinary_enter_eval",
                       "ordinary_evaluate", "train_close", "eval_close", ("runtime_close", 0)]
     result = json.loads((run_dir / "evaluation-entry.json").read_text())
     assert result["status"] == "COMPLETED_CURRENT_POLICY_EVALUATION"
     assert result["training_env_step"] == 39_290_880 and result["pin_during_eval"] is False
     assert result["wrench_measurement"].startswith("UNKNOWN")
+    assert result["factual_recording_dir"] == (None if recording_dir is None else str(recording_dir))
