@@ -168,8 +168,11 @@ class NativeRolloutRecord(RolloutRecord):
         robot = self.cmd.robot
         self.joint_names = tuple(robot.joint_names)
         self.body_names = tuple(robot.body_names)
+        if set(self.binding["hands"]) != set(self.cmd.motion_lib.hand_sides):
+            raise ValueError("FlashDex recorded hands differ from the actual motion library sides")
+        self.hand_sides = tuple(side for side in _NATIVE_SIDES if side in self.binding["hands"])
         self.hand_indices = tuple(self.body_names.index(self.binding["hands"][side]["body_name"])
-                                  for side in _NATIVE_SIDES)
+                                  for side in self.hand_sides)
         for hand in self.binding["hands"].values():
             for name in hand["physical_joint_names"].values():
                 self.joint_names.index(name)
@@ -263,7 +266,7 @@ class NativeRolloutRecord(RolloutRecord):
         if facts is not None:
             self._contact_names = []
             addresses = []
-            for side in _NATIVE_SIDES:
+            for side in self.hand_sides:
                 for part in self.binding["object_parts"].values():
                     address = dict(hand_side=side, hand_body_name=self.binding["hands"][side]["body_name"],
                                    part_entity_name=part["entity_name"], part_body_name=part["body_name"])
@@ -426,6 +429,7 @@ class NativeRolloutRecord(RolloutRecord):
                 name = self.motion_names[int(result["motion_id"])]
                 binding = {**self.binding, "clips": {name: self.binding["clips"][name]}}
                 result.update(
+                    native_hand_sides=np.asarray(self.hand_sides),
                     native_hand_pose=np.stack([frame["hands"][row].numpy() for frame in frames]),
                     native_hand_twist_w=np.stack([frame["hand_twist_w"][row].numpy() for frame in frames]),
                     native_hand_twist_authority=np.asarray("observed WORLD link-origin linear then angular velocity"),

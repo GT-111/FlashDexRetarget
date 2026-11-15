@@ -289,6 +289,15 @@ actual reset epoch. It is separate from source/reference time, nominal control
 elapsed time and an accepted-step ledger. Exact hand–part pair forces and their
 intervals remain unavailable from Isaac net-link/SDF views.
 
+Native factual recording follows the hand sides admitted by the motion library
+and recording binding. `native_hand_sides` labels the hand axis of
+`native_hand_pose` and `native_hand_twist_w`. Bilateral recordings retain
+left-then-right order; unilateral recordings contain only the available side.
+Named contact rows use that same side order and the configured object-part
+order. Installed-control arrays retain their independent `hand_sides` metadata.
+Downstream task readers keep their declared hand requirements; the bimanual BOX
+adapter still requires both hands.
+
 The readouts borrow stopped views of fixed storage until the next control,
 state change or reset. Capacity comes from `decimation`. Reset or authored
 state installation discards affected rows; physical restore preserves its

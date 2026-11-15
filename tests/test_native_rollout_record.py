@@ -34,6 +34,7 @@ def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, se
 
     native_command, env, _calls = _command(rigid=rigid)
     robot, library = native_command.robot, native_command.motion_lib
+    library.hand_sides = tuple(native_command._side_list)
     robot.body_names = ["left_root", "right_root"]
     robot.data.root_link_pos_w = torch.full((1, 3), 999.)
     robot.data.root_link_quat_w = torch.tensor([[1., 0., 0., 0.]])
@@ -152,7 +153,8 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
                          "motion_steps": torch.zeros(1, dtype=torch.int64)},
         cfg=SimpleNamespace(object=SimpleNamespace(pin_objects=False)),
         sim_obj_trans_w=torch.zeros((1, 1, 3)), sim_obj_quat_w=torch.tensor([[[1., 0., 0., 0.]]]),
-        motion_lib=SimpleNamespace(motion_files=["file#S10001__st00"], _motion_num_frames=torch.tensor([2]),
+        motion_lib=SimpleNamespace(hand_sides=("right", "left"),
+            motion_files=["file#S10001__st00"], _motion_num_frames=torch.tensor([2]),
             source_lineage=[{"capture_id": "S10001", "selected_source_frame_index": selected,
                              "scene_from_source_world": np.eye(4).tolist()}],
             source_query_ordinal=[ordinal], source_import_elapsed_ns=[imported_time]))
@@ -174,6 +176,7 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
     state = callback.collect_state()
     output = callback.rollout_arrays([state], 0)
     np.testing.assert_array_equal(output["recorded_motion_steps"], (0, 1))
+    np.testing.assert_array_equal(output["native_hand_sides"], ("left", "right"))
     np.testing.assert_array_equal(output["raw_action_valid"], (False, True))
     np.testing.assert_array_equal(output["elapsed_time_ns"], (0, 20_000_000))
     np.testing.assert_array_equal(output["native_hand_pose"][0, :, :3], ((5., 5., 5.), (2., 2., 2.)))
@@ -302,6 +305,7 @@ def test_frozen_attempt_npz_keeps_actual_native_schema_clocks_interval_and_first
         assert json.loads(str(saved["native_binding_json"]))["clips"]["fixture"]["prepared_time_ns"][0] == origin
         np.testing.assert_array_equal(saved["recorded_motion_steps"], (0, 1, 2))
         assert saved["command_motion_steps"][-1] == 2  # Keep actual clamped cursor distinct.
+        np.testing.assert_array_equal(saved["native_hand_sides"], ("left", "right"))
         assert saved["native_physics_time_s"].dtype == np.float64
         assert saved["hand_part_interval_sample_begin_time_s"].dtype == np.float64
         assert saved["hand_part_interval_sample_recorded"].dtype == bool
@@ -314,7 +318,7 @@ def test_frozen_attempt_npz_keeps_actual_native_schema_clocks_interval_and_first
     assert success_manifest.read_bytes() == original_manifest
 
 
-def _prepared_native_recorder_fixture(tmp_path):
+def _prepared_native_recorder_fixture(tmp_path, *, hand_sides=("left", "right")):
     """Real prepared-input/pack/library admission; only achieved state is synthetic."""
     from dexforge_adaptation.flashdex_retarget import flashdex_source_mapping
     from test_native_reference import _pipeline_config, _prepared_native_dataset
@@ -335,6 +339,20 @@ def _prepared_native_recorder_fixture(tmp_path):
     placement = np.eye(4)
     placement[:3, 3] = (1., -2., .3)
     native = clip["native_reference"]
+    physical_joints = {"left": ("left_a", "left_mimic"), "right": ("right_b",)}
+    joint_names = tuple(name for side in ("left", "right") if side in hand_sides
+                        for name in physical_joints[side])
+    columns = [i for i, name in enumerate(native["joint_names"]) if name in joint_names]
+    native["joint_names"] = tuple(native["joint_names"][i] for i in columns)
+    for field in ("joint_pos", "joint_vel", "joint_position_support", "joint_velocity_support"):
+        native[field] = native[field][:, columns]
+    for field in ("root_body_names", "root_state_w", "root_pose_support",
+                  "root_linear_velocity_support", "root_angular_velocity_support"):
+        native[field] = {side: native[field][side] for side in hand_sides}
+    for absent_side in set(("left", "right")) - set(hand_sides):
+        for key in list(clip):
+            if key.startswith((f"mano_{absent_side}_", f"obj_{absent_side}_")):
+                del clip[key]
     native["time_ns"] = elapsed.copy()
     native["provenance"] = dict(authority="requested_reference_not_achieved_state",
         source=dict(source), scene_from_source_world=placement.tolist())
@@ -346,22 +364,22 @@ def _prepared_native_recorder_fixture(tmp_path):
     prepared = PreparedNativeInput(dataset, cfg, workers=1, manifest="native-reference.json")
     prepared.pack()
 
-    joint_names = ("left_a", "left_mimic", "right_b")
     robot = SimpleNamespace(num_joints=len(joint_names), joint_names=joint_names,
-        body_names=("left_root", "right_root"), data=SimpleNamespace(
-            joint_pos=torch.zeros(1, 3), joint_vel=torch.zeros(1, 3),
+        body_names=tuple(native["root_body_names"][side] for side in hand_sides), data=SimpleNamespace(
+            joint_pos=torch.zeros(1, len(joint_names)), joint_vel=torch.zeros(1, len(joint_names)),
             root_link_pos_w=torch.zeros(1, 3), root_link_quat_w=torch.tensor([[1., 0., 0., 0.]]),
-            body_link_pos_w=torch.zeros(1, 2, 3),
-            body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2]),
-            body_link_lin_vel_w=torch.zeros(1, 2, 3), body_link_ang_vel_w=torch.zeros(1, 2, 3)))
+            body_link_pos_w=torch.zeros(1, len(hand_sides), 3),
+            body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * len(hand_sides)]),
+            body_link_lin_vel_w=torch.zeros(1, len(hand_sides), 3),
+            body_link_ang_vel_w=torch.zeros(1, len(hand_sides), 3)))
     library = MotionLibrary(str(dataset / "motion.pt"), robot, finger_names=C.FINGERS, device="cpu")
     command = SimpleNamespace(robot=robot, motion_lib=library,
         motion_ids=torch.zeros(1, dtype=torch.int64), motion_steps=torch.ones(1, dtype=torch.int64),
         reference_phase={"motion_ids": torch.zeros(1, dtype=torch.int64),
                          "motion_steps": torch.zeros(1, dtype=torch.int64)},
         cfg=SimpleNamespace(object=SimpleNamespace(pin_objects=False)), _xfrc_curr_ctrl=None,
-        sim_obj_trans_w=torch.zeros(1, 2, 3),
-        sim_obj_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2]))
+        sim_obj_trans_w=torch.zeros(1, len(hand_sides), 3),
+        sim_obj_quat_w=torch.tensor([[[1., 0., 0., 0.]] * len(hand_sides)]))
 
     class Scene(dict):
         env_origins = torch.zeros(1, 3)
@@ -370,13 +388,14 @@ def _prepared_native_recorder_fixture(tmp_path):
         data=SimpleNamespace(body_link_pos_w=torch.zeros(1, 2, 3),
             body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2]))))
     env = SimpleNamespace(step_dt=.02, num_envs=1, scene=scene,
-        action_manager=SimpleNamespace(action=torch.zeros(1, 3), active_terms=[]),
+        action_manager=SimpleNamespace(action=torch.zeros(1, len(joint_names)), active_terms=[]),
         command_manager=SimpleNamespace(get_term=lambda name: command))
     binding = dict(scene_from_source_world=placement.tolist(),
         hands={"left": dict(body_name="left_root", physical_joint_names={"driver": "left_a", "mimic": "left_mimic"}),
                "right": dict(body_name="right_root", physical_joint_names={"driver": "right_b"})},
         object_part_names=["lid", "base"], object_parts={name: dict(entity_name="articulated_object", body_name=name)
             for name in ("lid", "base")}, clips={"synthetic-stage": source})
+    binding["hands"] = {side: binding["hands"][side] for side in hand_sides}
     return env, binding
 
 
@@ -463,3 +482,81 @@ def test_isaac_callback_clock_survives_ordinary_native_recorder_and_reader(monke
     assert "native_execution_steps" not in arrays
     assert "hand_part_interval_metadata_json" not in arrays
     assert "hand_part_contact_metadata_json" not in arrays
+
+
+@pytest.mark.parametrize("hand_sides", [("left",), ("right",), ("right", "left")],
+                         ids=["left", "right", "bilateral"])
+def test_available_native_hands_survive_prepared_pack_library_and_factual_export(tmp_path, hand_sides):
+    from evaluation.callbacks.success_export import export_current_attempts
+
+    env, binding = _prepared_native_recorder_fixture(tmp_path, hand_sides=hand_sides)
+    command = env.command_manager.get_term("motion")
+    assert set(command.motion_lib.hand_sides) == set(hand_sides)
+    assert set(command.motion_lib.native_root_body_names) == set(hand_sides)
+    expected_sides = ("left", "right") if len(hand_sides) == 2 else hand_sides
+    # Physical body columns and binding insertion order must not set the archive hand axis.
+    robot = command.robot
+    robot.body_names = tuple(reversed(robot.body_names))
+    hand_position = {"left": (10., 11., 12.), "right": (20., 21., 22.)}
+    for side in hand_sides:
+        column = robot.body_names.index(binding["hands"][side]["body_name"])
+        robot.data.body_link_pos_w[0, column] = torch.tensor(hand_position[side])
+        robot.data.body_link_lin_vel_w[0, column] = torch.tensor(hand_position[side]) + 1.
+        robot.data.body_link_ang_vel_w[0, column] = torch.tensor(hand_position[side]) + 2.
+    named_pairs = [
+        (f"pair-{index}", dict(hand_side=side, hand_body_name=binding["hands"][side]["body_name"],
+            part_entity_name=part["entity_name"], part_body_name=part["body_name"]), index + .5)
+        for index, (side, part) in enumerate((side, part) for side in expected_sides
+                                           for part in binding["object_parts"].values())
+    ]
+
+    def contacts():
+        executed = bool(command.reference_phase["motion_steps"].item())
+        return dict(addresses={name: address for name, address, _force in reversed(named_pairs)},
+            pairs={name: dict(normal_force_n=torch.tensor([force if executed else float("nan")]),
+                force_bearing_contact_present=torch.tensor([executed]),
+                force_bearing_distance_max_m=torch.tensor([.01 if executed else float("nan")]))
+                for name, _address, force in reversed(named_pairs)},
+            measurement_support=torch.tensor([executed]),
+            sample_time_s=torch.tensor([1.25 if executed else float("nan")], dtype=torch.float64),
+            clock="synthetic stopped protocol", normal_force_authority="synthetic protocol facts",
+            distance_authority="synthetic protocol facts")
+
+    env.scene.hand_part_contact_facts = contacts
+    callback = NativeRolloutRecord(binding=binding)
+    callback.on_start(env)
+    command.reference_phase["motion_steps"][:] = 1
+    command.motion_steps[:] = 2
+    callback.on_step(env)
+    manifest, motions = export_current_attempts(
+        tmp_path / "available-hand-attempts", callback, [callback.collect_state()],
+        [dict(motion_id=0, evaluation_row=0, batch_index=0, env_index=0)],
+        env_step=0, motion_names=["synthetic-stage"], motion_file=command.motion_lib.motion_file,
+        num_per_motion=1, evaluation_id="available-hand-protocol",
+        frozen_authority={"kind": "serialization_protocol", "checkpoint": None, "learned_policy": False},
+        evaluation_report=tmp_path / "current-policy.json",
+    )
+    entry = motions[0]["attempts"][0]["recording"]
+    assert entry["status"] == "recorded" and entry["frames"] == 2
+    assert "native_hand_sides" in entry["fields"]
+    with np.load(manifest.parent / entry["rollout"], allow_pickle=False) as arrays:
+        np.testing.assert_array_equal(arrays["native_hand_sides"], expected_sides)
+        assert arrays["native_hand_pose"].shape == (2, len(expected_sides), 7)
+        assert arrays["native_hand_twist_w"].shape == (2, len(expected_sides), 6)
+        np.testing.assert_array_equal(arrays["native_hand_pose"][0, :, :3],
+            [hand_position[side] for side in expected_sides])
+        np.testing.assert_array_equal(arrays["native_hand_twist_w"][0, :, :3],
+            np.asarray([hand_position[side] for side in expected_sides]) + 1.)
+        np.testing.assert_array_equal(arrays["native_hand_twist_w"][0, :, 3:],
+            np.asarray([hand_position[side] for side in expected_sides]) + 2.)
+        assert np.isnan(arrays["hand_part_normal_force_n"][0]).all()
+        assert not arrays["hand_part_measurement_support"][0].any()
+        np.testing.assert_array_equal(arrays["hand_part_normal_force_n"][1],
+            [force for _name, _address, force in named_pairs])
+        contact_metadata = json.loads(str(arrays["hand_part_contact_metadata_json"]))
+        assert contact_metadata["pairs"] == [address for _name, address, _force in named_pairs]
+        np.testing.assert_array_equal(arrays["recorded_motion_steps"], (0, 1))
+        assert json.loads(str(arrays["native_binding_json"]))["clips"] == binding["clips"]
+    bad_binding = {**binding, "hands": {}}
+    with pytest.raises(ValueError, match="actual motion library sides"):
+        NativeRolloutRecord(binding=bad_binding).on_start(env)
