@@ -290,6 +290,18 @@ clear inherited `PYTHONPATH`. Keep machine overrides in the calling shell.
 Cache defaults use `${TMPDIR:-/tmp}/flashdexretarget-${UID}/${CONDA_DEFAULT_ENV}`
 for XDG, CUDA, Torch extensions/Inductor, Triton and Warp; explicit cache paths
 and the operator's existing license acceptance are preserved.
+Before the selected runtime boots, normal training/evaluation and the standalone
+asset converter create nonempty requested `TMPDIR`, `XDG_CACHE_HOME`,
+`CUDA_CACHE_PATH`, `TORCH_EXTENSIONS_DIR`, `TORCHINDUCTOR_CACHE_DIR`,
+`TRITON_CACHE_DIR` and `WARP_CACHE_PATH` directories, including missing parents.
+Set these paths in the launch environment, including for manually managed
+profiles; they must be writable and on the operator's selected local storage.
+Unset paths retain their library defaults. Kit's configured portable root and
+the run/checkpoint/replay directories keep their existing launcher and writer
+ownership. Directory creation does not remove cache contents or change an
+active environment.
+Use a short task-owned `TMPDIR` on local storage for native GPU compilation;
+NVRTC can reject a long operation-derived path even when the directory exists.
 
 The preparation wrapper uses the same explicit `--profile isaac|mjwarp|newton`
 selection. `isaac` is the default; native profiles require their generated

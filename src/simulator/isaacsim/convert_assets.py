@@ -809,6 +809,9 @@ def verify_usd(usd_path: str, expect_links: list[str] | None = None) -> None:
 
 
 def main() -> None:
+    from simulator.runtime import prepare_runtime_directories
+
+    prepare_runtime_directories()
     args = parse_args()
     from isaaclab.app import AppLauncher
 
