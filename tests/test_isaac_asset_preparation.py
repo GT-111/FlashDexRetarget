@@ -1,4 +1,4 @@
-"""Isaac USD preparation and launch routing without a Kit or CUDA context."""
+"""USD preparation and launch routing; the real PhysX case needs SDK bootstrap."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ def native_usd_completion(monkeypatch):
     for name in ("omni", "omni.physx", "omni.physx.bindings"):
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
     plugin = ModuleType("omni.physx.bindings._physx")
+    plugin.JOINT_AXIS_API = "PhysxJointAxisAPI"
     plugin.JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR = "unused:angularFriction"
     monkeypatch.setitem(sys.modules, plugin.__name__, plugin)
     # The existing scalar/mimic/inertia validator is not this regression's
@@ -146,6 +147,96 @@ def test_native_completion_never_erases_mechanical_root_authority(
         assert stage.GetPrimAtPath("/Asset/scaffold").HasAPI(UsdPhysics.ArticulationRootAPI)
     elif extra != "missing-root":
         assert stage.GetPrimAtPath(protected).HasAPI(UsdPhysics.ArticulationRootAPI)
+
+
+def test_native_completion_authors_and_requires_codeless_angular_viscosity(tmp_path):
+    # Run this owning case after the ordinary public Isaac runtime bootstrap.
+    # No generated PhysxJointAxisAPI class, schema stub, converter or step is used.
+    PhysxSchema = pytest.importorskip("pxr.PhysxSchema")
+    physx = pytest.importorskip("omni.physx.bindings._physx")
+
+    from simulator.isaacsim.convert_assets import (
+        complete_native_usd,
+        validate_native_usd,
+    )
+    from simulator.mjcf_meta import load_robot_mjcf_meta
+
+    xml = tmp_path / "affine.xml"
+    xml.write_text("""<mujoco>
+      <compiler angle="radian"/>
+      <worldbody>
+        <body name="base">
+          <freejoint name="root"/>
+          <geom type="sphere" size=".02" mass=".2"/>
+          <body name="driver_link" pos=".04 0 0">
+            <joint name="driver" axis="0 0 1" limited="true"
+                   range="-1 1" damping=".02"/>
+            <geom type="sphere" size=".01" mass=".1"/>
+            <body name="follower_link" pos=".04 0 0">
+              <joint name="follower" axis="0 0 1" limited="true"
+                     range="-1 1" damping=".3"/>
+              <geom type="sphere" size=".01" mass=".1"/>
+            </body>
+          </body>
+        </body>
+      </worldbody>
+      <actuator>
+        <position name="motor" joint="driver" kp="2"
+                  ctrlrange="-1 1" forcerange="-2 2"/>
+      </actuator>
+      <equality>
+        <joint name="affine" joint1="follower" joint2="driver"
+               polycoef=".1 .5 0 0 0"/>
+      </equality>
+    </mujoco>""")
+    meta = load_robot_mjcf_meta(xml).subtree("base")
+    path = tmp_path / "affine.usda"
+    stage = Usd.Stage.CreateNew(str(path))
+    root = UsdGeom.Xform.Define(stage, "/Asset").GetPrim()
+    stage.SetDefaultPrim(root)
+    bodies = {name: UsdGeom.Xform.Define(stage, "/Asset/" + name).GetPrim()
+              for name in meta.body_names}
+    for prim in bodies.values():
+        UsdPhysics.RigidBodyAPI.Apply(prim)
+    UsdPhysics.ArticulationRootAPI.Apply(bodies["base"])
+    for name, child in zip(meta.joint_names, meta.joint_body_names, strict=True):
+        parent = meta.body_parent_names[meta.body_names.index(child)]
+        joint = UsdPhysics.RevoluteJoint.Define(stage, "/Asset/joints/" + name)
+        joint.CreateAxisAttr(UsdPhysics.Tokens.z)
+        joint.CreateBody0Rel().SetTargets([bodies[parent].GetPath()])
+        joint.CreateBody1Rel().SetTargets([bodies[child].GetPath()])
+    follower = stage.GetPrimAtPath("/Asset/joints/follower")
+    drive = UsdPhysics.DriveAPI.Apply(follower, UsdPhysics.Tokens.angular)
+    drive.CreateStiffnessAttr().Set(4.0)
+    drive.CreateDampingAttr().Set(5.0)
+    stage.GetRootLayer().Save()
+
+    complete_native_usd(path, meta)
+    stage.Reload()
+    follower = stage.GetPrimAtPath("/Asset/joints/follower")
+    assert follower.HasAPI(physx.JOINT_AXIS_API, UsdPhysics.Tokens.angular)
+    assert follower.GetAttribute(
+        physx.JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR,
+    ).Get() == pytest.approx(.3 * math.pi / 180)
+    drive = UsdPhysics.DriveAPI.Get(follower, UsdPhysics.Tokens.angular)
+    assert drive.GetStiffnessAttr().Get() == 0
+    assert drive.GetDampingAttr().Get() == 0
+    mimic, = PhysxSchema.PhysxMimicJointAPI.GetAll(follower)
+    assert follower.HasAPI(PhysxSchema.PhysxMimicJointAPI, "rotZ")
+    assert mimic.GetReferenceJointRel().GetTargets() == [Sdf.Path("/Asset/joints/driver")]
+    assert mimic.GetReferenceJointAxisAttr().Get() == "rotZ"
+    assert mimic.GetGearingAttr().Get() == -.5
+    assert mimic.GetOffsetAttr().Get() == pytest.approx(-math.degrees(.1))
+    for attribute in (physx.JOINT_AXIS_ATTR_STATIC_FRICTION_EFFORT_ANGULAR,
+                      physx.JOINT_AXIS_ATTR_DYNAMIC_FRICTION_EFFORT_ANGULAR):
+        assert not follower.GetAttribute(attribute).HasAuthoredValueOpinion()
+
+    # A matching attribute alone must not pass: the pinned parser ignores it
+    # unless this specific codeless angular API instance is actually applied.
+    assert follower.RemoveAPI(physx.JOINT_AXIS_API, UsdPhysics.Tokens.angular)
+    stage.GetRootLayer().Save()
+    with pytest.raises(ValueError, match="mimic/property binding differs"):
+        validate_native_usd(path, meta)
 
 
 def test_empty_visual_reference_repair_preserves_physical_and_real_visual_prims(tmp_path):

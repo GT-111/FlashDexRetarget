@@ -266,6 +266,7 @@ def _complete_native_articulation_roots(stage) -> None:
 def complete_native_usd(usd_path, meta) -> None:
     """Install the native constraints missing from pinned MJCF import, pre-parse."""
     from omni.physx.bindings._physx import (
+        JOINT_AXIS_API,
         JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR,
     )
     from pxr import PhysxSchema, Sdf, Usd, UsdPhysics
@@ -298,7 +299,7 @@ def complete_native_usd(usd_path, meta) -> None:
         drive = UsdPhysics.DriveAPI.Apply(prim, UsdPhysics.Tokens.angular)
         drive.CreateStiffnessAttr().Set(0.0)
         drive.CreateDampingAttr().Set(0.0)
-        PhysxSchema.PhysxJointAxisAPI.Apply(prim, UsdPhysics.Tokens.angular)
+        prim.ApplyAPI(JOINT_AXIS_API, UsdPhysics.Tokens.angular)
         prim.CreateAttribute(
             JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR, Sdf.ValueTypeNames.Float,
         ).Set(fact.viscous_friction_per_degree)
@@ -311,6 +312,7 @@ def validate_native_usd(usd_path, meta) -> None:
     import mujoco
     import numpy as np
     from omni.physx.bindings._physx import (
+        JOINT_AXIS_API,
         JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR,
     )
     from pxr import PhysxSchema, UsdPhysics
@@ -356,13 +358,16 @@ def validate_native_usd(usd_path, meta) -> None:
         mimic = mimics[0]
         reference = joints[fact.reference_joint_name]
         if (
-            mimic.GetName() != "rot" + joint.GetAxisAttr().Get()
+            not prim.HasAPI(
+                PhysxSchema.PhysxMimicJointAPI, "rot" + joint.GetAxisAttr().Get(),
+            )
             or mimic.GetReferenceJointAxisAttr().Get()
             != "rot" + UsdPhysics.RevoluteJoint(reference).GetAxisAttr().Get()
             or mimic.GetReferenceJointRel().GetTargets() != [reference.GetPath()]
             or mimic.GetGearingAttr().Get() != float(np.float32(fact.gearing))
             or mimic.GetOffsetAttr().Get() != float(np.float32(fact.offset_degrees))
             or (drive and (drive.GetStiffnessAttr().Get() != 0 or drive.GetDampingAttr().Get() != 0))
+            or not prim.HasAPI(JOINT_AXIS_API, UsdPhysics.Tokens.angular)
             or prim.GetAttribute(JOINT_AXIS_ATTR_VISCOUS_FRICTION_COEFFICIENT_ANGULAR).Get()
             != float(np.float32(fact.viscous_friction_per_degree))
         ):
