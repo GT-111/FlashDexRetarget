@@ -152,7 +152,7 @@ this stock correction does not alter XML geometry or native pair-contact facts.
 
 ### Native articulated training assistance
 
-The `native` recipe uses the authored scene's gravity and passive support with no object assistance. Select `--config-name native_assisted` to train with explicit per-part object PD forces and the existing adaptive xfrc curriculum. The robot, physical part names, command actuators and runtime remain selected through the same native configuration. The object retains one FREE base and its passive articulation; training assistance is not an object motor, weld or playback.
+The `native` recipe uses the authored scene's gravity and passive support with no object assistance. Select `--config_name native_assisted` to train with explicit per-part object PD forces and the existing adaptive xfrc curriculum. The robot, physical part names, command actuators and runtime remain selected through the same native configuration. The object retains one FREE base and its passive articulation; training assistance is not an object motor, weld or playback.
 
 The configured PD acts at actual body COMs in WORLD axes. Its linear error uses body-origin pose/velocity, and its rotational inertia is the installed COM inertia expressed in the body frame. Unsupported reference poses receive no force; unsupported velocities use zero feedforward with false independent rate support. Native assistance currently admits the explicit PD/adaptive recipe, not dynamic gravity, contact-dependent scaling, perturbation or implicit damping.
 
