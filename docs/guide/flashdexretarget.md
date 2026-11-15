@@ -150,6 +150,10 @@ learner/replay results require separate qualification on the corrected source.
 The native USD path supplies no such override and keeps its authored authority;
 this stock correction does not alter XML geometry or native pair-contact facts.
 
+Body correspondences use the existing `[robot, MANO role]` pairs, with the robot member now an explicit mapping from each available hand side to its complete body name. For example, `[{left: armA/segment, right: receiverB/finger_stage}, index_proximal]` preserves full namespaces and supports asymmetric names. Declare only actual physical correspondences; missing anatomy must stay absent. The former suffix-string schema is no longer accepted. The command resolves those names against the actual entity once, then uses the admitted full names for reference FK.
+
+All shipped XHand, Sharpa and F1 registrations retain their prior body names, MANO roles and ordering. Stock and native commands use the same nonempty declared level groups for geometry access. Stock metrics follow those groups; native metrics retain their separate registered-root and object-part meanings. This does not add native anatomical metric outputs. F1 retains its seven sparse all-body correspondences and no level groups. Reward selection, source/support authority, controllers, clocks and physics are unchanged.
+
 ### Native articulated training assistance
 
 The `native` recipe uses the authored scene's gravity and passive support with no object assistance. Select `--config_name native_assisted` to train with explicit per-part object PD forces and the existing adaptive xfrc curriculum. The robot, physical part names, command actuators and runtime remain selected through the same native configuration. The object retains one FREE base and its passive articulation; training assistance is not an object motor, weld or playback.

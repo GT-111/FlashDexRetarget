@@ -40,13 +40,13 @@ robot:
   # are not filled by choosing another physical link. Flash calls little pinky.
   body_mapping:
     all:
-      - [thumb_4, thumb_distal]
-      - [index_1, index_proximal]
-      - [index_2, index_intermediate]
-      - [middle_2, middle_intermediate]
-      - [ring_2, ring_intermediate]
-      - [little_1, pinky_proximal]
-      - [little_2, pinky_intermediate]
+      - [{left: left_thumb_4, right: right_thumb_4}, thumb_distal]
+      - [{left: left_index_1, right: right_index_1}, index_proximal]
+      - [{left: left_index_2, right: right_index_2}, index_intermediate]
+      - [{left: left_middle_2, right: right_middle_2}, middle_intermediate]
+      - [{left: left_ring_2, right: right_ring_2}, ring_intermediate]
+      - [{left: left_little_1, right: right_little_1}, pinky_proximal]
+      - [{left: left_little_2, right: right_little_2}, pinky_intermediate]
     level1: {}
     level2: {}
 

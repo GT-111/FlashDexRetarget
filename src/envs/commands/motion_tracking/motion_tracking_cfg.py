@@ -154,6 +154,7 @@ class MotionTrackingCommandCfg(CommandTermCfg):
     finger_names: tuple[str, ...]
     joint_names: dict[str, list[str]]
     site_names: dict[str, dict]
+    # Pairs are [{available_side: exact_full_body_name}, original_MANO_joint_name].
     body_mapping: dict
 
     sampling: MotionSamplingCfg = field(default_factory=MotionSamplingCfg)

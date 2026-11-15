@@ -87,24 +87,24 @@ class MotionTrackingCommandBase(
 
         for side in self.motion_lib.hand_sides:
             self._level1_body_ids[side] = [
-                self.robot.body_names.index(f"{side}_{level1_mapping[f][0]}")
+                self.robot.body_names.index(level1_mapping[f][0][side])
                 for f in self.finger_names if f in level1_mapping
             ]
             self._level2_body_ids[side] = [
-                self.robot.body_names.index(f"{side}_{level2_mapping[f][0]}")
+                self.robot.body_names.index(level2_mapping[f][0][side])
                 for f in self.finger_names if f in level2_mapping
             ]
             self._all_body_ids[side] = [
-                self.robot.body_names.index(f"{side}_{rb}") for rb, _ in all_body_mano
+                self.robot.body_names.index(names[side]) for names, _ in all_body_mano
             ]
             if mid_mapping:
                 self._levelmid_body_ids[side] = [
-                    self.robot.body_names.index(f"{side}_{mid_mapping[f][0]}")
-                    for f in self.finger_names
+                    self.robot.body_names.index(mid_mapping[f][0][side])
+                    for f in self.finger_names if f in mid_mapping
                 ]
 
     def _levels(self) -> tuple:
-        return (1, 2, 3) if getattr(self, "_levelmid_body_ids", None) else (1, 2)
+        return tuple(level for level in (1, 2, 3) if self.cfg.body_mapping.get(f"level{level}"))
 
     def _init_mano_body_ids(self, cfg: MotionTrackingCommandCfg) -> None:
         all_body_mano = cfg.body_mapping["all"]
@@ -132,7 +132,7 @@ class MotionTrackingCommandBase(
             ]
             if mid_mapping:
                 self._levelmid_mano_ids[side] = [
-                    joint_names.index(mid_mapping[f][1]) for f in self.finger_names
+                    joint_names.index(mid_mapping[f][1]) for f in self.finger_names if f in mid_mapping
                 ]
 
     # ══ Reference state: clip indexing, reference joints, robot-reference FK ═══════
@@ -191,14 +191,14 @@ class MotionTrackingCommandBase(
         for j in range(model.njnt):
             nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
             if nm is not None:
-                qadr_by_name[nm.split("/")[-1]] = int(model.jnt_qposadr[j])
+                qadr_by_name[nm] = int(model.jnt_qposadr[j])
         col_qadr = [qadr_by_name[jn] for jn in self.robot.joint_names]
 
         site_by_name: dict[str, int] = {}
         for s in range(model.nsite):
             nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, s)
             if nm is not None:
-                site_by_name[nm.split("/")[-1]] = s
+                site_by_name[nm] = s
         tip_ids = {
             side: [site_by_name[n] for n in self.cfg.site_names["tip"][side]]
             for side in self._side_list
@@ -214,18 +214,15 @@ class MotionTrackingCommandBase(
         for b in range(model.nbody):
             nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b)
             if nm is not None:
-                body_by_name[nm.split("/")[-1]] = b
-        level1_map = self.cfg.body_mapping["level1"]
+                body_by_name[nm] = b
         lvl1_body_ids = {
-            side: [
-                body_by_name[f"{side}_{level1_map[f][0]}"] for f in self.finger_names
-                if f in level1_map
-            ]
+            side: [body_by_name[self.robot.body_names[index]]
+                   for index in self._level1_body_ids[side]]
             for side in self._side_list
         }
-        all_map = self.cfg.body_mapping["all"]
         all_body_ids = {
-            side: [body_by_name[f"{side}_{rb}"] for rb, _ in all_map]
+            side: [body_by_name[self.robot.body_names[index]]
+                   for index in self._all_body_ids[side]]
             for side in self._side_list
         }
 
@@ -233,7 +230,7 @@ class MotionTrackingCommandBase(
         for j in range(model.njnt):
             nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
             if nm is not None:
-                dadr_by_name[nm.split("/")[-1]] = int(model.jnt_dofadr[j])
+                dadr_by_name[nm] = int(model.jnt_dofadr[j])
         col_dadr = [dadr_by_name[jn] for jn in self.robot.joint_names]
 
         # ── FK over every demo frame ───────────────────────────────────────────────
@@ -242,11 +239,12 @@ class MotionTrackingCommandBase(
         T = qpos.shape[0]
         n_sides = len(self._side_list)
         n_fing = len(self.finger_names)
-        n_all = len(all_map)
+        n_all = len(all_body_ids[self._side_list[0]])
+        n_level1 = len(lvl1_body_ids[self._side_list[0]])
         rest = data.qpos.copy()
         rest_v = data.qvel.copy()
         tips = np.zeros((T, n_sides, n_fing, 3), dtype=np.float32)
-        lvl1 = np.zeros((T, n_sides, len(level1_map), 3), dtype=np.float32)
+        lvl1 = np.zeros((T, n_sides, n_level1, 3), dtype=np.float32)
         allp = np.zeros((T, n_sides, n_all, 3), dtype=np.float32)
         allv = np.zeros((T, n_sides, n_all, 3), dtype=np.float32)
         tipv = np.zeros((T, n_sides, n_fing, 3), dtype=np.float32)

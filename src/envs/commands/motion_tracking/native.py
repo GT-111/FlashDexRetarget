@@ -136,11 +136,6 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             return self.robot.data.joint_vel.new_empty(self.num_envs, 0)
         return self.native_object.data.joint_vel
 
-    def _levels(self):
-        return tuple(
-            level for level in (1, 2) if self.cfg.body_mapping.get(f"level{level}")
-        )
-
     def _reference_free_root_states(self):
         return {
             h.root_joint_name: self.motion_lib.native_root_state_w[h.side]

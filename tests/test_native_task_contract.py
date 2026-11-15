@@ -1,4 +1,4 @@
-"""Synthetic native task DTO/caller contracts; no learned model, FK, Kit or physics."""
+"""Synthetic native task contracts and CPU FK; no learner, Kit or integration."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -905,3 +905,223 @@ def test_stock_reward_twins_keep_metadata_and_full_termination_weights():
         env, **terms[side_twin_name("termination_penalty", side[0])].params
     ) * terms[side_twin_name("termination_penalty", side[0])].weight for side in command._side_list)
     torch.testing.assert_close(weighted, torch.tensor([2 * cfg.rewards.reward_weights.termination_penalty]))
+
+
+def _full_name_body_fixture(tmp_path, root_mode):
+    """Compile tiny named geometry and exercise the selected real setup/FK owners.
+
+    No plant, SDF, complete task or policy is constructed. Live state facts are
+    explicit analytic points; no integration is performed.
+    """
+    import mujoco
+    import numpy as np
+    from mjlab.managers import CommandTerm
+
+    from envs.commands.motion_tracking.motion_tracking import MotionTrackingCommand
+    from retarget.human_demo import clips as C
+
+    sides = ("right", "left")
+    prefix = {"left": "Alpha", "right": "receiver-B"}
+    origin = {"left": np.array((.4, .2, .8)), "right": np.array((-.3, -.1, 1.1))}
+    angles = {"left": np.array((.25, -.4)), "right": np.array((-.3, .6))}
+    rates = {"left": np.array((.7, -.5)), "right": np.array((-.6, .8))}
+    native = root_mode == "native-free"
+
+    def hand_xml(side):
+        name = prefix[side]
+        position = " ".join(str(x) for x in origin[side])
+        free = f'<freejoint name="{name}/root"/>' if native else ""
+        return f'''<body name="{name}/base" pos="{position}">
+          {free}<geom type="sphere" size=".03" mass=".1"/>
+          <site name="{name}/palm"/>
+          <site name="{name}/thumb-tip" pos="0 .1 0"/>
+          <body name="{name}/prox">
+            <joint name="{name}/hinge" axis="0 0 1"/>
+            <geom type="sphere" size=".02" mass=".02"/>
+            <body name="{name}/dist" pos=".2 0 0">
+              <geom type="sphere" size=".02" mass=".02"/>
+              <site name="{name}/tip" pos=".1 0 0"/>
+            </body>
+          </body>
+        </body>'''
+
+    xml = '<mujoco><worldbody>' + ''.join(hand_xml(side) for side in sides)
+    xml += '''<body name="object" pos="0 0 2"><freejoint name="object-free"/>
+      <geom type="sphere" size=".02" mass=".1"/></body></worldbody><actuator>'''
+    xml += ''.join(f'<position name="{prefix[side]}/drive" joint="{prefix[side]}/hinge" kp="3" kv=".1"/>'
+                   for side in sides) + '</actuator></mujoco>'
+    path = tmp_path / "namespaced.xml"
+    path.write_text(xml)
+    model = mujoco.MjModel.from_xml_path(str(path))
+    body_names = tuple(reversed([mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)
+                                for i in range(1, model.nbody)]))
+    joint_names = tuple(reversed([mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
+                                 for i in range(model.njnt)
+                                 if model.jnt_type[i] == mujoco.mjtJoint.mjJNT_HINGE]))
+    site_names = tuple(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, i)
+                       for i in range(model.nsite))
+    root_states, expected = {}, {}
+    for si, side in enumerate(sides):
+        state = np.zeros((2, 13))
+        state[:, :3] = origin[side]
+        theta = np.zeros(2)
+        if native:
+            state[:, :3] += np.array(((.01, 0., 0.), (.03, -.01, .02))) * (si + 1)
+            theta = np.array((.2, -.1)) * (1. if side == "left" else -1.)
+            state[:, 7:10] = (.05 * (si + 1), -.02, .01)
+            state[:, 12] = .4 if side == "left" else -.2
+        state[:, 3], state[:, 6] = np.cos(theta / 2), np.sin(theta / 2)
+        root_states[side] = torch.from_numpy(state)
+        total = theta + angles[side]
+        distal_offset = .2 * np.stack((np.cos(total), np.sin(total), np.zeros(2)), -1)
+        index_offset = distal_offset * 1.5
+        thumb_offset = .1 * np.stack((-np.sin(theta), np.cos(theta), np.zeros(2)), -1)
+        total_omega = np.zeros((2, 3))
+        total_omega[:, 2] = state[:, 12] + rates[side]
+        root_omega = np.zeros((2, 3))
+        root_omega[:, 2] = state[:, 12]
+        expected[side] = dict(
+            root=state[:, :3], quaternion=state[:, 3:7],
+            all_position=np.stack((state[:, :3] + distal_offset, state[:, :3]), 1),
+            all_velocity=np.stack((state[:, 7:10] + np.cross(total_omega, distal_offset), state[:, 7:10]), 1),
+            tip_position=np.stack((state[:, :3] + index_offset, state[:, :3] + thumb_offset), 1),
+            tip_velocity=np.stack((state[:, 7:10] + np.cross(total_omega, index_offset),
+                                   state[:, 7:10] + np.cross(root_omega, thumb_offset)), 1),
+        )
+    column_side = {prefix[side] + "/hinge": side for side in sides}
+    q = torch.tensor(np.stack([angles[column_side[name]] for name in joint_names], -1), dtype=torch.float32)
+    v = torch.tensor(np.stack([rates[column_side[name]] for name in joint_names], -1), dtype=torch.float32)
+    live_pos, live_vel = torch.zeros(1, len(body_names), 3), torch.zeros(1, len(body_names), 3)
+    for side in sides:
+        for suffix, slot in (("dist", 0), ("prox", 1)):
+            column = body_names.index(prefix[side] + "/" + suffix)
+            live_pos[0, column] = torch.tensor(expected[side]["all_position"][0, slot], dtype=torch.float32)
+            live_vel[0, column] = torch.tensor(expected[side]["all_velocity"][0, slot], dtype=torch.float32)
+    robot = SimpleNamespace(body_names=body_names, joint_names=joint_names, site_names=site_names,
+        cfg=SimpleNamespace(spec_fn=lambda: mujoco.MjSpec.from_file(str(path))),
+        find_sites=lambda names, preserve_order: ([site_names.index(name) for name in names], list(names)),
+        data=SimpleNamespace(body_link_pos_w=live_pos, body_link_lin_vel_w=live_vel))
+    distal = {side: prefix[side] + "/dist" for side in sides}
+    proximal = {side: prefix[side] + "/prox" for side in sides}
+    mapping = dict(all=[[distal, "index_distal"], [proximal, "index_proximal"]],
+                   level1={"index": [proximal, "index_proximal"]}, level2={},
+                   level3={"index": [distal, "index_distal"]})
+    cfg = SimpleNamespace(body_mapping=mapping, object=SimpleNamespace(entity_names=None),
+        site_names={"palm": {side: prefix[side] + "/palm" for side in sides},
+            "tip": {side: [prefix[side] + "/tip", prefix[side] + "/thumb-tip"] for side in sides}})
+    cfg.site_names["contact"] = cfg.site_names["tip"]
+    mano_names = list(reversed(C.MANO_JOINT_NAMES))
+    mano = torch.arange(2 * len(mano_names) * 3, dtype=torch.float32).reshape(2, len(mano_names), 3) / 100
+    library = SimpleNamespace(hand_sides=sides, robot_joint_pos=q, robot_joint_vel=v,
+        length_starts=torch.tensor([0]), mano_joint_names={side: mano_names for side in sides},
+        mano_joint_pos={side: mano.clone() for side in sides}, native_root_state_w=root_states)
+    cls = NativeMotionTrackingCommand if native else MotionTrackingCommand
+    command = object.__new__(cls)
+    env = SimpleNamespace(device="cpu", num_envs=1, scene=SimpleNamespace(env_origins=torch.zeros(1, 3)))
+    CommandTerm.__init__(command, cfg, env)
+    command.robot, command.motion_lib = robot, library
+    command._side_list, command.finger_names = list(sides), ("index", "thumb")
+    command.motion_ids, command.motion_steps = torch.tensor([0]), torch.tensor([0])
+    if native:
+        command.native_layout = NativeSceneCfg.from_mapping(dict(scene_xml_path=str(path),
+            hands=[dict(side=side, entity_name=side, root_body_name=prefix[side] + "/base",
+                root_joint_name=prefix[side] + "/root", command_actuator_names=[prefix[side] + "/drive"],
+                root_control=dict(position_stiffness=0, position_damping=0, rotation_stiffness=0,
+                    rotation_damping=0, force_limit_n=None, torque_limit_nm=None)) for side in sides],
+            object=dict(entity_name="object", root_body_name="object", root_joint_name="object-free",
+                parts=[dict(name="body", body_name="object", mesh_path="not-queried.obj")])))
+    command._init_site_ids(cfg)
+    command._init_robot_body_ids(cfg)
+    command._init_mano_body_ids(cfg)
+    command._init_metrics()
+    command._compute_robot_ref_state()
+    return command, expected
+
+
+@pytest.mark.parametrize("root_mode", ["stock-sites", "native-free"])
+def test_explicit_body_correspondence_joins_live_and_reference_fk(tmp_path, root_mode):
+    import numpy as np
+
+    command, expected = _full_name_body_fixture(tmp_path, root_mode)
+    assert command._levels() == (1, 3)  # Missing thumb level3 is not invented.
+    if root_mode == "native-free":
+        assert set(command.metrics) == {"native_root_position_error_m", "native_part_position_error_m"}
+    else:
+        assert "error_level3_l" in command.metrics and "error_level3_r" in command.metrics
+        assert "error_level2_l" not in command.metrics
+    for si, side in enumerate(command._side_list):
+        np.testing.assert_allclose(command._robot_ref_all_pos[:, si], expected[side]["all_position"], atol=1e-6)
+        np.testing.assert_allclose(command._robot_ref_all_lin_vel[:, si], expected[side]["all_velocity"], atol=1e-6)
+        np.testing.assert_allclose(command._robot_ref_tip_pos[:, si], expected[side]["tip_position"], atol=1e-6)
+        np.testing.assert_allclose(command._robot_ref_tip_lin_vel[:, si], expected[side]["tip_velocity"], atol=1e-6)
+        np.testing.assert_allclose(command._robot_ref_wrist_pos[:, si], expected[side]["root"], atol=1e-6)
+        np.testing.assert_allclose(command._robot_ref_wrist_quat[:, si], expected[side]["quaternion"], atol=1e-6)
+        np.testing.assert_allclose(command._robot_ref_level1_pos[:, si, 0], expected[side]["root"], atol=1e-6)
+        np.testing.assert_allclose(command.robot_level_trans_w(side, 3)[0, 0],
+                                   expected[side]["all_position"][0, 0], atol=1e-6)
+        mano_index = command.motion_lib.mano_joint_names[side].index("index_distal")
+        torch.testing.assert_close(command.mano_level_trans_w(side, 3),
+                                   command.motion_lib.mano_joint_pos[side][:1, [mano_index]])
+        assert len(command._levelmid_body_ids[side]) == len(command._levelmid_mano_ids[side]) == 1
+
+
+@pytest.mark.parametrize("profile", ["xhand_bimanual", "sharpa_bimanual", "inspire_rh56f1_bimanual"])
+def test_registered_body_correspondence_preserves_literal_asset_names(profile):
+    """Check shared name admission and stock geometry metrics, not native task scoring."""
+    import xml.etree.ElementTree as ET
+
+    from mjlab.managers import CommandTerm
+    from omegaconf import OmegaConf
+
+    from envs.commands.motion_tracking.motion_tracking import MotionTrackingCommand
+    from retarget.human_demo import clips as C
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = OmegaConf.load(root / "config/envs/robot" / (profile + ".yaml")).robot
+    suffixes = {
+        "xhand_bimanual": ("hand_thumb_bend_link", "hand_thumb_rota_link1", "hand_thumb_rota_link2",
+            "hand_index_bend_link", "hand_index_rota_link1", "hand_index_rota_link2", "hand_mid_link1",
+            "hand_mid_link2", "hand_ring_link1", "hand_ring_link2", "hand_pinky_link1", "hand_pinky_link2"),
+        "sharpa_bimanual": ("thumb_MC", "thumb_PP", "thumb_DP", "index_MCP_VL", "index_MP", "index_DP",
+            "middle_MCP_VL", "middle_MP", "middle_DP", "ring_MCP_VL", "ring_MP", "ring_DP",
+            "pinky_MCP_VL", "pinky_MP", "pinky_DP"),
+        "inspire_rh56f1_bimanual": ("thumb_4", "index_1", "index_2", "middle_2", "ring_2", "little_1", "little_2"),
+    }
+    roles = {
+        "xhand_bimanual": ("thumb_proximal", "thumb_intermediate", "thumb_distal", "index_proximal",
+            "index_proximal", "index_distal", "middle_proximal", "middle_distal", "ring_proximal",
+            "ring_distal", "pinky_proximal", "pinky_distal"),
+        "sharpa_bimanual": tuple(f"{finger}_{part}" for finger in C.FINGERS
+                                 for part in ("proximal", "intermediate", "distal")),
+        "inspire_rh56f1_bimanual": ("thumb_distal", "index_proximal", "index_intermediate",
+            "middle_intermediate", "ring_intermediate", "pinky_proximal", "pinky_intermediate"),
+    }
+    expected_levels = {"xhand_bimanual": (1, 2), "sharpa_bimanual": (1, 2, 3),
+                       "inspire_rh56f1_bimanual": ()}[profile]
+    if profile == "inspire_rh56f1_bimanual":
+        # The external composed model is not reopened for this registration regression.
+        body_names = list(dict.fromkeys(name for names in cfg.contact_links.values() for name in names))
+    else:
+        asset = "xhand" if profile == "xhand_bimanual" else "sharpa"
+        body_names = [node.attrib["name"] for node in ET.parse(root / "assets/robot" / asset / "bimanual.xml").iter("body")]
+    robot = SimpleNamespace(body_names=list(reversed(body_names)))
+    source_names = list(reversed(C.MANO_JOINT_NAMES))
+    library = SimpleNamespace(hand_sides=("right", "left"),
+                              mano_joint_names={side: source_names for side in ("left", "right")})
+    command = object.__new__(MotionTrackingCommand)
+    CommandTerm.__init__(command, SimpleNamespace(body_mapping=cfg.body_mapping,
+        object=SimpleNamespace(entity_names=None)), SimpleNamespace(device="cpu", num_envs=1))
+    command.robot, command.motion_lib = robot, library
+    command._side_list, command.finger_names = list(library.hand_sides), tuple(cfg.body_names.fingers)
+    command._init_robot_body_ids(command.cfg)
+    command._init_mano_body_ids(command.cfg)
+    command._init_metrics()
+    assert command._levels() == expected_levels
+    for side in library.hand_sides:
+        assert [robot.body_names[i] for i in command._all_body_ids[side]] == [
+            f"{side}_{suffix}" for suffix in suffixes[profile]]
+        assert [source_names[i] for i in command._all_mano_ids[side]] == list(roles[profile])
+        for level in (1, 2, 3):
+            field = {1: "_level1_body_ids", 2: "_level2_body_ids", 3: "_levelmid_body_ids"}[level]
+            assert len(getattr(command, field).get(side, ())) == (5 if level in expected_levels else 0)
+            assert (f"error_level{level}_{side[0]}" in command.metrics) == (level in expected_levels)
