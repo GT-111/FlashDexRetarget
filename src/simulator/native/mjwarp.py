@@ -31,6 +31,7 @@ class MjWarpPlant(NativePlant):
                          "scene_xml_path": scene_xml_path, "sim_dt_s": float(sim_dt)}
         with self._scope():
             self._model = mjw.put_model(model)
+            self._bind_execution_clock(float(model.opt.timestep))
             data = mujoco.MjData(model)
             mujoco.mj_forward(model, data)
             self._data = mjw.put_data(model, data, nworld=num_envs, nconmax=nconmax, njmax=njmax)
@@ -47,6 +48,34 @@ class MjWarpPlant(NativePlant):
             self._body_root = torch.as_tensor(model.body_rootid, device=device, dtype=torch.long)
             self._geom_body = torch.as_tensor(model.geom_bodyid, device=device, dtype=torch.long)
             mjw.forward(self._model, self._data)
+
+    def _bind_execution_clock(self, configured_timestep_s):
+        """Bind the configured schedule to the actually installed device dt.
+
+        Counts describe accepted step calls, not exact sums of binary device dt.
+        Nonintegral-nanosecond steps remain supported and round only at export.
+        """
+        actual = self._wp.to_torch(self._model.opt.timestep).detach()
+        expected = torch.full_like(actual, configured_timestep_s)
+        if (not np.isfinite(configured_timestep_s) or configured_timestep_s <= 0
+                or actual.shape != (1,) or actual.dtype != torch.float32
+                or not torch.equal(actual, expected)):
+            raise ValueError("MJWarp execution clock requires the installed fixed timestep cast")
+        self._execution_steps = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+        self.contact_sample_execution_step = torch.full_like(self._execution_steps, -1)
+        self._execution_clock_metadata = dict(
+            schema="accepted_mjwarp_fixed_step_clock_v1",
+            authority="accepted direct MJWarp step calls on the owning stream",
+            configured_timestep_s=configured_timestep_s,
+            device_timestep_s=float(actual[0].cpu()), device_timestep_dtype=str(actual.dtype),
+            configured_device_cast_verified=True,
+            time_ns="round((accepted_steps - recorded_reset_steps) * configured_timestep_s * 1e9); not a sum of binary device dt",
+            raw_solver_time="unchanged Data.time; separate accumulated floating engine state",
+        )
+        self.identity["execution_clock"] = self._execution_clock_metadata
+
+    def execution_clock(self):
+        return dict(steps=self._execution_steps, metadata=self._execution_clock_metadata)
 
     @contextmanager
     def _scope(self):
@@ -71,6 +100,7 @@ class MjWarpPlant(NativePlant):
             self.control[env_ids] = 0
             self.external_body_wrench_w[env_ids] = 0
             self.effort[env_ids] = 0
+            self._execution_steps[env_ids] = 0
             self.invalidate_contacts(env_ids)
 
     def set_state(self, env_ids, qpos, qvel):
@@ -87,14 +117,17 @@ class MjWarpPlant(NativePlant):
         with self._scope():
             self.prepare_contact_substep()
             sample_time = self.physics_time()
+            sample_step = self._execution_steps.clone()
             self._ctrl.copy_(self.control)
             self._xfrc_applied.copy_(self.external_body_wrench_w)
             self._mjw.step(self._model, self._data)
+            self._execution_steps.add_(1)
             self.effort.copy_(self._solved_effort)
             torch._assert_async((self._wp.to_torch(self._data.overflow) == 0).all(), "MJWarp contact/constraint capacity exceeded")
             # A subsequent forward refreshes endpoint geometry; retain the actual solve first.
             self._read_solved_contacts()
             self.contact_sample_time_s.copy_(sample_time)
+            self.contact_sample_execution_step.copy_(sample_step)
             self.forward()
             self.record_contact_substep()
 

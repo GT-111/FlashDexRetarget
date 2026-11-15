@@ -282,6 +282,10 @@ class NativeScene:
         """Actual endpoint solver clock, independently of source/control phases."""
         return self.sim.plant.physics_time()
 
+    def physics_execution_clock(self):
+        """Backend-admitted accepted-step facts, independently of raw solver time."""
+        return self.sim.plant.execution_clock()
+
     def hand_part_contact_facts(self):
         return {
             "pairs": self.sim.plant.contact_facts,

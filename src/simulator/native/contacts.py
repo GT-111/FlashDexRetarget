@@ -35,6 +35,13 @@ class ControlIntervalContacts:
         self.interval_complete = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._discarded = torch.zeros_like(self.interval_complete)
         self._active, self._count = False, 0
+        clock = plant.execution_clock()
+        self.execution_clock_metadata = None if clock is None else clock["metadata"]
+        if clock is not None:
+            self.execution_sample_begin_step = torch.full(shape, -1, dtype=torch.int64, device=self.device)
+            self.execution_sample_end_step = torch.full_like(self.execution_sample_begin_step, -1)
+            self.execution_clock_support = torch.zeros_like(self.clock_support)
+            self.execution_interval_complete = torch.zeros_like(self.interval_complete)
 
     def discard(self, rows=None):
         """A reset/state write has no executed contact interval for selected rows."""
@@ -45,6 +52,11 @@ class ControlIntervalContacts:
             field[rows] = False
         self.sample_begin_time_s[rows] = float("nan")
         self.sample_end_time_s[rows] = float("nan")
+        if self.execution_clock_metadata is not None:
+            self.execution_sample_begin_step[rows] = -1
+            self.execution_sample_end_step[rows] = -1
+            self.execution_clock_support[rows] = False
+            self.execution_interval_complete[rows] = False
         for pair in self.pairs.values():
             pair["normal_force_n"][rows] = float("nan")
             pair["force_bearing_contact_present"][rows] = False
@@ -79,6 +91,15 @@ class ControlIntervalContacts:
         if slot:
             clock &= begin == self.sample_end_time_s[:, slot - 1]
         self.clock_support[:, slot].copy_(clock)
+        if self.execution_clock_metadata is not None:
+            first = plant.contact_sample_execution_step.detach()
+            last = plant.execution_clock()["steps"].detach()
+            self.execution_sample_begin_step[:, slot].copy_(torch.where(valid, first, -1))
+            self.execution_sample_end_step[:, slot].copy_(torch.where(valid, last, -1))
+            supported = valid & (first >= 0) & (last == first + 1)
+            if slot:
+                supported &= first == self.execution_sample_end_step[:, slot - 1]
+            self.execution_clock_support[:, slot].copy_(supported)
         for name, target in self.pairs.items():
             for key, values in target.items():
                 missing = False if values.dtype == torch.bool else float("nan")
@@ -89,10 +110,13 @@ class ControlIntervalContacts:
         if not self._active or self._count != self.num_substeps:
             raise RuntimeError("native contact interval did not finish its configured substeps")
         self.interval_complete.copy_(self.sample_recorded.all(-1) & self.clock_support.all(-1))
+        if self.execution_clock_metadata is not None:
+            self.execution_interval_complete.copy_(
+                (self.sample_recorded & self.execution_clock_support).all(-1))
         self._active = False
 
     def facts(self):
-        return {
+        result = {
             "num_substeps": self.num_substeps, "pairs": self.pairs,
             "sample_recorded": self.sample_recorded, "measurement_support": self.measurement_support,
             "clock_support": self.clock_support, "sample_begin_time_s": self.sample_begin_time_s,
@@ -100,3 +124,10 @@ class ControlIntervalContacts:
             "clock": "actual per-world solver substep begin and achieved endpoint; independent of source time",
             "sampling": "discrete solved samples at every configured physics substep; not continuous force proof",
         }
+        if self.execution_clock_metadata is not None:
+            result.update(execution_clock=self.execution_clock_metadata,
+                execution_sample_begin_step=self.execution_sample_begin_step,
+                execution_sample_end_step=self.execution_sample_end_step,
+                execution_clock_support=self.execution_clock_support,
+                execution_interval_complete=self.execution_interval_complete)
+        return result

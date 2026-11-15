@@ -41,7 +41,7 @@ class _Plant(NativePlant):
 
     def __init__(self, *, substeps=3, requires_grad=False):
         self.device, self.num_envs, self.substeps, self.requires_grad = "cpu", 2, substeps, requires_grad
-        self.model = SimpleNamespace(nu=1, opt=SimpleNamespace(gravity=(0, 0, -9.81)))
+        self.model = SimpleNamespace(nu=1, nbody=1, opt=SimpleNamespace(gravity=(0, 0, -9.81)))
         self.identity = {"backend": "synthetic_contact_protocol_not_physics"}
         self.layout = _layout()
         self._time = torch.tensor([17.25, 3.5], dtype=torch.float64)
@@ -207,7 +207,7 @@ def test_partial_reset_state_write_and_stopped_interval_discard_old_samples():
 def test_real_backend_advance_methods_feed_the_same_interval_contact_owner(engine):
     """Only the external numerical calls are protocol stubs; run the real adapter method."""
     clock = torch.tensor([8.0, 12.0], dtype=torch.float64)
-    model = SimpleNamespace(nu=1, nv=1)
+    model = SimpleNamespace(nu=1, nv=1, nbody=9)
     state = SimpleNamespace(qpos=torch.zeros(2, 1), qvel=torch.zeros(2, 1))
     index = 0
 
@@ -226,16 +226,22 @@ def test_real_backend_advance_methods_feed_the_same_interval_contact_owner(engin
         def __init__(self):
             self._init_buffers(model, 2, "cpu", {"renamed/panel": ([3], [8])})
             self.effort = torch.zeros(2, 1)
+            self._world_ids, self._body_ids = torch.arange(2), torch.arange(1, model.nbody)
             self.backend = SimpleNamespace(get_physics_time_torch=lambda: clock.clone(),
-                step_torch=step, get_body_pair_contact_facts=read_contacts)
+                step_torch=step, get_body_pair_contact_facts=read_contacts,
+                set_body_wrench_w_torch=lambda *args, **kwargs: None)
 
     class WarpFixture(MjWarpPlant):
         def __init__(self):
             self._init_buffers(model, 2, "cpu", {"renamed/panel": ([3], [8])})
-            self._model, self._data = None, SimpleNamespace(overflow=torch.zeros(1))
+            self._model = SimpleNamespace(opt=SimpleNamespace(timestep=torch.tensor([.005], dtype=torch.float32)))
+            self._data = SimpleNamespace(overflow=torch.zeros(1))
             self._ctrl = torch.zeros(2, 1)
+            self._xfrc_applied = torch.zeros_like(self.external_body_wrench_w)
             self._solved_effort, self.effort = torch.zeros(2, 1), torch.zeros(2, 1)
             self._mjw, self._wp = SimpleNamespace(step=step), SimpleNamespace(to_torch=lambda value: value)
+            self.identity = {"backend": "synthetic actual-MjWarp-method fixture"}
+            self._bind_execution_clock(.005)
 
         def _scope(self):
             return nullcontext()
@@ -261,6 +267,11 @@ def test_real_backend_advance_methods_feed_the_same_interval_contact_owner(engin
                                torch.tensor([[1.0, 2.0, 3.0]] * 2), rtol=0, atol=0)
     assert plant.contact_interval.interval_complete.all()
     assert plant.contact_interval.sample_recorded.all()
+    if engine == "newton":
+        assert plant.execution_clock() is None
+    else:
+        assert plant.execution_clock()["steps"].tolist() == [3, 3]
+        assert plant.contact_interval.facts()["execution_interval_complete"].all()
 
 
 def test_normal_manager_brackets_all_substeps_before_partial_auto_reset():

@@ -252,6 +252,9 @@ class NativeRolloutRecord(RolloutRecord):
             )
         self.backend_metadata = getattr(env.scene, "backend_identity", None)
         self._physics_time_reader = getattr(env.scene, "physics_time_s", None)
+        self._execution_clock_reader = getattr(env.scene, "physics_execution_clock", None)
+        execution = None if self._execution_clock_reader is None else self._execution_clock_reader()
+        self.execution_clock_metadata = None if execution is None else dict(execution["metadata"])
         self._contact_reader = getattr(env.scene, "hand_part_contact_facts", None)
         association_reader = getattr(env.scene, "tracking_contact_metadata", None)
         self.contact_association_metadata = None if association_reader is None else association_reader()
@@ -294,6 +297,8 @@ class NativeRolloutRecord(RolloutRecord):
                 source_required_contact_phase="UNKNOWN; no source engagement is inferred from actual force or hinge sign",
                 provenance="derived target execution evidence, not original observed source contacts",
             )
+            if "execution_clock" in interval:
+                self.contact_interval_metadata["execution_clock"] = dict(interval["execution_clock"])
         self.native_frames = []
         phase = self.cmd.reference_phase
         self.valid_steps_per_env = (
@@ -351,6 +356,8 @@ class NativeRolloutRecord(RolloutRecord):
             frame["object_joint_vel"] = self.cmd.native_object_joint_vel.detach().to("cpu").clone()
         if self._physics_time_reader is not None:
             frame["physics_time_s"] = self._physics_time_reader().detach().cpu().clone()
+        if self.execution_clock_metadata is not None:
+            frame["execution_steps"] = self._execution_clock_reader()["steps"].detach().cpu().clone()
         if self.contact_metadata is not None:
             facts = self._contact_reader()
             frame["contact"] = {
@@ -369,6 +376,10 @@ class NativeRolloutRecord(RolloutRecord):
             for key in ("measurement_support", "sample_recorded", "clock_support",
                         "sample_begin_time_s", "sample_end_time_s", "interval_complete"):
                 frame["contact_interval"][key] = interval[key].detach().cpu().clone()
+            if "execution_clock" in self.contact_interval_metadata:
+                for key in ("execution_sample_begin_step", "execution_sample_end_step",
+                            "execution_clock_support", "execution_interval_complete"):
+                    frame["contact_interval"][key] = interval[key].detach().cpu().clone()
         self.native_frames.append(frame)
 
     def collect_state(self, active_mask=None):
@@ -395,6 +406,8 @@ class NativeRolloutRecord(RolloutRecord):
                 selected["contact_sample_time_s"] = frame["contact_sample_time_s"][select]
             if "physics_time_s" in frame:
                 selected["physics_time_s"] = frame["physics_time_s"][select]
+            if "execution_steps" in frame:
+                selected["execution_steps"] = frame["execution_steps"][select]
             if "contact_interval" in frame:
                 selected["contact_interval"] = {key: value[select] for key, value in frame["contact_interval"].items()}
         return state
@@ -469,11 +482,20 @@ class NativeRolloutRecord(RolloutRecord):
                     for field in _CONTACT_ARRAYS:
                         result["hand_part_" + field] = np.stack([frame["contact"][field][row].numpy() for frame in frames])
                     result["hand_part_sample_time_s"] = np.array([float(frame["contact_sample_time_s"][row]) for frame in frames])
+                if self.execution_clock_metadata is not None:
+                    result["native_execution_steps"] = np.array(
+                        [int(frame["execution_steps"][row]) for frame in frames], dtype=np.int64)
+                    result["native_execution_clock_metadata_json"] = np.asarray(json.dumps(self.execution_clock_metadata))
                 if self.contact_interval_metadata is not None:
                     result["hand_part_interval_metadata_json"] = np.asarray(json.dumps(self.contact_interval_metadata))
                     for field in _CONTACT_INTERVAL_ARRAYS:
                         result["hand_part_interval_" + field] = np.stack([
                             frame["contact_interval"][field][row].numpy() for frame in frames])
+                    if "execution_clock" in self.contact_interval_metadata:
+                        for field in ("execution_sample_begin_step", "execution_sample_end_step",
+                                      "execution_clock_support", "execution_interval_complete"):
+                            result["hand_part_interval_" + field] = np.stack([
+                                frame["contact_interval"][field][row].numpy() for frame in frames])
                 return result
             offset += size
         raise IndexError(env_index)

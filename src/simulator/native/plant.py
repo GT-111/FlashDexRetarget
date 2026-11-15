@@ -72,6 +72,8 @@ class NativePlantSnapshot:
     control: torch.Tensor
     contact_sample_time_s: torch.Tensor
     external_body_wrench_w: torch.Tensor
+    execution_steps: torch.Tensor | None
+    contact_sample_execution_step: torch.Tensor | None
 
 
 class NativePlant(ABC):
@@ -82,6 +84,10 @@ class NativePlant(ABC):
         self.device = str(device)
         self.contact_pairs = contact_pairs
         self.contact_interval = None
+        # Only a backend with an observed fixed-step installation supplies this
+        # clock. Raw solver time remains a separate, unchanged engine state.
+        self._execution_steps = None
+        self.contact_sample_execution_step = None
         self.control = torch.zeros(self.num_envs, model.nu, device=device)
         # Public native-body order, WORLD force then torque at each body COM.
         # This independent external input never creates an actuator/DOF.
@@ -113,6 +119,8 @@ class NativePlant(ABC):
             self.contact_interval.discard(rows)
         self.contact_support[rows] = False
         self.contact_sample_time_s[rows] = float("nan")
+        if self.contact_sample_execution_step is not None:
+            self.contact_sample_execution_step[rows] = -1
         for facts in self.contact_facts.values():
             facts["normal_force_n"][rows] = float("nan")
             facts["force_bearing_contact_present"][rows] = False
@@ -142,6 +150,10 @@ class NativePlant(ABC):
     def physics_time(self):
         """Actual per-world solver clock, not source time or a nominal counter."""
 
+    def execution_clock(self):
+        """Accepted fixed-step clock facts, or None when this backend has no port."""
+        return None
+
     @abstractmethod
     def forward(self):
         """Refresh kinematics without integrating or changing retained solved contact facts."""
@@ -160,6 +172,8 @@ class NativePlant(ABC):
             {n: {k: v.clone() for k, v in f.items()} for n, f in self.contact_facts.items()},
             self.contact_support.clone(), self.control.clone(), self.contact_sample_time_s.clone(),
             self.external_body_wrench_w.clone(),
+            None if self._execution_steps is None else self._execution_steps.clone(),
+            None if self.contact_sample_execution_step is None else self.contact_sample_execution_step.clone(),
         )
 
     def restore(self, snapshot):
@@ -168,6 +182,9 @@ class NativePlant(ABC):
         self.external_body_wrench_w.copy_(snapshot.external_body_wrench_w)
         self.contact_support.copy_(snapshot.contact_support)
         self.contact_sample_time_s.copy_(snapshot.contact_sample_time_s)
+        if self._execution_steps is not None:
+            self._execution_steps.copy_(snapshot.execution_steps)
+            self.contact_sample_execution_step.copy_(snapshot.contact_sample_execution_step)
         for name, facts in snapshot.contact_facts.items():
             for key, value in facts.items():
                 self.contact_facts[name][key].copy_(value)

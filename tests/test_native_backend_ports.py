@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import xml.etree.ElementTree as ET
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -214,6 +215,106 @@ def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_
     assert qpos is state.qpos and qvel is state.qvel
 
 
+@pytest.mark.parametrize("dt", (.005, 1 / 240))
+def test_mjwarp_execution_clock_tracks_actual_calls_reset_restore_and_missing_step(tmp_path, dt):
+    """Real clock/advance owners; only the external solver operations are stubs."""
+    _layout, _mapping, model = _mechanics(tmp_path)
+    plant = object.__new__(MjWarpPlant)
+    plant._init_buffers(model, 2, "cpu", {"left/base": ([1], [2])})
+    plant.identity = {"backend": "mjwarp", "fixture": "solver protocol, not physics"}
+    plant._scope = nullcontext
+    plant._wp = SimpleNamespace(to_torch=lambda value: value, from_torch=lambda value: value)
+    plant._model = SimpleNamespace(opt=SimpleNamespace(timestep=torch.tensor([dt], dtype=torch.float32)))
+    plant._bind_execution_clock(dt)
+    plant._data = SimpleNamespace(time=torch.tensor([25., 7.], dtype=torch.float32), overflow=torch.zeros(2, dtype=torch.int32))
+    plant._qpos = torch.tensor(np.tile(model.qpos0, (2, 1)), dtype=torch.float32)
+    plant._qvel = torch.zeros(2, model.nv)
+    plant._ctrl, plant._xfrc_applied = torch.zeros_like(plant.control), torch.zeros_like(plant.external_body_wrench_w)
+    plant._solved_effort = torch.zeros(2, model.nv)
+    plant.effort = torch.zeros_like(plant._solved_effort)
+    plant._reset_mask = torch.zeros(2, dtype=torch.bool)
+    plant._integration = torch.empty(2, 1)
+    calls = []
+
+    def step(_model, data):
+        calls.append(plant.execution_clock()["steps"].clone())
+        data.time.add_(plant._model.opt.timestep[0])
+
+    def reset(_model, data, *, reset):
+        data.time[reset] = 0
+
+    def get_state(_model, data, target, _kind):
+        target.copy_(data.time[:, None])
+
+    def set_state(_model, data, source, _kind):
+        data.time.copy_(source[:, 0])
+
+    plant._mjw = SimpleNamespace(step=step, reset_data=reset, get_state=get_state, set_state=set_state,
+                                 State=SimpleNamespace(INTEGRATION=1))
+    plant.forward = lambda: None
+
+    def solved_contacts():
+        plant.contact_support[:] = True
+        facts = plant.contact_facts["left/base"]
+        facts["normal_force_n"][:] = 2.
+        facts["force_bearing_contact_present"][:] = True
+        facts["force_bearing_distance_max_m"][:] = .001
+
+    plant._read_solved_contacts = solved_contacts
+    sim = NativeSim(plant)
+    plant.configure_control_interval(4)
+    sim.begin_control_step()
+    raw_before = plant.physics_time()
+    for _ in range(4):
+        sim.step()
+    sim.end_control_step()
+    assert len(calls) == 4 and calls[0].tolist() == [0, 0] and calls[-1].tolist() == [3, 3]
+    facts = plant.contact_interval.facts()
+    torch.testing.assert_close(facts["execution_sample_begin_step"], torch.arange(4).expand(2, -1), rtol=0, atol=0)
+    assert facts["execution_interval_complete"].all()
+    torch.testing.assert_close(facts["pairs"]["left/base"]["normal_force_n"], torch.full((2, 4), 2.))
+    torch.testing.assert_close(facts["sample_begin_time_s"][:, 0], raw_before.double(), rtol=0, atol=0)
+    assert plant.physics_time().dtype == torch.float32
+    if dt == .005:
+        assert int(torch.round((plant.physics_time()[0].double() - raw_before[0].double()) * 1e9)) != 20_000_000
+    metadata = plant.execution_clock()["metadata"]
+    assert metadata["configured_timestep_s"] == dt and metadata["configured_device_cast_verified"] is True
+    assert metadata["device_timestep_s"] == float(torch.tensor(dt, dtype=torch.float32))
+    scene = object.__new__(NativeScene)
+    scene.sim = sim
+    assert scene.physics_execution_clock()["steps"].tolist() == [4, 4]
+
+    snapshot = plant.snapshot()
+    sim.step()
+    plant.restore(snapshot)
+    torch.testing.assert_close(plant.physics_time(), snapshot.physics[0][:, 0], rtol=0, atol=0)
+    torch.testing.assert_close(plant.execution_clock()["steps"], snapshot.execution_steps, rtol=0, atol=0)
+    torch.testing.assert_close(plant.contact_sample_execution_step, snapshot.contact_sample_execution_step, rtol=0, atol=0)
+    assert not plant.contact_interval.facts()["execution_interval_complete"].any()
+    sim.forward()
+    plant.set_state(torch.tensor([1]), plant._qpos[1:].clone(), plant._qvel[1:].clone())
+    assert plant.execution_clock()["steps"].tolist() == [4, 4]
+    sim.reset(torch.tensor([1]))
+    assert plant.execution_clock()["steps"].tolist() == [4, 0]
+    assert plant.physics_time()[0] == snapshot.physics[0][0, 0] and plant.physics_time()[1] == 0
+
+    # Re-reading the last solve four times is not four new accepted advances.
+    sim.begin_control_step()
+    for _ in range(4):
+        plant.record_contact_substep()
+    sim.end_control_step()
+    assert not plant.contact_interval.facts()["execution_interval_complete"].any()
+
+
+def test_mjwarp_execution_clock_rejects_an_actual_device_timestep_mismatch():
+    plant = object.__new__(MjWarpPlant)
+    plant.num_envs, plant.device, plant.identity = 2, "cpu", {}
+    plant._wp = SimpleNamespace(to_torch=lambda value: value)
+    plant._model = SimpleNamespace(opt=SimpleNamespace(timestep=torch.tensor([.006], dtype=torch.float32)))
+    with pytest.raises(ValueError, match="installed fixed timestep cast"):
+        plant._bind_execution_clock(.005)
+
+
 class _ProtocolPlant(NativePlant):
     """Synthetic state owner for reset/installation contracts, never a physical result."""
 
@@ -379,6 +480,11 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
         env.scene.backend_identity = {"backend": "synthetic_port_protocol_not_physics"}
         env.scene.physics_time_s = lambda: torch.tensor(
             [7.125 + int(command.reference_phase["motion_steps"].item()) * .02], dtype=torch.float64)
+        env.scene.physics_execution_clock = lambda: dict(
+            steps=torch.tensor([40 + int(command.reference_phase["motion_steps"].item()) * 4], dtype=torch.int64),
+            metadata=dict(schema="accepted_mjwarp_fixed_step_clock_v1", configured_timestep_s=.005,
+                device_timestep_s=float(torch.tensor(.005, dtype=torch.float32)), device_timestep_dtype="torch.float32",
+                configured_device_cast_verified=True, authority="synthetic recording protocol, not physics"))
         def contacts():
             row = int(command.reference_phase["motion_steps"].item())
             known = row > 0
@@ -396,6 +502,27 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
                 distance_authority="synthetic protocol")
         env.scene.hand_part_contact_facts = contacts
 
+        def interval():
+            last = contacts()
+            row = int(command.reference_phase["motion_steps"].item())
+            known = row > 0
+            start = 40 + (row - 1) * 4 + torch.arange(4)[None]
+            raw = 7.125 + (row - 1) * .02 + torch.arange(4, dtype=torch.float64)[None] * .005
+            return {**last, "num_substeps": 4, "sampling": "synthetic every-substep protocol",
+                "pairs": {name: {key: value[:, None].expand(-1, 4).clone() for key, value in facts.items()}
+                          for name, facts in last["pairs"].items()},
+                "measurement_support": torch.full((1, 4), known), "sample_recorded": torch.full((1, 4), known),
+                "clock_support": torch.full((1, 4), known), "interval_complete": torch.tensor([known]),
+                "sample_begin_time_s": raw if known else torch.full_like(raw, float("nan")),
+                "sample_end_time_s": raw + .005 if known else torch.full_like(raw, float("nan")),
+                "execution_clock": env.scene.physics_execution_clock()["metadata"],
+                "execution_sample_begin_step": start if known else torch.full_like(start, -1),
+                "execution_sample_end_step": start + 1 if known else torch.full_like(start, -1),
+                "execution_clock_support": torch.full((1, 4), known),
+                "execution_interval_complete": torch.tensor([known])}
+
+        env.scene.hand_part_contact_interval_facts = interval
+
     manifest = record_reference_phase_fixture(tmp_path, binding, native=True, setup_scene=setup)
     recorded = load_flashdex_rollout(manifest, motion_id=0)
     arrays = recorded.arrays
@@ -407,6 +534,11 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
     np.testing.assert_allclose(arrays["hand_part_sample_time_s"][1:], [7.14, 7.16])
     np.testing.assert_allclose(arrays["native_physics_time_s"], [7.125, 7.145, 7.165])
     assert arrays["native_physics_reset_time_s"] == 7.125
+    np.testing.assert_array_equal(arrays["native_execution_steps"], [40, 44, 48])
+    assert json.loads(str(arrays["native_execution_clock_metadata_json"]))["configured_timestep_s"] == .005
+    np.testing.assert_array_equal(arrays["hand_part_interval_execution_sample_begin_step"][1], [40, 41, 42, 43])
+    assert not arrays["hand_part_interval_execution_interval_complete"][0]
+    assert arrays["hand_part_interval_execution_interval_complete"][1:].all()
     assert arrays["native_hand_twist_w"].shape == (3, 2, 6)
     metadata = json.loads(str(arrays["hand_part_contact_metadata_json"]))
     assert len(metadata["pairs"]) == 4 and "not original" in metadata["provenance"]

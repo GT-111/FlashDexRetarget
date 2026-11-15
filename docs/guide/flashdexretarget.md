@@ -267,6 +267,21 @@ current manager control interval, with solver begin/end clocks, independent
 recording/measurement/clock support and named hand-subtree × object-part
 addresses. These discrete solved samples do not certify continuous force.
 
+Direct MjWarp also exposes `physics_execution_clock()`: int64 counts of accepted
+backend advances and the configured/device timestep witness. The constructor
+checks the installed fixed timestep against its actual device cast. Only an
+actual advance increments the count; forward and authored state installation do
+not. Selected reset clears only selected counts, and same-plant snapshot/restore
+retains them. Newton and Isaac leave this clock unavailable.
+
+The recorder preserves `native_execution_steps` and matching per-substep count
+boundaries beside unchanged `native_physics_time_s` and raw contact clocks.
+Consumers may form a configured schedule by rounding count differences times
+the configured timestep once to nanoseconds, including steps such as 1/240s.
+This schedule is distinct from the accumulated floating solver counter and from
+an exact sum of binary device dt. Missing advances remain unsupported; recorder
+row numbers alone cannot supply execution evidence.
+
 The readouts borrow stopped views of fixed storage until the next control,
 state change or reset. Capacity comes from `decimation`. Reset or authored
 state installation discards affected rows; physical restore preserves its
