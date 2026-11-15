@@ -194,8 +194,8 @@ for property frames, assistance selection and qualification limits.
 Configuration, software checks and an import alone do not qualify either port's
 physical tracking or task success. Each actual scene/backend needs the declared
 two-world native step, reset, contact, snapshot and SAC/replay continuation gates.
-The author Isaac freeze remains Python 3.11. This native campaign selects an
-existing Python 3.12 environment; the fork's package metadata allows both.
+The author Isaac freeze remains Python 3.11. Native profiles use a separate
+Python 3.12 environment; the fork's package metadata allows both.
 Install this repository with `--no-deps` in the selected environment so its
 author-stack dependency list does not resolve or replace the native runtime.
 `requirements/native_cu128.txt` is a separate candidate constraint set. Actual
@@ -240,6 +240,35 @@ checkout and installs its public core/tracking packages with `--no-deps`:
 bash scripts/setup.sh --profile mjwarp
 bash scripts/setup.sh --profile newton --dexforge-root /path/to/DexForge
 ```
+
+The native profile pins WandB `0.28.0` for Python 3.12. The author Python 3.11
+freeze retains WandB `0.15.12`; installing that older pin in native pulls
+`pathtools`, whose build imports the removed Python `imp` module. Resolve the
+native requirements normally, including WandB's dependencies; do not reuse the
+author freeze or skip WandB dependency resolution.
+
+For a manually managed native environment, create a fresh Python 3.12 venv.
+Keep the recorded FlashSAC source in `third_party/rsl_rl_flashsac`; a normal
+checkout initializes that submodule, while an admitted source publication may
+already include it:
+
+```sh
+python3.12 -m venv /path/to/new-native-env
+source /path/to/new-native-env/bin/activate
+unset PYTHONPATH
+python -m pip install 'setuptools<81' wheel
+python -m pip install --prefer-binary -r requirements/native_cu128.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu128
+python -m pip install --no-deps -e third_party/rsl_rl_flashsac
+python -m pip install --no-deps -e .
+```
+
+Call the ordinary Python entry with the selected native Hydra configuration;
+shell wrappers require setup-generated activation files. Newton additionally
+needs the selected DexForge public core/tracking packages, installed as described
+by `--dexforge-root` above. Keep temporary and pip/compiler caches node-local,
+record actual resolved versions, and qualify logging, engines and continuation
+separately. This fresh environment does not replace an active runtime.
 
 `--env NAME` selects a different conda environment; setup checks its Python minor
 version before installation and regenerates that profile's activation file.
