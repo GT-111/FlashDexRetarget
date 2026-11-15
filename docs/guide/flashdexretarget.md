@@ -123,6 +123,11 @@ admission of an external USD does not perform this normalization.
 
 Converted and externally supplied native USDs pass the same read-only named-body/joint, FREE-root, limit, mimic instance/reference-axis and follower-drive admission before the first physics parse. An absent own DriveAPI adds no position-drive authority; present passive drives must have zero stiffness, and present mimic drives must have zero stiffness and damping. The pinned normal BOX import itself authors its source zero-stiffness drive. USD admission and software forwarding tests are separate from actual installed property/constraint response, which needs a pinned-Isaac F1/BOX qualification; stock XHand SAC results do not qualify these native assets. Isaac net-link force and SDF proximity remain distinct from native solved hand-part pair forces.
 
+Native joint defaults enter IsaacLab configuration as Python scalar values.
+Runtime damping, armature and friction tensors use the dtype of their actual
+SDK destination buffers. Shared compiled metadata retains its original numeric
+precision; this boundary does not change Torch's global default dtype.
+
 Stock USD collision overrides are installed after the scene owner makes nested
 references editable, before material binding and the first physics reset.
 Robot and parked-object edits precede environment cloning; per-world objects,

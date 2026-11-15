@@ -379,8 +379,15 @@ def test_native_isaac_scene_keeps_mimic_viscous_and_passive_hinge_authority(monk
 
     layout, _ = _scene(tmp_path)
     tree = ET.parse(layout.scene_xml_path)
-    tree.getroot().find(".//joint[@name='left_joint']").set("damping", ".2")
-    tree.getroot().find(".//joint[@name='left_mimic']").set("damping", ".1")
+    tree.getroot().find(".//joint[@name='left_joint']").attrib.update(
+        damping=".2", armature=".02", frictionloss=".03", ref=".2",
+    )
+    tree.getroot().find(".//joint[@name='left_mimic']").attrib.update(
+        damping=".1", armature=".04", frictionloss=".05", ref=".1",
+    )
+    tree.getroot().find(".//joint[@name='hinge']").attrib.update(
+        armature=".06", frictionloss=".07",
+    )
     tree.getroot().find("actuator/position[@name='command_A']").set("kv", ".3")
     tree.write(layout.scene_xml_path)
     meta = load_robot_mjcf_meta(layout.scene_xml_path)
@@ -404,35 +411,88 @@ def test_native_isaac_scene_keeps_mimic_viscous_and_passive_hinge_authority(monk
     monkeypatch.setattr(scene.sim_utils, "UsdFileCfg", lambda **kwargs: SimpleNamespace(**kwargs), raising=False)
     monkeypatch.setattr(scene.sim_utils, "ArticulationRootPropertiesCfg",
                         lambda **kwargs: SimpleNamespace(**kwargs), raising=False)
+    original_default_dtype = torch.get_default_dtype()
     left = meta.subtree("left_root")
+    joint_default = left.joint_default.copy()
+    assert joint_default.dtype == np.float64
     selected = scene._native_articulation_cfg(layout.hands[0], left, cfg)
     assert events == ["admit", "actuator"]
+    initial = selected.init_state.joint_pos
+    assert list(initial) == left.joint_names
+    assert all(type(value) is float for value in initial.values())
+    # Lab infers this source tensor's dtype before an indexed Float-buffer write.
+    defaults = torch.zeros(2, left.num_joints, dtype=torch.float32)
+    defaults[:, list(range(left.num_joints))] = torch.tensor(list(initial.values()))
+    torch.testing.assert_close(
+        defaults, torch.tensor(joint_default, dtype=torch.float32).expand_as(defaults),
+    )
     drive = selected.actuators["native_position"]
     assert drive.joint_names_expr == ["left_joint"]
     assert drive.stiffness == {"left_joint": 20.0}
     assert drive.damping == {"left_joint": .5}
     calls = []
     authored_viscous = {"left_mimic": native_mimic_imports(left)[0].viscous_friction_per_degree}
-    asset = SimpleNamespace(
-        write_joint_stiffness_to_sim=lambda value, **kw: calls.append(("stiffness", value, kw)),
-        write_joint_damping_to_sim=lambda value, **kw: calls.append(("damping", value.clone(), kw)),
-        write_joint_armature_to_sim=lambda value, **kw: calls.append(("armature", value.clone(), kw)),
-        write_joint_friction_coefficient_to_sim=lambda value, **kw: calls.append(("friction", value.clone(), kw)),
-        authored_viscous=authored_viscous.copy(),
-    )
-    scene._install_native_joint_properties(asset, left, [1, 0], "cpu")
-    assert calls[0] == ("stiffness", 0.0, {"joint_ids": [0]})
-    assert calls[1][2] == {"joint_ids": [1, 0]}
+
+    def property_asset(joint_count):
+        data = SimpleNamespace(**{
+            name: torch.full((2, joint_count), -7.0, dtype=torch.float32)
+            for name in ("joint_stiffness", "joint_damping", "joint_armature", "joint_friction_coeff")
+        })
+
+        def write(name, kind, value, **kwargs):
+            # Execute the actual-shaped indexed write; clone-only mocks hide Double sources.
+            getattr(data, name)[:, kwargs["joint_ids"]] = value
+            saved = value.clone() if isinstance(value, torch.Tensor) else value
+            calls.append((kind, saved, kwargs))
+
+        return SimpleNamespace(
+            data=data,
+            write_joint_stiffness_to_sim=lambda value, **kw: write("joint_stiffness", "stiffness", value, **kw),
+            write_joint_damping_to_sim=lambda value, **kw: write("joint_damping", "damping", value, **kw),
+            write_joint_armature_to_sim=lambda value, **kw: write("joint_armature", "armature", value, **kw),
+            write_joint_friction_coefficient_to_sim=lambda value, **kw: write("joint_friction_coeff", "friction", value, **kw),
+            authored_viscous=authored_viscous.copy(),
+        )
+
+    asset = property_asset(left.num_joints)
+    left_ids = list(reversed(range(left.num_joints)))
+    scene._install_native_joint_properties(asset, left, left_ids, "cpu")
+    follower = left.joint_names.index(left.mimics[0].joint_name)
+    assert calls[0] == ("stiffness", 0.0, {"joint_ids": [left_ids[follower]]})
+    assert calls[1][2] == {"joint_ids": left_ids}
     np.testing.assert_array_equal(calls[1][1], [.5, 0])
+    for field, expected in (
+        ("joint_armature", left.joint_armature),
+        ("joint_friction_coeff", left.joint_frictionloss),
+    ):
+        actual = getattr(asset.data, field)[:, left_ids]
+        torch.testing.assert_close(
+            actual, torch.tensor(expected, dtype=torch.float32).expand_as(actual),
+        )
     assert asset.authored_viscous == authored_viscous
+    np.testing.assert_array_equal(left.joint_default, joint_default)
+    assert left.joint_damping.dtype == left.joint_armature.dtype == left.joint_frictionloss.dtype == np.float64
     obj = meta.subtree("base")
     selected = scene._native_articulation_cfg(layout.object, obj, cfg)
     assert selected.actuators == {}
+    assert all(type(value) is float for value in selected.init_state.joint_pos.values())
     calls.clear()
-    scene._install_native_joint_properties(asset, obj, [3], "cpu")
+    asset = property_asset(obj.num_joints)
+    object_ids = list(range(obj.num_joints))
+    scene._install_native_joint_properties(asset, obj, object_ids, "cpu")
     assert [kind for kind, _, _ in calls] == ["damping", "armature", "friction"]
-    np.testing.assert_array_equal(calls[0][1], [.01])
-    assert all(kwargs == {"joint_ids": [3]} for _, _, kwargs in calls)
+    torch.testing.assert_close(calls[0][1], torch.tensor(obj.joint_damping, dtype=torch.float32))
+    assert all(kwargs == {"joint_ids": object_ids} for _, _, kwargs in calls)
+    for field, expected in (
+        ("joint_damping", obj.joint_damping),
+        ("joint_armature", obj.joint_armature),
+        ("joint_friction_coeff", obj.joint_frictionloss),
+    ):
+        actual = getattr(asset.data, field)
+        torch.testing.assert_close(
+            actual, torch.tensor(expected, dtype=torch.float32).expand_as(actual),
+        )
+    assert torch.get_default_dtype() == original_default_dtype
 
 
 def test_actual_native_action_derives_dimensions_and_records_accepted_supported_targets(

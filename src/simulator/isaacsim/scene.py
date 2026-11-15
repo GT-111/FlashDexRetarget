@@ -771,7 +771,10 @@ def _native_articulation_cfg(binding, meta, cfg) -> ArticulationCfg:
         init_state=ArticulationCfg.InitialStateCfg(
             pos=tuple(meta.free_roots[0].default_pose[:3]),
             rot=tuple(meta.free_roots[0].default_pose[3:]),
-            joint_pos=dict(zip(meta.joint_names, meta.joint_default, strict=True)),
+            joint_pos={
+                name: float(value)
+                for name, value in zip(meta.joint_names, meta.joint_default, strict=True)
+            },
         ),
         actuators=actuators,
     )
@@ -805,12 +808,21 @@ def _install_native_joint_properties(asset, meta, joint_ids, device) -> None:
         )
     for joint in meta.driven_joint_names:
         damping[meta.joint_names.index(joint)] += meta.kp_kv_for_joint(joint)[1]
-    asset.write_joint_damping_to_sim(torch.as_tensor(damping, device=device), **scalar)
+    asset.write_joint_damping_to_sim(
+        torch.as_tensor(damping, dtype=asset.data.joint_damping.dtype, device=device),
+        **scalar,
+    )
     asset.write_joint_armature_to_sim(
-        torch.as_tensor(meta.joint_armature, device=device), **scalar,
+        torch.as_tensor(
+            meta.joint_armature, dtype=asset.data.joint_armature.dtype, device=device,
+        ),
+        **scalar,
     )
     asset.write_joint_friction_coefficient_to_sim(
-        torch.as_tensor(meta.joint_frictionloss, device=device), **scalar,
+        torch.as_tensor(
+            meta.joint_frictionloss, dtype=asset.data.joint_friction_coeff.dtype, device=device,
+        ),
+        **scalar,
     )
 
 
