@@ -419,6 +419,102 @@ def _runner(agent, action_space, curriculum, path):
     return runner
 
 
+@pytest.mark.parametrize("resume_mode", ["agent_only", "full"])
+def test_runner_load_restarts_episode_returns_once_without_erasing_learned_state(
+    tmp_path, monkeypatch, resume_mode,
+):
+    import runner.off_policy_runner as runner_module
+
+    monkeypatch.setattr(runner_module.wandb, "run", None)
+    original = _agent()
+    _feed_agent(original)
+    original.update()
+    original.update()
+    saved_algorithm = original._alg.save()
+    assert bool(saved_algorithm["reward_normalizer_state_dict"]["G_r"].any())
+    original_curriculum, original_env = _curriculum()
+    for step in range(1, 7):
+        _curriculum_step(original_curriculum, original_env, step)
+    checkpoint = tmp_path / "parent"
+    original.save(str(checkpoint))
+    original.save_buffer(str(checkpoint))
+    parent_space = gym.spaces.Box(-1, 1, shape=(2, 4), dtype=np.float32)
+    parent_space.seed(21)
+    parent = _runner(original, parent_space, original_curriculum, tmp_path / "first")
+    parent._save_learning_state(checkpoint, 100)
+    saved_learning = torch.load(checkpoint / LEARNING_STATE_FILE, weights_only=False)
+
+    fresh = _agent()
+    fresh_curriculum, fresh_env = _curriculum()
+    new_curriculum_state = fresh_curriculum.state_dict()
+    command = SimpleNamespace(_xfrc_curr_ctrl=fresh_curriculum)
+    physical = SimpleNamespace(common_step_counter=fresh_env.common_step_counter,
+        command_manager=SimpleNamespace(get_term=lambda _name: command))
+    flat = SimpleNamespace(unwrapped=physical,
+        reset=lambda: (np.zeros((2, 6), dtype=np.float32), {}), current_aux=lambda: None,
+        action_space=gym.spaces.Box(-1, 1, shape=(2, 4), dtype=np.float32),
+        step=lambda _actions: (np.ones((2, 6), dtype=np.float32),
+            np.full((2, 2), .25, dtype=np.float32), np.zeros(2, dtype=bool),
+            np.zeros(2, dtype=bool), {}))
+    monkeypatch.setattr(runner_module.FlatObsVecEnv, "from_env", lambda *_args, **_kwargs: flat)
+    monkeypatch.setattr(runner_module, "build_agent", lambda *_args, **_kwargs: fresh)
+    events = []
+    real_load, real_load_buffer = fresh.load, fresh.load_buffer
+    real_reset = fresh.reset_collection
+
+    def load(path):
+        real_load(path)
+        assert bool(fresh._alg.reward_normalizer.state_dict()["G_r"].any())
+        events.append("agent")
+
+    def load_buffer(path):
+        real_load_buffer(path)
+        events.append("replay")
+
+    def reset_collection():
+        real_reset()
+        events.append("collection")
+
+    monkeypatch.setattr(fresh, "load", load)
+    monkeypatch.setattr(fresh, "load_buffer", load_buffer)
+    monkeypatch.setattr(fresh, "reset_collection", reset_collection)
+    config = _lifecycle_config([f"run_dir={tmp_path / 'child'}"])
+    config.runner.agent = OmegaConf.create({"class_name": "agents.flashsac.FlashSACAgent",
+        **asdict(fresh._cfg)})
+    config.runner.agent_load_path = str(checkpoint)
+    config.runner.buffer_load_path = str(checkpoint) if resume_mode == "full" else None
+    config.runner.step_offset = 100 if resume_mode == "full" else 0
+    torch.manual_seed(312)
+    new_torch_rng = torch.get_rng_state().clone()
+    runner = OffPolicyRunner(SimpleNamespace(unwrapped=physical), config.runner, config.eval,
+        eval_env=SimpleNamespace())
+
+    assert events == (["agent", "replay", "collection"] if resume_mode == "full"
+                      else ["agent", "collection"])
+    loaded = fresh._alg.save()
+    for key in saved_algorithm.keys() - {"reward_normalizer_state_dict"}:
+        _tree_equal(loaded[key], saved_algorithm[key])
+    for key in saved_algorithm["reward_normalizer_state_dict"].keys() - {"G_r"}:
+        _tree_equal(loaded["reward_normalizer_state_dict"][key],
+            saved_algorithm["reward_normalizer_state_dict"][key])
+    assert not bool(loaded["reward_normalizer_state_dict"]["G_r"].any())
+    assert fresh._alg._last_obs is fresh._alg._last_actions is fresh._alg._cached_noise is None
+    assert fresh._alg._noise_repeat_n == 1 and fresh._alg._noise_repeat_count == 0
+    assert not fresh._alg.replay_buffer._n_step_transitions
+    if resume_mode == "full":
+        assert fresh_curriculum.state_dict() == saved_learning["curriculum"]
+        torch.testing.assert_close(torch.get_rng_state(), saved_learning["rng"]["torch_cpu"], rtol=0, atol=0)
+        assert fresh._alg.replay_buffer._num_in_buffer == original._alg.replay_buffer._num_in_buffer
+    else:
+        assert fresh_curriculum.state_dict() == new_curriculum_state
+        torch.testing.assert_close(torch.get_rng_state(), new_torch_rng, rtol=0, atol=0)
+        assert fresh._alg.replay_buffer._num_in_buffer == 0
+    # The actual first fresh collection must not include the parent's discounted return.
+    runner._collect(1, runner_module.AverageMeter())
+    torch.testing.assert_close(fresh._alg.reward_normalizer.state_dict()["G_r"],
+        torch.full((2, 2), .25), rtol=0, atol=0)
+
+
 def test_real_sac_learning_and_full_owner_restore_keep_schedules_rng_and_fresh_episode(tmp_path):
     original = _agent()
     _feed_agent(original)

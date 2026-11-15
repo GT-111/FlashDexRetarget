@@ -392,6 +392,15 @@ the independent Gym action sampler, and the adaptive curriculum's gains, histori
 The visible CUDA layout must match. Eval and checkpoint points stay on the absolute env-step grid;
 the original LR horizon and optimizer age continue.
 
+For a warm start with fresh replay and episodes, set `agent_load_path=<ckpt>` and
+`buffer_load_path=null`; select `runner.agent.load_optimizer=true` to retain optimizer
+age and schedules. Learned networks and running reward statistics stay loaded, while
+the existing collection reset clears per-world episode returns, pending transitions
+and correlated exploration state. Replay, RNG and curriculum start fresh. Report the
+parent optimizer/update age separately from the new run's `step_offset`. Full learning
+restore keeps its existing replay/learning-state owner and resets collection once
+after those owners load.
+
 Physical worlds and episodes start fresh. Per-world return carry, correlated exploration noise and
 pending n-step transitions are cleared, while learned and running statistics are retained. The replay
 stores explicit factual successors for the old fragment's edge, so new episodes cannot become its

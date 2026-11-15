@@ -91,6 +91,9 @@ class OffPolicyRunner:
         # ── resume ───────────────────────────────────────────────────────────────────
         if runner_cfg.agent_load_path is not None:
             self._agent.load(str((_BASE_DIR / runner_cfg.agent_load_path).resolve()))
+            if runner_cfg.buffer_load_path is None:
+                # Warm initialization starts new episodes, not the saved return/noise carry.
+                self._agent.reset_collection()
         if runner_cfg.buffer_load_path is not None:
             self._agent.load_buffer(str((_BASE_DIR / runner_cfg.buffer_load_path).resolve()))
         # Ever-success vectors ride in resume_state.json, so a resume keeps the cumulative curve.
