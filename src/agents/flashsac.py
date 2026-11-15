@@ -14,6 +14,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from rsl_rl_flashsac.utils import resolve_compile_mode
 from tensordict import TensorDict
 
 from .algorithms.flashsac import MultiHeadFlashSAC
@@ -273,7 +274,7 @@ class FlashSACPolicy:
         self._action_scale = action_scale.to(self._device)
         self._use_compile = cfg.use_compile
         self._actor_mean_std = (
-            torch.compile(self.actor.get_mean_and_std, mode=cfg.compile_mode)
+            torch.compile(self.actor.get_mean_and_std, mode=resolve_compile_mode(cfg.compile_mode))
             if cfg.use_compile else self.actor.get_mean_and_std
         )
         self.checkpoint_authority = checkpoint_authority

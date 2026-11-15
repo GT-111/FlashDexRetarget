@@ -507,7 +507,9 @@ The registered `runner.agent.class_name` supplies a policy-only loader.
 FlashSAC uses the same actor builder as normal learning and strictly restores
 its complete `actor_state_dict`, including running BatchNorm and trajectory
 encoder buffers. It applies the same observation-layout checks and action
-affine coordinates. Policy loading constructs no critic, optimizer, reward
+affine coordinates. Configured compilation uses FlashSAC's ordinary mode
+resolver, including the supported Torch mode selected by `compile_mode=auto`.
+Policy loading constructs no critic, optimizer, reward
 normalizer or replay and restores no saved curriculum or RNG state. The ordinary
 environment factory still creates its configured managers and uses the existing
 evaluation transitions. The common `flashsac.pt` tensor container is CPU-mapped;

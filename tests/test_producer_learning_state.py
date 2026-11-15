@@ -764,6 +764,41 @@ def test_policy_only_load_matches_normal_actor_and_statistics_without_training_o
         policy.act(observations, deterministic=False)
 
 
+def test_policy_only_load_auto_compile_matches_eager_actor(tmp_path, monkeypatch):
+    from rsl_rl_flashsac.utils import resolve_compile_mode
+
+    from agents import load_policy
+
+    agent, env, info, cfg = _frozen_policy_fixture(encoded_window=True)
+    width = env.single_observation_space.shape[-1]
+    observations = torch.linspace(-.7, .8, 5 * width).reshape(5, width)
+    agent._alg.actor.get_mean_and_std(
+        agent._alg.actor.flatten_obs(agent._layout.actor_input(observations)), training=True,
+    )
+    expected = agent.act(observations, deterministic=True)
+    agent.save(str(tmp_path))
+    cfg.use_compile, cfg.compile_mode = True, "auto"
+    original_compile, compiled_modes = torch.compile, []
+
+    def compile_actor(function, *, mode):
+        compiled_modes.append(mode)
+        return original_compile(function, mode=mode)
+
+    # Record the actual supported mode while retaining real Inductor compilation
+    # and execution. An identity/eager compiler replacement would miss this failure.
+    monkeypatch.setattr(torch, "compile", compile_actor)
+    policy = load_policy(cfg, env, info, "motion", str(tmp_path))
+    assert cfg.use_compile and cfg.compile_mode == "auto"
+    assert compiled_modes == [resolve_compile_mode("auto")]
+    assert compiled_modes[0] != "auto"
+    before = {name: value.clone() for name, value in policy.actor.state_dict().items()}
+    for _ in range(2):
+        actual = policy.act(observations, deterministic=True)
+        torch.testing.assert_close(torch.from_numpy(actual), torch.from_numpy(expected))
+    for name, value in policy.actor.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
 def test_policy_only_load_rejects_equal_width_layout_change_before_model_read(tmp_path, monkeypatch):
     from agents import load_policy
 
