@@ -14,6 +14,8 @@ import mujoco
 import numpy as np
 import pytest
 import torch
+from test_native_contract import _scene, _two_object_scene
+
 from envs import create_envs
 from simulator.mjcf_meta import load_robot_mjcf_meta
 from simulator.native.mjwarp import MjWarpPlant
@@ -27,7 +29,6 @@ from simulator.native.plant import (
 )
 from simulator.native.scene import NativeScene, NativeSim
 from simulator.runtime import launch_runtime
-from test_native_contract import _scene
 
 
 def _mechanics(tmp_path):
@@ -551,7 +552,11 @@ def _initial_control_case(tmp_path):
     from mjlab.managers.action_manager import ActionManager
     from mjlab.managers.command_manager import CommandManager
     from mjlab.managers.event_manager import EventManager, EventTermCfg
-    from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationManager, ObservationTermCfg
+    from mjlab.managers.observation_manager import (
+        ObservationGroupCfg,
+        ObservationManager,
+        ObservationTermCfg,
+    )
     from mjlab.managers.reward_manager import RewardManager, RewardTermCfg
 
     from envs.actions.native import NativeResidualActionCfg
@@ -612,7 +617,7 @@ def _initial_control_case(tmp_path):
     command.command_counter = torch.zeros(2, dtype=torch.long)
     command.metrics = {}
     roots = {hand.side: scene[hand.entity_name]._default_root_state[:1].repeat(3, 1) for hand in layout.hands}
-    parts = torch.zeros(3, len(layout.object.parts), 13)
+    parts = torch.zeros(3, len(layout.objects[0].parts), 13)
     parts[..., 3] = 1
     command.motion_lib = SimpleNamespace(
         num_trajectories=1, length_starts=torch.tensor([0]), _motion_num_frames=torch.tensor([3]),
@@ -624,21 +629,21 @@ def _initial_control_case(tmp_path):
         native_root_state_w=roots, native_root_pose_support={side: torch.ones(3, dtype=torch.bool) for side in roots},
         native_root_linear_velocity_support={side: torch.ones(3, dtype=torch.bool) for side in roots},
         native_root_angular_velocity_support={side: torch.ones(3, dtype=torch.bool) for side in roots},
-        native_object_entity_name=layout.object.entity_name,
-        native_object_part_body_names=tuple(part.body_name for part in layout.object.parts),
-        native_object_joint_names=tuple(scene[layout.object.entity_name].joint_names),
-        native_object_joint_pos=torch.zeros(3, scene[layout.object.entity_name].num_joints),
-        native_object_joint_vel=torch.zeros(3, scene[layout.object.entity_name].num_joints),
-        native_object_joint_position_support=torch.ones(3, scene[layout.object.entity_name].num_joints, dtype=torch.bool),
-        native_object_joint_velocity_support=torch.ones(3, scene[layout.object.entity_name].num_joints, dtype=torch.bool),
-        native_object_part_state_w=parts, native_object_part_pose_support=torch.ones(3, len(layout.object.parts), dtype=torch.bool),
-        native_object_part_linear_velocity_support=torch.ones(3, len(layout.object.parts), dtype=torch.bool),
-        native_object_part_angular_velocity_support=torch.ones(3, len(layout.object.parts), dtype=torch.bool),
+        native_object_root_body_names=layout.object_root_body_names,
+        native_object_part_body_names=tuple(part.body_name for part in layout.objects[0].parts),
+        native_object_joint_names=tuple(scene[layout.objects[0].entity_name].joint_names),
+        native_object_joint_pos=torch.zeros(3, scene[layout.objects[0].entity_name].num_joints),
+        native_object_joint_vel=torch.zeros(3, scene[layout.objects[0].entity_name].num_joints),
+        native_object_joint_position_support=torch.ones(3, scene[layout.objects[0].entity_name].num_joints, dtype=torch.bool),
+        native_object_joint_velocity_support=torch.ones(3, scene[layout.objects[0].entity_name].num_joints, dtype=torch.bool),
+        native_object_part_state_w=parts, native_object_part_pose_support=torch.ones(3, len(layout.objects[0].parts), dtype=torch.bool),
+        native_object_part_linear_velocity_support=torch.ones(3, len(layout.objects[0].parts), dtype=torch.bool),
+        native_object_part_angular_velocity_support=torch.ones(3, len(layout.objects[0].parts), dtype=torch.bool),
     )
     command.cfg = SimpleNamespace(sampling=SimpleNamespace(mode="start", start_frame=0),
         resampling_time_range=(1000., 1000.), hand=SimpleNamespace(zero_init_vel=False),
         object=SimpleNamespace(zero_init_vel=False, pin_objects=False,
-                               entity_names={side: layout.object.entity_name for side in roots}))
+                               entity_names={side: layout.objects[0].entity_name for side in roots}))
     command._bind_native_reference()
     command._init_metrics()
     command._init_object_assist()
@@ -802,3 +807,52 @@ def test_native_context_rng_keeps_real_gym_sampler_separate(tmp_path):
     # The manager restores only its globals; it never fabricates a sampler.
     env.restore_initial_control_context(initial)
     _assert_control_values_equal(capture_rng_state(None), initial.rng)
+
+
+def test_native_factory_keeps_multiple_objects_and_duplicate_local_part_labels(tmp_path, monkeypatch):
+    """Actual factory/scene with a CPU state protocol, no integration or SDK."""
+    from omegaconf import OmegaConf
+
+    from simulator.native import create as native_create
+
+    layout, mapping = _two_object_scene(tmp_path)
+    document = ET.parse(layout.scene_xml_path)
+    for hand in layout.hands:
+        for axis, gear in enumerate(np.eye(6, dtype=int)):
+            ET.SubElement(document.getroot().find("actuator"), "motor",
+                name=f"{hand.side}_wrench_{axis}", jointinparent=hand.root_joint_name,
+                gear=" ".join(map(str, gear)))
+    document.write(layout.scene_xml_path)
+
+    class FactoryPlant(_ProtocolPlant):
+        def __init__(self, *, scene_xml_path, num_envs, sim_dt, device, contact_pairs):
+            assert num_envs == 2 and sim_dt == .005 and device == "cpu"
+            super().__init__(mujoco.MjModel.from_xml_path(scene_xml_path))
+            self._init_buffers(self.model, num_envs, device, contact_pairs)
+
+        def body_state(self, body_ids):
+            shape = (self.num_envs, len(body_ids))
+            position = torch.zeros(*shape, 3)
+            rotation = torch.zeros(*shape, 4)
+            rotation[..., 0] = 1
+            return position, rotation, position.clone(), position.clone()
+
+    monkeypatch.setattr(native_create, "get_class", lambda name: FactoryPlant)
+    monkeypatch.setattr(native_create, "build_manager_cfgs", lambda cfg: {})
+    monkeypatch.setattr(native_create, "RslRlVecEnvWrapper", lambda env: env)
+    monkeypatch.setattr(native_create, "SharedEvalEnv", lambda env, cfg: None)
+    cfg = OmegaConf.create(dict(robot=dict(entity_name="robot", native_scene=mapping),
+        commands=dict(object=dict(pin_objects=False, support_disks=dict(enable=False))), curriculum={},
+        sim=dict(dt=.005, plant={"_target_": "explicit_cpu_protocol"}), scene=dict(num_envs=2),
+        decimation=4, episode_length_s=1., seed=1, eval={}))
+    env, _ = native_create.create_native_envs(cfg, "cpu")
+    scene, plant = env.scene, env.sim.plant
+    assert len(plant.contact_facts) == 6
+    assert {a["part_entity_name"] for a in scene.hand_part_contact_facts()["addresses"].values()} == {"object", "loose_prop"}
+    assert "left/object/base" in plant.contact_facts and "left/loose_prop/base" in plant.contact_facts
+    assert set(scene.object_parts) == {"object/base", "object/lid", "loose_prop/base"}
+    plant.contact_facts["left/object/base"]["normal_force_n"].zero_()
+    facts = scene.hand_part_contact_facts()
+    assert facts["pairs"]["left/object/base"]["normal_force_n"].eq(0).all()
+    assert facts["pairs"]["left/loose_prop/base"]["normal_force_n"].isnan().all()
+    assert scene["loose_prop"].joint_names == [] and plant.advance_calls == plant.set_calls == 0

@@ -871,9 +871,9 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         ):
             raise ValueError(f"wrong FREE root for {binding.entity_name!r}")
         metadata[binding.entity_name] = meta
-        if binding == layout.object and meta.actuator_names:
+        if binding in layout.objects and meta.actuator_names:
             raise ValueError("native object articulation must remain passive")
-        if binding == layout.object and not meta.joint_names:
+        if binding in layout.objects and not meta.joint_names:
             assets[binding.entity_name] = RigidObject(_native_rigid_object_cfg(binding, meta, cfg.sim.native_assets.articulations[binding.entity_name]))
             rigid.add(binding.entity_name)
         else:
@@ -952,10 +952,10 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         adapter.entities[b.entity_name] for b in layout.articulations
     ]
     # Exact named parts are available to the public recorder; they are bodies
-    # of ONE articulation, rather than aliases for two rigid object roots.
+    # of their actual configured articulations, never duplicated hand aliases.
     adapter.object_parts = {
-        p.name: {"entity_name": layout.object.entity_name, "body_name": p.body_name}
-        for p in layout.object.parts
+        f"{obj.entity_name}/{p.name}": {"entity_name": obj.entity_name, "body_name": p.body_name}
+        for obj, p in layout.part_bindings
     }
     for hand in layout.hands:
         names = list(cfg.robot.contact_links[hand.side])

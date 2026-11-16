@@ -28,7 +28,7 @@ class NativeCommandControlContext:
 
 
 class NativeMotionTrackingCommand(MotionTrackingCommand):
-    """Registered FREE-root references and ONE named articulated object.
+    """Registered FREE-root references and actual named object articulations.
 
     Source MANO geometry remains source geometry. Native wrist targets use the
     separately published target-body root carrier, not a renamed MANO wrist.
@@ -80,8 +80,18 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
 
     @property
     def object_distance_sign(self) -> str:
-        signs = {part.distance_sign for part in self.native_layout.object.parts}
+        signs = {part.distance_sign for _, part in self.native_layout.part_bindings}
         return next(iter(signs)) if len(signs) == 1 else "mixed"
+
+    @property
+    def has_objects(self):
+        return bool(self.native_layout.objects)
+
+    @property
+    def multi_object(self):
+        # The inherited property means alternate per-world asset slots, not
+        # simultaneous objects in the authored native scene.
+        return False
 
     def _bind_native_reference(self):
         """Admit the prepared clock and bind declared columns to the actual scene."""
@@ -89,24 +99,37 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         if not hasattr(ml, "native_time_ns"):
             raise ValueError("native task requires an explicitly prepared native_reference carrier")
         if tuple(ml.native_object_part_body_names) != tuple(
-            p.body_name for p in self.native_layout.object.parts
+            p.body_name for _, p in self.native_layout.part_bindings
         ):
             raise ValueError("native object reference and scene part bodies differ")
-        if ml.native_object_entity_name != self.native_layout.object.entity_name:
-            raise ValueError("native object reference names a different scene entity")
+        if ml.native_object_root_body_names != self.native_layout.object_root_body_names:
+            raise ValueError("native object reference names different scene entities or FREE bases")
         for hand in self.native_layout.hands:
             if ml.native_root_body_names[hand.side] != hand.root_body_name:
                 raise ValueError(
                     "native reference root body does not match the selected asset"
                 )
-        names = tuple(self.native_object.joint_names)
+        objects = self.native_objects
+        names = tuple(name for obj in objects.values() for name in obj.joint_names)
         if set(names) != set(ml.native_object_joint_names):
             raise ValueError("native object reference and actual scalar joint names differ")
         self._object_joint_columns = torch.tensor(
             [ml.native_object_joint_names.index(name) for name in names],
             device=self.device, dtype=torch.long,
         )
-        self.object_joint_coordinate_metadata = self.native_object.joint_coordinate_metadata()
+        coordinates = [obj.joint_coordinate_metadata() for obj in objects.values()]
+        self.object_joint_coordinate_metadata = {
+            key: tuple(value for entry in coordinates for value in entry[key])
+            for key in coordinates[0]
+        }
+        self.object_joint_coordinate_metadata["entity_names"] = tuple(
+            entity for entity, obj in objects.items() for _ in obj.joint_names
+        )
+        self._object_joint_slices = {}
+        start = 0
+        for entity, obj in objects.items():
+            self._object_joint_slices[entity] = slice(start, start + len(obj.joint_names))
+            start += len(obj.joint_names)
         self.robot_joint_coordinate_metadata = self.robot.joint_coordinate_metadata()
         command_columns = self.native_command_joint_ids.tolist()
         self.command_joint_coordinate_metadata = {
@@ -126,8 +149,18 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         self.object_joint_columns_by_unit = unit_columns(self.object_joint_coordinate_metadata)
         self.robot_joint_columns_by_unit = unit_columns(self.robot_joint_coordinate_metadata)
         self.command_joint_columns_by_unit = unit_columns(self.command_joint_coordinate_metadata)
-        self._part_body_ids = [self.native_object.body_names.index(p.body_name)
-                               for p in self.native_layout.object.parts]
+        self._part_entities = tuple(objects[obj.entity_name] for obj, _ in self.native_layout.part_bindings)
+        self._part_body_ids = [objects[obj.entity_name].body_names.index(p.body_name)
+                               for obj, p in self.native_layout.part_bindings]
+        self._object_part_columns = {
+            obj.entity_name: [i for i, (owner, _) in enumerate(self.native_layout.part_bindings)
+                              if owner.entity_name == obj.entity_name]
+            for obj in self.native_layout.objects
+        }
+        self._object_root_columns = torch.tensor(
+            [ml.native_object_part_body_names.index(obj.root_body_name) for obj in self.native_layout.objects],
+            device=self.device, dtype=torch.long,
+        )
         period_ns = float(self._env.step_dt) * 1e9
         for start, count in zip(ml.length_starts.tolist(), ml._motion_num_frames.tolist(), strict=True):
             times = ml.native_time_ns[start:start + count]
@@ -196,15 +229,13 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
 
     @property
     def native_object_joint_pos(self):
-        if not self.native_object.joint_names:
-            return self.robot.data.joint_pos.new_empty(self.num_envs, 0)
-        return self.native_object.data.joint_pos
+        values = [obj.data.joint_pos for obj in self.native_objects.values() if obj.joint_names]
+        return torch.cat(values, -1) if values else self.robot.data.joint_pos.new_empty(self.num_envs, 0)
 
     @property
     def native_object_joint_vel(self):
-        if not self.native_object.joint_names:
-            return self.robot.data.joint_vel.new_empty(self.num_envs, 0)
-        return self.native_object.data.joint_vel
+        values = [obj.data.joint_vel for obj in self.native_objects.values() if obj.joint_names]
+        return torch.cat(values, -1) if values else self.robot.data.joint_vel.new_empty(self.num_envs, 0)
 
     def _reference_free_root_states(self):
         return {
@@ -250,16 +281,15 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         return state
 
     @property
-    def native_object(self):
-        return self._env.scene[self.native_layout.object.entity_name]
+    def native_objects(self):
+        return {obj.entity_name: self._env.scene[obj.entity_name] for obj in self.native_layout.objects}
 
     @property
     def sim_object_part_state_w(self):
-        ids = self._part_body_ids
-        data = self.native_object.data
         return torch.cat(
             [
-                getattr(data, f)[:, ids]
+                torch.stack([getattr(obj.data, f)[:, body]
+                             for obj, body in zip(self._part_entities, self._part_body_ids, strict=True)], 1)
                 for f in (
                     "body_link_pos_w",
                     "body_link_quat_w",
@@ -411,9 +441,10 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                 schema="native_source_tip_geometry_v1", hand_sides=tuple(self._side_list),
                 hand_offsets=tuple(offsets), point_hand_sides=tuple(point_sides),
                 source_point_names=tuple(source_names), target_site_names=tuple(target_names),
-                part_names=tuple(p.name for p in self.native_layout.object.parts),
-                part_body_names=tuple(p.body_name for p in self.native_layout.object.parts),
-                part_distance_sign=tuple(p.distance_sign for p in self.native_layout.object.parts),
+                part_names=tuple(f"{obj.entity_name}/{p.name}" for obj, p in self.native_layout.part_bindings),
+                part_entity_names=tuple(obj.entity_name for obj, _ in self.native_layout.part_bindings),
+                part_body_names=tuple(p.body_name for _, p in self.native_layout.part_bindings),
+                part_distance_sign=tuple(p.distance_sign for _, p in self.native_layout.part_bindings),
                 position_frame="WORLD_including_env_origin", position_unit="m", distance_unit="m",
                 query_authority="finite_supported_inputs_inside_baked_grid_not_contact_or_surface_coverage",
                 reference_authority="installed_packet_or_reset_pre_advance_reference_phase",
@@ -437,11 +468,23 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         return self.object_part_reference(self._motion_flat_ids)
 
     def _object_base_reference(self, ids):
-        index = self.motion_lib.native_object_part_body_names.index(
-            self.native_layout.object.root_body_name
-        )
-        state = self.object_part_reference(ids)[..., index, :]
-        return state.unsqueeze(-2).expand(*state.shape[:-1], len(self._side_list), 13)
+        return self.object_part_reference(ids)[..., self._object_root_columns, :]
+
+    @property
+    def sim_obj_trans_w(self):
+        return self.sim_object_part_state_w[:, self._object_root_columns, :3]
+
+    @property
+    def sim_obj_quat_w(self):
+        return self.sim_object_part_state_w[:, self._object_root_columns, 3:7]
+
+    @property
+    def sim_obj_lin_vel_w(self):
+        return self.sim_object_part_state_w[:, self._object_root_columns, 7:10]
+
+    @property
+    def sim_obj_ang_vel_w(self):
+        return self.sim_object_part_state_w[:, self._object_root_columns, 10:13]
 
     @property
     def ref_obj_trans_w(self):
@@ -488,7 +531,9 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         ]
 
     def _obj_mass_body_idx(self, obj):
-        return obj.body_names.index(self.native_layout.object.root_body_name)
+        binding = next(binding for binding in self.native_layout.objects
+                       if self._env.scene[binding.entity_name] is obj)
+        return obj.body_names.index(binding.root_body_name)
 
     def _init_metrics(self):
         # Native reference-tracking metrics do not inherit raw-MANO wrist or
@@ -601,42 +646,35 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             if self.cfg.hand.zero_init_vel:
                 state[:, 7:] = 0.0
             self.robot.hands[hand.side].write_root_state_to_sim(state, env_ids)
-        obj = self.native_object
         object_ref = self.object_joint_reference(ids)
         if not bool(object_ref["position_support"].all()):
-            raise ValueError("native reset requires the passive articulation pose")
-        base = ml.native_object_part_body_names.index(
-            self.native_layout.object.root_body_name
-        )
-        if not bool(ml.native_object_part_pose_support[ids, base].all()):
-            raise ValueError("native reset requires the object FREE-base pose")
-        state = ml.native_object_part_state_w[ids, base].clone()
-        state[:, :3] += self._env.scene.env_origins[env_ids]
-        state[:, 7:10] = torch.where(
-            ml.native_object_part_linear_velocity_support[ids, base, None],
-            state[:, 7:10],
-            0.0,
-        )
-        state[:, 10:13] = torch.where(
-            ml.native_object_part_angular_velocity_support[ids, base, None],
-            state[:, 10:13],
-            0.0,
-        )
-        ov = torch.where(
-            object_ref["velocity_support"],
-            object_ref["velocity"],
-            0.0,
-        )
-        if self.cfg.object.zero_init_vel:
-            state[:, 7:], ov = 0.0, torch.zeros_like(ov)
-        obj.write_root_state_to_sim(state, env_ids)
-        if obj.joint_names:
-            obj.write_joint_state_to_sim(object_ref["position"], ov, env_ids=env_ids)
+            raise ValueError("native reset requires every passive articulation pose")
+        for binding in self.native_layout.objects:
+            obj = self.native_objects[binding.entity_name]
+            base = ml.native_object_part_body_names.index(binding.root_body_name)
+            if not bool(ml.native_object_part_pose_support[ids, base].all()):
+                raise ValueError(f"native reset requires object {binding.entity_name!r} FREE-base pose")
+            state = ml.native_object_part_state_w[ids, base].clone()
+            state[:, :3] += self._env.scene.env_origins[env_ids]
+            state[:, 7:10] = torch.where(
+                ml.native_object_part_linear_velocity_support[ids, base, None], state[:, 7:10], 0.0,
+            )
+            state[:, 10:13] = torch.where(
+                ml.native_object_part_angular_velocity_support[ids, base, None], state[:, 10:13], 0.0,
+            )
+            columns = self._object_joint_slices[binding.entity_name]
+            ov = torch.where(object_ref["velocity_support"][:, columns],
+                             object_ref["velocity"][:, columns], 0.0)
+            if self.cfg.object.zero_init_vel:
+                state[:, 7:], ov = 0.0, torch.zeros_like(ov)
+            obj.write_root_state_to_sim(state, env_ids)
+            if obj.joint_names:
+                obj.write_joint_state_to_sim(object_ref["position"][:, columns], ov, env_ids=env_ids)
         self.clear_object_wrenches(env_ids)
         self._obj_state_version = getattr(self, "_obj_state_version", 0) + 1
 
     def _init_native_object_assist(self):
-        shape = (self.num_envs, len(self.native_layout.object.parts), 3)
+        shape = (self.num_envs, len(self.native_layout.part_bindings), 3)
         self._assist_force_w = torch.zeros(shape, device=self.device)
         self._assist_torque_w = torch.zeros_like(self._assist_force_w)
         self._assist_last_force_w = torch.zeros_like(self._assist_force_w)
@@ -651,11 +689,11 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
     def _apply_object_assist(self):
         from .objects.assist import object_pose_pd_wrench
 
-        obj = self.native_object
         if not self.cfg.object.pin_objects:
             self._assist_force_w.zero_()
             self._assist_torque_w.zero_()
-            obj.clear_external_wrenches()
+            for obj in self.native_objects.values():
+                obj.clear_external_wrenches()
             return
         if self.cfg.object.pin_mode != "xfrc":
             raise ValueError("native object assistance requires the explicit xfrc force mode")
@@ -684,7 +722,10 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         if xfrc.omega_rot > 0.0:
             kp_rot, kd_rot = float(xfrc.omega_rot) ** 2, 2.0 * float(xfrc.zeta_rot) * float(xfrc.omega_rot)
             inertia_scale = True
-        inertia = obj.body_inertial_properties().inertia_com_body_kg_m2[:, self._part_body_ids]
+        inertia = torch.stack([
+            obj.body_inertial_properties().inertia_com_body_kg_m2[:, body]
+            for obj, body in zip(self._part_entities, self._part_body_ids, strict=True)
+        ], 1)
         force, torque, _ = object_pose_pd_wrench(
             state, reference, inertia,
             kp_pos=gain("_xfrc_kp_pos_env", xfrc.kp.pos),
@@ -696,9 +737,12 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             torque = torque.clamp(-self._xfrc_force_range, self._xfrc_force_range)
         self._assist_force_w.copy_(torch.where(support[..., None], force, 0.0).detach())
         self._assist_torque_w.copy_(torch.where(support[..., None], torque, 0.0).detach())
-        obj.write_external_wrench_to_sim(
-            self._assist_force_w, self._assist_torque_w, body_ids=self._part_body_ids,
-        )
+        for entity, obj in self.native_objects.items():
+            columns = self._object_part_columns[entity]
+            obj.write_external_wrench_to_sim(
+                self._assist_force_w[:, columns], self._assist_torque_w[:, columns],
+                body_ids=[self._part_body_ids[i] for i in columns],
+            )
 
     def apply_substep(self):
         self._apply_object_assist()
@@ -719,7 +763,8 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
 
     def object_assist_facts(self):
         return dict(
-            body_names=tuple(part.body_name for part in self.native_layout.object.parts),
+            entity_names=tuple(obj.entity_name for obj, _ in self.native_layout.part_bindings),
+            body_names=tuple(part.body_name for _, part in self.native_layout.part_bindings),
             force_w=self._assist_last_force_w, torque_w=self._assist_last_torque_w,
             submission_support=self._assist_submission_support,
             pose_support=self._assist_pose_support,
@@ -732,7 +777,8 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         )
 
     def clear_object_wrenches(self, env_ids=None):
-        self.native_object.clear_external_wrenches(env_ids)
+        for obj in self.native_objects.values():
+            obj.clear_external_wrenches(env_ids)
         rows = slice(None) if env_ids is None else env_ids
         for value in (self._assist_force_w, self._assist_torque_w,
                       self._assist_last_force_w, self._assist_last_torque_w):
@@ -755,7 +801,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                 int(cfg.object.sdf.grid_n),
                 str(self.device),
             )
-            for p in self.native_layout.object.parts
+            for _, p in self.native_layout.part_bindings
         ]
 
     def sdf_query_parts(self, world_pts, *, part_state_w=None, env_ids=None, return_support=False):
@@ -765,7 +811,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         if env_ids is not None:
             state = state[env_ids]
         distances, gradients, supports = [], [], []
-        for i, part in enumerate(self.native_layout.object.parts):
+        for i, (_, part) in enumerate(self.native_layout.part_bindings):
             body = state[:, i]
             offset = body.new_tensor(part.body_from_mesh_position_m).expand_as(
                 body[:, :3]

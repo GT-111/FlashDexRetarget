@@ -59,7 +59,7 @@ class NativeObjectCfg(NativeArticulationCfg):
 class NativeSceneCfg:
     scene_xml_path: str
     hands: tuple[NativeHandCfg, ...]
-    object: NativeObjectCfg
+    objects: tuple[NativeObjectCfg, ...]
 
     @classmethod
     def from_mapping(cls, config: Mapping) -> NativeSceneCfg:
@@ -79,26 +79,40 @@ class NativeSceneCfg:
             )
             for h in config["hands"]
         )
-        obj = config["object"]
-        return cls(
+        objects = tuple(
+            NativeObjectCfg(
+                **{k: str(obj[k]) for k in (
+                    "entity_name", "root_body_name", "root_joint_name",
+                )},
+                parts=tuple(NativeObjectPartCfg(**dict(p)) for p in obj["parts"]),
+            )
+            for obj in config["objects"]
+        )
+        if not objects:
+            raise ValueError("native scene requires its declared object articulations")
+        layout = cls(
             scene_xml_path=str(config["scene_xml_path"]),
             hands=hands,
-            object=NativeObjectCfg(
-                **{
-                    k: str(obj[k])
-                    for k in (
-                        "entity_name",
-                        "root_body_name",
-                        "root_joint_name",
-                    )
-                },
-                parts=tuple(NativeObjectPartCfg(**dict(p)) for p in obj["parts"]),
-            ),
+            objects=objects,
         )
+        for field in ("entity_name", "root_body_name", "root_joint_name"):
+            values = [getattr(binding, field) for binding in layout.articulations]
+            if len(set(values)) != len(values):
+                raise ValueError(f"native articulations require distinct {field}")
+        return layout
 
     @property
     def articulations(self) -> tuple[NativeArticulationCfg, ...]:
-        return (*self.hands, self.object)
+        return (*self.hands, *self.objects)
+
+    @property
+    def part_bindings(self) -> tuple[tuple[NativeObjectCfg, NativeObjectPartCfg], ...]:
+        """One actual owner and part order shared by references, contacts and export."""
+        return tuple((obj, part) for obj in self.objects for part in obj.parts)
+
+    @property
+    def object_root_body_names(self) -> dict[str, str]:
+        return {obj.entity_name: obj.root_body_name for obj in self.objects}
 
 
 def bind_native_scene_config(cfg, *, constructor_gravity_world_m_per_s2) -> NativeSceneCfg:
@@ -115,7 +129,8 @@ def bind_native_scene_config(cfg, *, constructor_gravity_world_m_per_s2) -> Nati
         obj = cfg.commands.object
         if obj.pin_mode != "xfrc":
             raise ValueError("native object assistance requires the explicit xfrc force mode")
-        if len({part.body_name for part in layout.object.parts}) != len(layout.object.parts):
+        parts = layout.part_bindings
+        if len({part.body_name for _, part in parts}) != len(parts):
             raise ValueError("native assistance requires one declared reference part per actual body")
         if obj.perturb.enabled or obj.xfrc.implicit_damping or float(obj.xfrc.contact_scale) != 1.0:
             raise ValueError("native xfrc supports explicit PD without perturbation, implicit damping or contact scaling")
@@ -129,9 +144,6 @@ def bind_native_scene_config(cfg, *, constructor_gravity_world_m_per_s2) -> Nati
             )
     with open_dict(cfg.commands):
         cfg.commands.native_scene = cfg.robot.native_scene
-        cfg.commands.object.entity_names = {
-            h.side: layout.object.entity_name for h in layout.hands
-        }
     if cfg.commands.object.support_disks.enable:
         raise ValueError("native scene uses its authored static support")
     return layout

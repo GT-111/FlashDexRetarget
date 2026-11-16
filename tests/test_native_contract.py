@@ -83,15 +83,29 @@ def _scene(tmp_path):
                 ("right", ["command_B", "command_C"]),
             )
         ],
-        object=dict(
+        objects=(dict(
             entity_name="object",
             root_body_name="base",
             root_joint_name="base_free",
             parts=[
                 dict(name=n, body_name=n, mesh_path=f"{n}.obj") for n in ("base", "lid")
             ],
-        ),
+        ),),
     )
+    return NativeSceneCfg.from_mapping(mapping), mapping
+
+
+def _two_object_scene(tmp_path):
+    layout, mapping = _scene(tmp_path)
+    tree = ET.parse(layout.scene_xml_path)
+    root = ET.SubElement(tree.getroot().find("worldbody"), "body", name="prop_root", pos=".3 0 .2")
+    ET.SubElement(root, "freejoint", name="prop_free")
+    ET.SubElement(root, "geom", type="box", size=".02 .03 .04", mass=".125")
+    tree.write(layout.scene_xml_path)
+    mapping["objects"] = (*mapping["objects"], dict(
+        entity_name="loose_prop", root_body_name="prop_root", root_joint_name="prop_free",
+        parts=[dict(name="base", body_name="prop_root", mesh_path="prop.obj")],
+    ))
     return NativeSceneCfg.from_mapping(mapping), mapping
 
 
@@ -121,10 +135,23 @@ def test_native_metadata_keeps_free_roots_passive_mimics_and_real_effort_bounds(
     np.testing.assert_allclose(obj.body_mass, [0.075, 0.025])
 
 
-def test_native_conversion_inputs_preserve_subtree_inertials_and_one_articulated_object(
+def test_native_conversion_inputs_keep_multiple_actual_object_trees(
     tmp_path,
 ):
-    layout, _ = _scene(tmp_path)
+    from unittest.mock import patch
+
+    from hydra import compose, initialize_config_dir
+
+    with (patch.dict("os.environ", {"FDR_NATIVE_OBJECT_ROOT_BODY": "prop_root",
+                                   "FDR_NATIVE_OBJECT_ROOT_JOINT": "prop_free"}),
+          initialize_config_dir(config_dir=str(Path(__file__).parents[1] / "config"), version_base=None)):
+        for overrides, expected in (([], "object_0"),
+                                    (["envs/native_object@native_object=rigid"], "prop_root")):
+            cfg = compose(config_name="native", overrides=overrides)
+            assert len(cfg.robot.native_scene.objects) == 1
+            assert cfg.robot.native_scene.objects[0].root_body_name == expected
+
+    layout, _ = _two_object_scene(tmp_path)
     original = load_robot_mjcf_meta(layout.scene_xml_path)
     paths = write_native_mjcf_assets(layout, {
         "static": str(tmp_path / "static.usd"),
@@ -150,6 +177,17 @@ def test_native_conversion_inputs_preserve_subtree_inertials_and_one_articulated
     static = ET.parse(paths["static"]).getroot()
     assert static.find(".//geom[@name='support']") is not None
     assert not static.findall(".//freejoint") + static.findall(".//joint[@type='free']")
+    assert load_robot_mjcf_meta(paths["loose_prop"]).joint_names == []
+    assert layout.object_root_body_names == {"object": "base", "loose_prop": "prop_root"}
+    from dataclasses import replace
+    from unittest import TestCase
+
+    with TestCase().assertRaisesRegex(ValueError, "cover the source FREE roots"):
+        write_native_mjcf_assets(replace(layout, objects=layout.objects[:1]), {
+            "static": str(tmp_path / "missing/static.usd"),
+            "articulations": {binding.entity_name: str(tmp_path / "missing" / (binding.entity_name + ".usd"))
+                              for binding in layout.articulations},
+        })
 
 
 def test_native_file_meshes_resolve_from_each_generated_xml(tmp_path):
@@ -473,7 +511,7 @@ def test_native_isaac_scene_keeps_mimic_viscous_and_passive_hinge_authority(monk
     np.testing.assert_array_equal(left.joint_default, joint_default)
     assert left.joint_damping.dtype == left.joint_armature.dtype == left.joint_frictionloss.dtype == np.float64
     obj = meta.subtree("base")
-    selected = scene._native_articulation_cfg(layout.object, obj, cfg)
+    selected = scene._native_articulation_cfg(layout.objects[0], obj, cfg)
     assert selected.actuators == {}
     assert all(type(value) is float for value in selected.init_state.joint_pos.values())
     calls.clear()
@@ -898,7 +936,7 @@ if __name__ == "__main__":
     torch.set_num_threads(1)
     cases = (
         test_native_metadata_keeps_free_roots_passive_mimics_and_real_effort_bounds,
-        test_native_conversion_inputs_preserve_subtree_inertials_and_one_articulated_object,
+        test_native_conversion_inputs_keep_multiple_actual_object_trees,
         test_actual_native_action_derives_dimensions_and_records_accepted_supported_targets,
         test_native_free_root_wrench_is_root_only_and_recomputed_from_current_body_state,
     )

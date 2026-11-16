@@ -62,12 +62,12 @@ def _command(*, rigid=False, passive_types=None, hand_types=None):
                 )
                 for s in ("left", "right")
             ],
-            object=dict(
+            objects=(dict(
                 entity_name="object",
                 root_body_name="object_root",
                 root_joint_name="object_free",
                 parts=parts,
-            ),
+            ),),
         )
     )
     part_state = states(len(parts))
@@ -102,7 +102,7 @@ def _command(*, rigid=False, passive_types=None, hand_types=None):
         native_root_angular_velocity_support={
             s: torch.zeros(3, dtype=torch.bool) for s in ("left", "right")
         },
-        native_object_entity_name="object",
+        native_object_root_body_names={"object": layout.objects[0].root_body_name},
         native_object_part_body_names=tuple(p["body_name"] for p in parts),
         native_object_part_state_w=part_state,
         native_object_part_pose_support=torch.ones(3, len(parts), dtype=torch.bool),
@@ -199,6 +199,74 @@ def _command(*, rigid=False, passive_types=None, hand_types=None):
     return command, env, calls
 
 
+def _add_loose_object(command, env, calls):
+    """Add a distinct physical protocol entity; no joint or hand-side alias."""
+    from dataclasses import replace
+
+    first = command.native_layout.objects[0]
+    binding = replace(first, entity_name="loose_prop", root_body_name="prop_root",
+        root_joint_name="prop_free", parts=(replace(first.parts[0], body_name="prop_root"),))
+    command.native_layout = replace(command.native_layout, objects=(*command.native_layout.objects, binding))
+    ml = command.motion_lib
+    state = ml.native_object_part_state_w.new_zeros(len(ml.native_time_ns), 1, 13)
+    state[..., 0], state[..., 3] = 2., 1.
+    ml.native_object_root_body_names = command.native_layout.object_root_body_names
+    ml.native_object_part_body_names += ("prop_root",)
+    ml.native_object_part_state_w = torch.cat((ml.native_object_part_state_w, state), 1)
+    for field in ("object_part_pose_support", "object_part_linear_velocity_support",
+                  "object_part_angular_velocity_support"):
+        extra = torch.full(state.shape[:2], field == "object_part_pose_support", dtype=torch.bool)
+        setattr(ml, "native_" + field, torch.cat((getattr(ml, "native_" + field), extra), 1))
+    loose = SimpleNamespace(body_names=("prop_root",), joint_names=(), data=SimpleNamespace(
+        body_link_pos_w=state[:1, :, :3].clone(), body_link_quat_w=state[:1, :, 3:7].clone(),
+        body_link_lin_vel_w=state[:1, :, 7:10].clone(), body_link_ang_vel_w=state[:1, :, 10:13].clone()),
+        write_root_state_to_sim=lambda value, ids: calls.append(("prop_root", value.clone(), ids.clone())),
+        clear_external_wrenches=lambda ids=None: calls.append(("clear_prop", ids)))
+    _declare_joint_coordinates(loose, ())
+    env.scene["loose_prop"] = loose
+    command._bind_native_reference()
+    command._init_native_object_assist()
+    return loose
+
+
+def test_multiple_object_reset_and_assistance_follow_actual_tree_ownership():
+    from envs.commands.motion_tracking.motion_tracking_cfg import ObjectCfg
+
+    command, env, calls = _command()
+    loose = _add_loose_object(command, env, calls)
+    command._resample_command(torch.tensor([0]))
+    assert [entry[0] for entry in calls].count("object_root") == 1
+    assert [entry[0] for entry in calls].count("prop_root") == 1
+    assert [entry[0] for entry in calls].count("object_joints") == 1
+    assert command.native_object_joint_pos.shape == (1, 2)
+    assert command.object_joint_coordinate_metadata["entity_names"] == ("object", "object")
+    assert command.ref_obj_trans_w.shape == (1, 2, 3)
+    torch.testing.assert_close(command.ref_obj_trans_w[0, :, 0], torch.tensor([0., 2.]))
+
+    submitted = {}
+    for name, obj in command.native_objects.items():
+        obj.body_inertial_properties = lambda obj=obj: SimpleNamespace(
+            inertia_com_body_kg_m2=torch.eye(3).expand(1, len(obj.body_names), 3, 3))
+        obj.write_external_wrench_to_sim = lambda f, t, *, body_ids, name=name: submitted.update(
+            {name: (f.clone(), t.clone(), list(body_ids))})
+    command.cfg.object = ObjectCfg(pin_objects=True, pin_mode="xfrc")
+    command._init_object_assist()
+    command.cfg.object.xfrc.kp.pos = 10.
+    command.cfg.object.xfrc.kd.pos = 0.
+    loose.data.body_link_pos_w[..., 0] += 1.
+    command._apply_object_assist()
+    assert set(submitted) == {"object", "loose_prop"}
+    assert submitted["object"][0].shape == (1, 2, 3) and submitted["loose_prop"][0].shape == (1, 1, 3)
+    assert submitted["loose_prop"][2] == [0]
+    torch.testing.assert_close(submitted["object"][0], torch.zeros(1, 2, 3))
+    torch.testing.assert_close(submitted["loose_prop"][0][..., 0], torch.tensor([[-10.]]))
+    command.clear_object_wrenches()
+    assert ("clear_prop", None) in calls
+    command.motion_lib.native_object_part_pose_support[0, -1] = False
+    with pytest.raises(ValueError, match="loose_prop.*FREE-base pose"):
+        command._resample_command(torch.tensor([0]))
+
+
 def test_native_profile_builds_real_box_and_rigid_managers(tmp_path):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
@@ -247,7 +315,7 @@ def test_native_profile_builds_real_box_and_rigid_managers(tmp_path):
                 cfg
             )  # Same public composition step as train.run, without AppLauncher.
             layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=(0.0, 0.0, -9.81))
-            assert len(layout.object.parts) == count
+            assert len(layout.objects[0].parts) == count
             managers = build_manager_cfgs(cfg)
             assert not managers["curriculum"]
             assert {"native_command_bc_r", "native_command_bc_l"} <= set(managers["rewards"])
@@ -391,7 +459,6 @@ def test_native_selection_requires_all_part_support_and_finite_actual_state(tmp_
     }
     command._eval_mode = True
     command.time_left = torch.ones(1)
-    command.cfg.object.entity_names = {"left": "object", "right": "object"}
     command._xfrc_curr_ctrl = None
     # The real Isaac reset calls this public method at dt=0: metrics describe
     # reset row0 while the cursor becomes the first requested endpoint row1.
@@ -420,12 +487,12 @@ def test_native_selection_requires_all_part_support_and_finite_actual_state(tmp_
     CommandTerm.compute(command, dt=env.step_dt)
     callback.on_step(env)
     assert not callback.per_env_fail([callback.collect_state()]).any()
-    command.native_object.data.body_link_pos_w[:, 1, 0] += 1
+    next(iter(command.native_objects.values())).data.body_link_pos_w[:, 1, 0] += 1
     CommandTerm.compute(command, dt=env.step_dt)
     callback.on_step(env)
     assert callback.observed_steps.item() == 2
     assert callback.per_env_fail([callback.collect_state()]).all()
-    command.native_object.data.body_link_pos_w[:, 1, 0] -= 1
+    next(iter(command.native_objects.values())).data.body_link_pos_w[:, 1, 0] -= 1
     # SharedEvalEnv disables training terminations. A passive mimic rate can be
     # invalid without changing any of the supported pose/command errors.
     env.termination_manager = _NullTerminationManager(env.num_envs, env.device)
@@ -441,11 +508,11 @@ def test_native_selection_requires_all_part_support_and_finite_actual_state(tmp_
     assert callback.per_env_fail_obj([callback.collect_state()]).all()
     command.robot.data.joint_vel[0, 1] = 0
     command.motion_steps.zero_()
-    command.native_object.data.body_link_pos_w[:, 1, 0] += 1
+    next(iter(command.native_objects.values())).data.body_link_pos_w[:, 1, 0] += 1
     assert NativeMotionTrackingTerminations.native_reference_diverged(
         env, "motion", 0.2, 1.0, 0.2, 1.0, 0
     ).item()
-    command.native_object.data.body_link_pos_w[:, 0, 2] -= 0.2
+    next(iter(command.native_objects.values())).data.body_link_pos_w[:, 0, 2] -= 0.2
     assert NativeMotionTrackingTerminations.native_object_dropped(
         env, "motion", 0.1
     ).item()
@@ -657,9 +724,9 @@ def _configured_native_runner(tmp_path, monkeypatch, command_name):
                         rotation_stiffness=0, rotation_damping=0,
                         force_limit_n=None, torque_limit_nm=None))
                     for side, body in native["root_body_names"].items()],
-                object=dict(entity_name=native["object_entity_name"], root_body_name="base",
+                objects=(dict(entity_name=next(iter(native["object_root_body_names"])), root_body_name="base",
                     root_joint_name="object_free", parts=[dict(name=body, body_name=body, mesh_path=mesh)
-                        for body in native["object_part_body_names"]]))
+                        for body in native["object_part_body_names"]]),))
             cfg.robot.site_names = {kind: {side: [side + "_tip"] for side in ("left", "right")}
                                     for kind in ("tip", "contact")}
             cfg.robot.body_mapping = dict(all=[], level1={}, level2={})
@@ -1041,8 +1108,8 @@ def _full_name_body_fixture(tmp_path, root_mode):
                 root_joint_name=prefix[side] + "/root", command_actuator_names=[prefix[side] + "/drive"],
                 root_control=dict(position_stiffness=0, position_damping=0, rotation_stiffness=0,
                     rotation_damping=0, force_limit_n=None, torque_limit_nm=None)) for side in sides],
-            object=dict(entity_name="object", root_body_name="object", root_joint_name="object-free",
-                parts=[dict(name="body", body_name="object", mesh_path="not-queried.obj")])))
+            objects=(dict(entity_name="object", root_body_name="object", root_joint_name="object-free",
+                parts=[dict(name="body", body_name="object", mesh_path="not-queried.obj")]),)))
     command._init_site_ids(cfg)
     command._init_robot_body_ids(cfg)
     command._init_mano_body_ids(cfg)
@@ -1153,7 +1220,7 @@ def _source_geometry_command(widths=(("right", 3), ("left", 5))):
     command._root_body_ids = [0 if side == "left" else 1 for side, _ in widths]
     env.scene.env_origins = torch.tensor([[2., -1., .5]])
     command.robot.data.body_link_pos_w += env.scene.env_origins[:, None]
-    command.native_object.data.body_link_pos_w += env.scene.env_origins[:, None]
+    next(iter(command.native_objects.values())).data.body_link_pos_w += env.scene.env_origins[:, None]
     command.robot.data.body_link_quat_w[:] = torch.tensor([2**-.5, 0., 0., 2**-.5])
     names = list(reversed(C.MANO_JOINT_NAMES))
     ml = command.motion_lib
@@ -1190,7 +1257,7 @@ def _source_geometry_command(widths=(("right", 3), ("left", 5))):
     axis = torch.linspace(-2, 2, 2)
     grid = torch.zeros(4, 2, 2, 2)
     grid[0], grid[1] = axis[:, None, None], 1.
-    command._part_sdf = [grid.clone() for _ in command.native_layout.object.parts]
+    command._part_sdf = [grid.clone() for _ in command.native_layout.objects[0].parts]
     return command, env, installed, calls
 
 
@@ -1331,10 +1398,6 @@ def test_native_source_geometry_uses_consumed_packet_at_real_step_and_reset():
 
     command, protocol, installed, _ = _source_geometry_command()
     # Normal scene binding and assist initialization, bypassed by this fixture.
-    command.cfg.object.entity_names = {
-        hand.side: command.native_layout.object.entity_name
-        for hand in command.native_layout.hands
-    }
     command._xfrc_curr_ctrl = None
     env = object.__new__(ManagerBasedRlEnv)
     env.scene, env._device = protocol.scene, "cpu"
@@ -1415,11 +1478,11 @@ def test_native_source_part_query_domain_preserves_actual_mesh_chart_and_old_api
 
     command, env, _, _ = _source_geometry_command()
     del env
-    part = replace(command.native_layout.object.parts[0],
+    part = replace(command.native_layout.objects[0].parts[0],
         body_from_mesh_position_m=(.2, .1, 0.),
         body_from_mesh_quat_wxyz=(2**-.5, 0., 0., 2**-.5))
-    command.native_layout = replace(command.native_layout, object=replace(
-        command.native_layout.object, parts=(part, command.native_layout.object.parts[1])))
+    command.native_layout = replace(command.native_layout, objects=(replace(
+        command.native_layout.objects[0], parts=(part, command.native_layout.objects[0].parts[1])),))
     state = command.sim_object_part_state_w
     state[:, 0, :3] = torch.tensor([.3, -.2, 0.])
     state[:, 0, 3:7] = torch.tensor([2**-.5, 0., 0., 2**-.5])
@@ -1492,9 +1555,9 @@ def test_native_source_geometry_reward_split_conserves_supported_mass(widths):
         assert NativeMotionTrackingRewards.native_source_tip_object_bound(env, "motion", sigma).item() == 0
     from dataclasses import replace
 
-    parts = command.native_layout.object.parts
-    command.native_layout = replace(command.native_layout, object=replace(
-        command.native_layout.object, parts=(parts[0], replace(parts[1], distance_sign="winding"))))
+    parts = command.native_layout.objects[0].parts
+    command.native_layout = replace(command.native_layout, objects=(replace(
+        command.native_layout.objects[0], parts=(parts[0], replace(parts[1], distance_sign="winding"))),))
     with pytest.raises(ValueError, match="compatible part distance signs"):
         NativeMotionTrackingRewards.native_source_tip_object_bound(env, "motion", sigma)
 
@@ -1514,7 +1577,7 @@ def test_native_mixed_passive_reward_and_tracking_keep_dimensional_columns():
     assert reference["position_units"] == ("m", "rad")
     # The prepared columns are reversed relative to the physical entity.
     torch.testing.assert_close(reference["position"], torch.tensor([[.1, .2]]))
-    command.native_object.data.joint_pos += torch.tensor([[.02, .05]])
+    next(iter(command.native_objects.values())).data.joint_pos += torch.tensor([[.02, .05]])
     command.motion_lib.robot_joint_pos[1] = torch.tensor([.03, .8, .4])
     command.robot.data.joint_pos[0] = torch.tensor([.05, -.2, .45])
     command_ref = command.command_reference()
@@ -1596,7 +1659,7 @@ def test_native_mixed_passive_reward_and_tracking_keep_dimensional_columns():
 
     # The existing hinge-only formula and empty rigid reduction stay exact.
     hinge, hinge_env, _ = _command()
-    hinge.native_object.data.joint_pos += torch.tensor([[.031, .087]])
+    next(iter(hinge.native_objects.values())).data.joint_pos += torch.tensor([[.031, .087]])
     ref = hinge.object_joint_reference()
     old = torch.exp(-(ref["position"] - hinge.native_object_joint_pos).square() / .1**2).mean(-1)
     assert torch.equal(NativeMotionTrackingRewards.native_object_articulation(hinge_env, "motion", .1), old)
@@ -1619,11 +1682,11 @@ def test_native_scalar_velocity_limits_use_object_and_hand_coordinate_units():
                                 hand_types=("hinge", "slide", "hinge"))
     params = dict(linear_m_per_s=100., angular_rad_per_s=200., joint_rad_per_s=.05, joint_m_per_s=.5)
     check = NativeMotionTrackingTerminations.native_velocity_diverged
-    command.native_object.data.joint_vel[0, 0] = .4
+    next(iter(command.native_objects.values())).data.joint_vel[0, 0] = .4
     command.robot.data.joint_vel[0, 1] = .4
     assert not bool(check(env, "motion", **params).any())  # Metres are not checked as radians.
-    for values, column, speed in ((command.native_object.data.joint_vel, 1, .06),
-                                  (command.native_object.data.joint_vel, 0, .6),
+    for values, column, speed in ((next(iter(command.native_objects.values())).data.joint_vel, 1, .06),
+                                  (next(iter(command.native_objects.values())).data.joint_vel, 0, .6),
                                   (command.robot.data.joint_vel, 0, .06),
                                   (command.robot.data.joint_vel, 1, .6)):
         before = values[0, column].clone()
@@ -1645,15 +1708,15 @@ def _source_intent_reward_case(widths=(("right", 3), ("left", 5))):
 
     command, env, installed, _ = _source_geometry_command(widths)
     names = ("housing_panel", "rotating_leaf")
-    original = command.native_layout.object
-    command.native_layout = replace(command.native_layout, object=replace(
+    original = command.native_layout.objects[0]
+    command.native_layout = replace(command.native_layout, objects=(replace(
         original, entity_name="renamed_item", root_body_name=names[0], parts=tuple(
             replace(part, name=f"surface_{i}", body_name=name)
-            for i, (part, name) in enumerate(zip(original.parts, names, strict=True)))))
+            for i, (part, name) in enumerate(zip(original.parts, names, strict=True)))),))
     env.scene["renamed_item"] = env.scene.pop("object")
     env.scene["renamed_item"].body_names = list(names)
     ml = command.motion_lib
-    ml.native_object_entity_name, ml.native_object_part_body_names = "renamed_item", names
+    ml.native_object_root_body_names, ml.native_object_part_body_names = {"renamed_item": names[0]}, names
     command._bind_native_reference()
     ml.hand_sides = tuple(command._side_list)
     shape = (3, len(widths), len(names))
@@ -1796,7 +1859,6 @@ def test_source_intent_rewards_follow_real_manager_consumed_packet_and_reset():
 
     command, protocol, installed, _, prior = _source_intent_reward_case()
     command._source_tip_geometry_cache = None
-    command.cfg.object.entity_names = {side: "renamed_item" for side in command._side_list}
     command._xfrc_curr_ctrl = None
     command._eval_mode = True
     command.cfg.resampling_time_range = (100., 100.)

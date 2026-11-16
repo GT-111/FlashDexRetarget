@@ -25,7 +25,7 @@ commands:
     noise_to_initial_level: 0.0
     zero_init_vel: false
   object:
-    park_inactive_on_ground: false  # one declared object; no inactive stock slots
+    park_inactive_on_ground: false  # all declared objects are real; no inactive stock slots
     pin_objects: false
     pin_mode: none
     zero_init_vel: false
@@ -73,7 +73,7 @@ obs:
 rewards:
   _target_: envs.rewards.native.NativeMotionTrackingRewards
   split_sides: ${per_hand_actor_critic}
-  # One passive object and global failure: retain each scalar term once.
+  # Shared passive-object and global failure terms occur once, independent of hand count.
   shared_terms: [native_object_part_pose, native_object_articulation, termination_penalty]
   reward_weights:
     native_root_pose: 0.3

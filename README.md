@@ -83,11 +83,10 @@ distance sign and force availability. NOREPORT zeros remain a feature ablation,
 not observed zero force. Unsigned geometry does not provide signed penetration.
 Native `hand_part_contact_facts()` supplies solved pair facts; Isaac reports them
 unavailable. The ordinary recorder preserves this distinction, including supported
-measured-zero force, in exports. These interfaces have eight focused CPU passes;
-they do not establish successful physical interaction.
+measured-zero force, in exports. These software interfaces do not establish successful physical interaction.
 
 The native Isaac interface uses `NativeSceneCfg` to select actual floating hand
-articulations and one object articulation from an authored MJCF. Each hand keeps
+articulations and the ordered `robot.native_scene.objects` collection from an authored MJCF. Each hand keeps
 its FREE root and declared independent actuators; an articulated object keeps
 its passive joints. `convert_assets.py --native-scene-config <resolved-run.yaml>`
 reads the resolved run configuration: `robot.native_scene` owns mechanics and
@@ -102,21 +101,23 @@ The example F1 action recipe has translation/rotation component scales of
 0.1 m/1 rad, raw clipping at +/-1 and configured wrist filtering. It is a separate
 producer condition from DexForge's main-tracker wrist recipe. Preserve the
 resolved action configuration alongside exported installed targets and root-law
-metadata. Four CPU contract cases cover mechanics, scene splitting, actual
-action/reward callers and root wrench computation; imported USD, PhysX dynamics
-and physical task execution still need qualification.
+metadata. Qualify mechanics, scene splitting, actual action/reward callers and root wrench
+computation before admitting a new layout. Imported USD, PhysX dynamics and
+physical task execution require their own qualification.
 
 A trusted prepared clip can carry an explicit `native_reference` mapping in its
 NPZ. The existing crop and `build_motion_pt` path retain its per-row native
 joint Q/Qvel, named hand roots, object parts and passive joints, independent
 support masks, exact prepared `time_ns` and provenance. Root/part states use
 position, WXYZ rotation, world link velocity and world angular velocity.
+`object_root_body_names` maps each actual object entity to its FREE base; the
+flat named part/joint arrays retain configuration order and independent support.
+Native packing does not create hand-side object aliases, asset slots or estimated
+stock contact targets; native part geometry and solved contacts remain separate.
 `MotionLibrary` maps physical joint columns by the runtime joint names and
 exposes these facts separately from MANO and stock scalar-wrist references.
 Unknown rates have zero values and false support; cropping preserves the clock
-origin and complete source frame inventory. Three CPU cases qualify this
-pack/reader contract. Actual native reference generation and physical admission
-remain required.
+origin and complete source frame inventory. Actual native reference generation and physical admission remain required.
 
 Use the existing retarget entry with `input=prepared_native` to pack an explicit
 prepared population. Its default `<dataset>/native-reference.json` names the
@@ -136,7 +137,7 @@ finger-command BC, supported future references and native state terminations.
 It disables object pinning, perturbations and adaptive assistance. BOX keeps
 one free base and its passive hinge. For a real zero-joint rigid object, pass
 `--overrides 'envs/native_object@native_object=rigid'` and the declared scene
-bindings; no artificial hinge is added. Eight CPU cases cover normal Hydra
+bindings; no artificial hinge is added. The native software cases cover Hydra
 composition, command clocks, part/joint ordering, action and support routing,
 reset, wrench cleanup, complete endpoint selection and finite-state admission.
 Offline reference generation, USD/PhysX import and physical response remain

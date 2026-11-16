@@ -9,10 +9,18 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import simulator.isaacsim  # noqa: F401 -- expose the maintained manager subset
 import torch
 
+import simulator.isaacsim  # noqa: F401 -- expose the maintained manager subset
+
 # isort: split
+from hydra import compose, initialize_config_dir
+from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
+from omegaconf import OmegaConf, open_dict
+from test_installed_dynamics import _ObjectCommand, _rigid
+from test_native_backend_ports import _mechanics, _ProtocolPlant
+from test_native_contract import _scene
+
 from envs import build_manager_cfgs
 from envs.commands.motion_tracking.motion_tracking import MotionTrackingCommand
 from envs.commands.motion_tracking.motion_tracking_cfg import ObjectCfg
@@ -20,18 +28,12 @@ from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
 from envs.commands.motion_tracking.objects.assist import ObjectAssistMixin
 from envs.scene.native import bind_native_scene_config
 from evaluation.shared import SharedEvalEnv
-from hydra import compose, initialize_config_dir
-from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
-from omegaconf import OmegaConf, open_dict
 from simulator.env import ManagerBasedRlEnv, ManagerEnvCfg
 from simulator.isaacsim.commands_isaac import IsaacMotionTrackingCommand
 from simulator.isaacsim.entity import FreeArticulationAdapter
 from simulator.mjcf_meta import load_robot_mjcf_meta
 from simulator.native.entity import _FreshnessClock
 from simulator.native.scene import NativeScene, NativeSim
-from test_installed_dynamics import _ObjectCommand, _rigid
-from test_native_backend_ports import _mechanics, _ProtocolPlant
-from test_native_contract import _scene
 
 
 @pytest.mark.parametrize("backend", ("native_isaacsim", "mjwarp", "newton"))
@@ -45,7 +47,7 @@ def test_native_assisted_config_uses_real_curriculum_and_keeps_static_gravity(tm
     with open_dict(cfg.robot):
         cfg.robot.native_scene = mapping
     layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=(0., 0., -9.81))
-    assert layout.object.root_body_name == "base" and cfg.commands.object.pin_mode == "xfrc"
+    assert layout.objects[0].root_body_name == "base" and cfg.commands.object.pin_mode == "xfrc"
     built = build_manager_cfgs(cfg)
     adaptive = built["curriculum"]["xfrc_curriculum_adaptive"]
     assert adaptive.params["command_name"] == cfg.commands.name
@@ -115,7 +117,9 @@ def _native_assist(tmp_path):
     command.cfg = SimpleNamespace(object=ObjectCfg(pin_objects=True, pin_mode="xfrc",
         entity_names={"left": "object", "right": "object"}))
     command.cfg.object.xfrc.rot_inertia_scale = False
-    command._part_body_ids = [scene["object"].body_names.index(part.body_name) for part in layout.object.parts]
+    command._part_body_ids = [scene["object"].body_names.index(part.body_name) for part in layout.objects[0].parts]
+    command._part_entities = tuple(scene[obj.entity_name] for obj, _ in layout.part_bindings)
+    command._object_part_columns = {"object": list(range(len(layout.part_bindings)))}
     command.motion_ids, command.motion_steps = torch.zeros(2, dtype=torch.long), torch.arange(2)
     state = command.sim_object_part_state_w.clone()
     reference = state.clone()
@@ -140,7 +144,7 @@ def _native_assist(tmp_path):
 
 def test_native_assist_uses_named_parts_preserves_passive_hinge_and_clears_eval_reset_snapshot(tmp_path):
     command, env, plant, model = _native_assist(tmp_path)
-    ids = [model.body(part.body_name).id for part in command.native_layout.object.parts]
+    ids = [model.body(part.body_name).id for part in command.native_layout.objects[0].parts]
     before_control = plant.control.clone()
     command.apply_substep()
     submitted = plant.external_body_wrench_w[:, ids].clone()
@@ -257,7 +261,7 @@ def test_ordinary_native_recorder_preserves_submitted_assist_request_and_unknown
             row = int(command.reference_phase["motion_steps"].item())
             force = torch.zeros(1, 2, 3)
             force[0, :, 0] = torch.tensor([2., 5.]) * row  # deliberately lid/base
-            return dict(body_names=("object_lid", "object_root"), force_w=force, torque_w=-force,
+            return dict(entity_names=("object", "object"), body_names=("object_lid", "object_root"), force_w=force, torque_w=-force,
                 pose_support=torch.ones(1, 2, dtype=torch.bool),
                 linear_rate_support=torch.zeros(1, 2, dtype=torch.bool),
                 angular_rate_support=torch.zeros(1, 2, dtype=torch.bool),

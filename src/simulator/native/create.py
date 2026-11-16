@@ -26,11 +26,11 @@ def create_native_envs(cfg, device="cuda"):
     import mujoco
     model = mujoco.MjModel.from_xml_path(layout.scene_xml_path)
     pairs = {
-        f"{hand.side}/{part.name}": (
+        f"{hand.side}/{obj.entity_name}/{part.name}": (
             [model.body(n).id for n in meta.subtree(hand.root_body_name).body_names],
             [model.body(part.body_name).id],
         )
-        for hand in layout.hands for part in layout.object.parts
+        for hand in layout.hands for obj, part in layout.part_bindings
     }
     plant = plant_class(
         scene_xml_path=layout.scene_xml_path, num_envs=int(cfg.scene.num_envs),

@@ -67,18 +67,22 @@ def load_clip(path: Path, meshes: C.ObjectMeshes, fps: float, cfg) -> tuple[dict
         joints = C.joints(clip, s).astype(np.float32)
         wrist_pos = clip[f"mano_{s}_wrist_pos"].astype(np.float32)
         wrist_rot = clip[f"mano_{s}_wrist_rot"].astype(np.float32)
-        pose = C.obj_pose(clip, s)
-        for key, arr in (("mano_joints", joints), ("wrist_pos", wrist_pos), ("wrist_rot", wrist_rot), ("obj_pose", pose)):
+        for key, arr in (("mano_joints", joints), ("wrist_pos", wrist_pos), ("wrist_rot", wrist_rot)):
             if len(arr) != T:
                 raise ValueError(f"{path.name}: {s} {key} has {len(arr)} frames, qpos {T}")
-        obj_id, scale = C.obj_id(clip, s), C.obj_scale(clip, s)
-        mass = float(clip[f"obj_{s}_mass"]) if f"obj_{s}_mass" in clip else 0.0
         d[f"mano_{s}_wrist_pos"] = wrist_pos
         d[f"mano_{s}_wrist_rot"] = wrist_rot
         d[f"mano_{s}_wrist_vel"] = velocity(wrist_pos, dt, sigma)
         d[f"mano_{s}_wrist_angvel"] = angular_velocity(wrist_rot.astype(np.float64), dt, sigma)
         d[f"mano_{s}_joints"] = joints
         d[f"mano_{s}_joints_vel"] = velocity(joints, dt, sigma)
+        if native is not None:
+            continue  # Native objects/parts have independent owners, not hand-side aliases.
+        pose = C.obj_pose(clip, s)
+        if len(pose) != T:
+            raise ValueError(f"{path.name}: {s} obj_pose has {len(pose)} frames, qpos {T}")
+        obj_id, scale = C.obj_id(clip, s), C.obj_scale(clip, s)
+        mass = float(clip[f"obj_{s}_mass"]) if f"obj_{s}_mass" in clip else 0.0
         d[f"obj_{s}_pos"] = pose[:, :3, 3].astype(np.float32)
         d[f"obj_{s}_rotmat"] = pose[:, :3, :3].astype(np.float32)
         d[f"obj_{s}_vel"] = velocity(pose[:, :3, 3], dt, sigma)
@@ -106,7 +110,9 @@ def build(clips: Path, dataset: Path, fps: float, cfg, names: set[str] | None = 
         d, m = load_clip(f, meshes, fps, cfg)
         rows.append(d)
         metas.append(m)
-        print(f"[build] {f.stem}: {len(d['joint_pos'])} frames, objects {[m[s] for s in m['sides']]}", flush=True)
+        objects = (m["native_reference"]["object_root_body_names"] if "native_reference" in m
+                   else [m[s] for s in m["sides"]])
+        print(f"[build] {f.stem}: {len(d['joint_pos'])} frames, objects {objects}", flush=True)
     sides = metas[0]["sides"]
     bad = [f.name for f, m in zip(files, metas) if m["sides"] != sides]
     if bad:
@@ -128,13 +134,14 @@ def build(clips: Path, dataset: Path, fps: float, cfg, names: set[str] | None = 
 
     # One object slot per distinct (right, left) object pair; a single-hand file has one per object.
     slots: dict[tuple, int] = {}
-    slot_of = [slots.setdefault(tuple(m[s] for s in sides), len(slots)) for m in metas]
-    for i, s in enumerate(sides):
-        packed[f"{s}_object_mesh_dirs"] = [f"objects/{key[i][0]}" for key in slots]
-        packed[f"{s}_object_mesh_scales"] = [key[i][1] for key in slots]
-        if any(key[i][2] > 0 for key in slots):
-            packed[f"{s}_object_masses"] = [key[i][2] for key in slots]
-        packed[f"motion_object_slot_{s}"] = torch.tensor(slot_of, dtype=torch.long)
+    if native[0] is None:
+        slot_of = [slots.setdefault(tuple(m[s] for s in sides), len(slots)) for m in metas]
+        for i, s in enumerate(sides):
+            packed[f"{s}_object_mesh_dirs"] = [f"objects/{key[i][0]}" for key in slots]
+            packed[f"{s}_object_mesh_scales"] = [key[i][1] for key in slots]
+            if any(key[i][2] > 0 for key in slots):
+                packed[f"{s}_object_masses"] = [key[i][2] for key in slots]
+            packed[f"motion_object_slot_{s}"] = torch.tensor(slot_of, dtype=torch.long)
 
     disks = [m["support"] for m in metas]
     if any(x is not None for x in disks):

@@ -89,6 +89,15 @@ Native FREE-root scenes instead use `robot.native_scene` and named
 floating hands and passive articulated objects; the stock fixed-root URDF
 binding does not replace it.
 
+The native scene declares an ordered `objects` collection of actual FREE-base
+articulations. Each owns its original passive joints and named part surfaces.
+Prepared native clips bind the same entities through `object_root_body_names`;
+part/joint rows remain flat, named, and independently supported. Objects are not
+assigned to hand-side slots. All declared objects participate in the same coupled
+plant, and contact/export metadata retains each `(entity_name, body_name)` owner.
+A changed object/part layout is a new configured model interface; common code
+does not establish that a trained policy generalizes across layouts or tasks.
+
 ### Native Isaac articulated assets
 
 The native Isaac profile converts the configured MJCF subtrees through the existing `convert_assets.py --native-scene-config <resolved-native-config>` entry. It retains separate FREE hand articulations and one FREE object articulation with its original passive hinge. The scene's named body, actuator and part bindings remain the source of the dimensions and addresses.

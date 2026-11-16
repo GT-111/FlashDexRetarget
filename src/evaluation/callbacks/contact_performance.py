@@ -215,9 +215,9 @@ class NativeContactPerformance:
         self.cmd = env.command_manager.get_term(self.command_name)
         layout = self.cmd.native_layout
         self.addresses = {
-            f"{hand.side}/{part.name}": dict(hand_side=hand.side, hand_body_name=hand.root_body_name,
-                part_entity_name=layout.object.entity_name, part_body_name=part.body_name)
-            for hand in layout.hands for part in layout.object.parts
+            f"{hand.side}/{obj.entity_name}/{part.name}": dict(hand_side=hand.side, hand_body_name=hand.root_body_name,
+                part_entity_name=obj.entity_name, part_body_name=part.body_name)
+            for hand in layout.hands for obj, part in layout.part_bindings
         }
         self.pair_names = tuple(self.addresses)
         self.num_substeps, self.control_dt = int(env.cfg.decimation), float(env.step_dt)

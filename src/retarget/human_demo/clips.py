@@ -142,9 +142,12 @@ def native_reference(clip: dict) -> dict | None:
                 raise ValueError("native source_point_position_support requires explicit boolean [frames, points]")
             reference["source_point_position_support"][side] = support
     parts = names("object_part_body_names")
-    if (not parts or not reference["object_entity_name"]
-            or reference["object_root_body_name"] not in parts):
-        raise ValueError("native object reference must name its actual entity, FREE base and parts")
+    object_roots = dict(reference["object_root_body_names"])
+    if (not object_roots or any(not entity for entity in object_roots)
+            or len(set(object_roots.values())) != len(object_roots)
+            or not set(object_roots.values()) <= set(parts)):
+        raise ValueError("native object reference must name its distinct actual entities, FREE bases and parts")
+    reference["object_root_body_names"] = object_roots
     part_state = array("object_part_state_w", (frames, len(parts), 13))
     array("object_part_pose_support", (frames, len(parts)), support=True)
     linear = array("object_part_linear_velocity_support", (frames, len(parts)), support=True)

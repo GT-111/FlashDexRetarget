@@ -102,11 +102,12 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         addresses = {(row["hand_side"], row["hand_body_name"], row["part_entity_name"], row["part_body_name"]): name
                      for name, row in interval["addresses"].items()}
         hands = {hand.side: hand.root_body_name for hand in command.native_layout.hands}
+        owners = {part.body_name: obj.entity_name for obj, part in command.native_layout.part_bindings}
         values = []
         for hand, name in enumerate(intent["metadata"]["hand_sides"]):
             credit = torch.zeros_like(duration, dtype=torch.float32)
             for part, body in enumerate(intent["metadata"]["part_body_names"]):
-                address = (name, hands[name], command.native_layout.object.entity_name, body)
+                address = (name, hands[name], owners[body], body)
                 if address not in addresses:
                     continue  # No measurement for this actual pair; no contact credit.
                 pair = interval["pairs"][addresses[address]]
@@ -137,7 +138,7 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
     def native_source_tip_object_bound(env, command_name, sigma_m, side=None):
         """Declared part-SDF proximity mechanism; never paired contact/penetration."""
         command = env.command_manager.get_term(command_name)
-        if len({part.distance_sign for part in command.native_layout.object.parts}) != 1:
+        if len({part.distance_sign for _, part in command.native_layout.part_bindings}) != 1:
             raise ValueError("native source object bound requires compatible part distance signs")
         facts = command.source_tip_geometry_facts()
         if facts is None:

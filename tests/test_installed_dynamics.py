@@ -363,7 +363,7 @@ def test_native_properties_use_real_compiled_body_rows_and_static_gravity(tmp_pa
     model.body_inertia[ids] = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
     model.body_iquat[ids] = [2**-0.5, 0.0, 0.0, 2**-0.5]
     sim = NativeSim(SimpleNamespace(model=model, device="cpu", num_envs=2))
-    obj = NativeArticulation(layout.object, meta, sim)
+    obj = NativeArticulation(layout.objects[0], meta, sim)
     properties = obj.body_inertial_properties()
     torch.testing.assert_close(
         properties.mass_kg, torch.tensor([[2.0, 5.0]]).expand(2, -1)

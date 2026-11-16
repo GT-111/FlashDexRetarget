@@ -85,7 +85,7 @@ def _replay_case(*, rigid, joint_order=(2, 0, 1), source_entity="robot"):
     robot.joint_pos = torch.tensor([[0.25, 0.91, -0.5], [0.125, 0.71, 0.25]])
     robot.joint_vel = torch.tensor([[0.5, 0.9, -0.25], [0.25, 0.7, 0.125]])
     if not rigid:
-        obj = command.native_object.data
+        obj = next(iter(command.native_objects.values())).data
         obj.joint_pos = torch.tensor([[0.5, -0.125], [-0.25, 0.25]])
         obj.joint_vel = torch.tensor([[0.125, -0.5], [0.25, 0.5]])
     # Both native independent-command order and object-reference order differ
@@ -168,7 +168,7 @@ def test_native_replay_reconstructs_named_future_without_live_world_reads(rigid)
     command.robot.data.joint_vel.fill_(-0.5)
     command.robot.data.body_link_pos_w.fill_(1.0)
     if not rigid:
-        command.native_object.data.joint_pos.fill_(0.25)
+        next(iter(command.native_objects.values())).data.joint_pos.fill_(0.25)
     actual = compactor.expand(compact[select], aux[select])
     torch.testing.assert_close(actual, full[select], rtol=0, atol=0)
 
@@ -200,7 +200,7 @@ def test_native_future_retains_independent_support_clocks_and_physical_columns()
         rows[0, 0, object_start : object_start + 2], torch.tensor([-0.75, 0.875])
     )
     # 90-degree WORLD-z wrist rotation: (x,y,z) -> (y,-x,z).
-    part_start = object_start + 4 * len(command.native_object.joint_names)
+    part_start = object_start + 4 * len(next(iter(command.native_objects.values())).joint_names)
     wrist_position = full[0, :3]
     displacement = torch.tensor([1.0, 0.2, 0.3]) - wrist_position
     expected = torch.stack((displacement[1], -displacement[0], displacement[2]))

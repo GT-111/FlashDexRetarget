@@ -46,15 +46,13 @@ class NativeMotionTrackingTerminations(MotionTrackingTerminations):
     @staticmethod
     def native_object_dropped(env, command_name, drop_margin_m):
         command = env.command_manager.get_term(command_name)
-        body = command.motion_lib.native_object_part_body_names.index(
-            command.native_layout.object.root_body_name
-        )
-        actual = command.sim_object_part_state_w[:, body, 2]
-        reference = command.ref_object_part_state_w[:, body, 2]
+        bodies = command._object_root_columns
+        actual = command.sim_object_part_state_w[:, bodies, 2]
+        reference = command.ref_object_part_state_w[:, bodies, 2]
         support = command.motion_lib.native_object_part_pose_support[
-            command._motion_flat_ids, body
-        ]
-        return support & (actual < reference - drop_margin_m)
+            command._motion_flat_ids
+        ][:, bodies]
+        return (support & (actual < reference - drop_margin_m)).any(-1)
 
     @staticmethod
     def native_velocity_diverged(

@@ -64,7 +64,8 @@ def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, se
     library.source_import_elapsed_ns = [np.asarray(source["prepared_elapsed_time_ns"], np.int64) + 1_000_000_000]
     env.scene.env_origins = torch.tensor([[1., 2., 3.]])
     env.close = lambda: None
-    native_command.cfg.object.entity_names = {"left": "object", "right": "object"}
+    if not native:
+        native_command.cfg.object.entity_names = {"left": "object", "right": "object"}
     native_command._eval_mode = True
     native_command._xfrc_curr_ctrl = None
     native_command.time_left = torch.ones(1)
@@ -100,6 +101,8 @@ def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, se
     env.command_manager = SimpleNamespace(get_term=lambda name: command)
     if setup_scene is not None:
         setup_scene(env, command)
+    if native:
+        action_cfg.native_scene = asdict(command.native_layout)
     env.action_manager = ActionManager({"actual": action_cfg}, env)
     env.action_manager.reset()
     CommandTerm.compute(command, dt=0.)
@@ -116,7 +119,7 @@ def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, se
         robot.data.joint_vel[:] = row + .25
         robot.data.body_link_pos_w += .001
         if native and not rigid:
-            command.native_object.data.joint_vel[:] = row + .5
+            next(iter(command.native_objects.values())).data.joint_vel[:] = row + .5
         CommandTerm.compute(command, dt=env.step_dt)
         recorder.on_step(env)
         assert command.reference_phase["motion_steps"].item() == row
@@ -776,7 +779,7 @@ def test_source_tip_geometry_uses_real_consumed_phase_through_final_endpoint(tmp
         command.motion_lib.native_time_ns = (
             command.motion_lib.native_time_ns - command.motion_lib.native_time_ns[0] + clock_origin
         )
-        parts = command.native_layout.object.parts
+        parts = command.native_layout.objects[0].parts
         _metadata, rows = _source_geometry_protocol(env, command, command._side_list,
             tuple(part.name for part in parts), tuple(part.body_name for part in parts))
         trace.append(rows)
@@ -805,12 +808,12 @@ def test_source_tip_geometry_absent_modality_exports_no_invented_group(tmp_path)
     assert not any(key.startswith("source_tip_geometry_") for key in arrays)
 
 
-def test_native_mixed_passive_coordinates_roundtrip_raw_state_and_units(tmp_path):
+def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assistance(tmp_path):
     from dexforge_adaptation.flashdex_retarget import (
         flashdex_source_mapping,
         load_flashdex_rollout,
     )
-    from test_native_task_contract import _declare_joint_coordinates
+    from test_native_task_contract import _add_loose_object, _declare_joint_coordinates
 
     source = flashdex_source_mapping(source_id="arctic", source_revision="synthetic", source_unit_id="fixture",
         source_episode_index=0, fold="train", source_frame_index=(0, 1, 2),
@@ -822,20 +825,24 @@ def test_native_mixed_passive_coordinates_roundtrip_raw_state_and_units(tmp_path
         assistance_receipt={"evaluation_external_wrenches_cleared": True, "evaluation_object_playback": False},
         hands={side: dict(body_name=side + "_root", command_joint_names={"driver": side + "_driver"},
                          physical_joint_names={"driver": side + "_driver"}) for side in ("left", "right")},
-        object_part_names=["proximal", "distal"], object_parts={name: dict(entity_name="object", body_name=body)
-            for name, body in (("proximal", "object_root"), ("distal", "object_lid"))}, clips={"fixture": source})
+        object_part_names=["proximal", "distal", "prop"], object_parts=dict(
+            proximal=dict(entity_name="object", body_name="object_root"),
+            distal=dict(entity_name="object", body_name="object_lid"),
+            prop=dict(entity_name="loose_prop", body_name="prop_root")), clips={"fixture": source})
 
     def setup(env, command):
-        _declare_joint_coordinates(command.native_object, ("slide", "hinge"))
+        _declare_joint_coordinates(next(iter(command.native_objects.values())), ("slide", "hinge"))
         _declare_joint_coordinates(command.robot, ("slide", "hinge", "hinge"))
         command._bind_native_reference()
+        _add_loose_object(command, env, [])
         # A type does not rename, convert, or reorder observed coordinates.
-        command.native_object.data.joint_pos[:] = torch.tensor([[.023, -.4]])
+        next(iter(command.native_objects.values())).data.joint_pos[:] = torch.tensor([[.023, -.4]])
 
     manifest = record_reference_phase_fixture(tmp_path, binding, native=True, setup_scene=setup)
     recorded = load_flashdex_rollout(manifest, motion_id=0)
     metadata = recorded.object_joint_metadata
-    assert metadata["entity_name"] == "object"
+    assert metadata["object_root_body_names"] == {"object": "object_root", "loose_prop": "prop_root"}
+    assert metadata["entity_names"] == ["object", "object"]
     assert metadata["joint_names"] == ["hinge_a", "hinge_b"]
     assert metadata["joint_types"] == ["slide", "hinge"]
     assert metadata["position_units"] == ["m", "rad"]
@@ -856,3 +863,8 @@ def test_native_mixed_passive_coordinates_roundtrip_raw_state_and_units(tmp_path
     assert recorded.arrays["object_joint_pos"].dtype == np.float32
     assert recorded.arrays["object_joint_position_support"].dtype == bool
     np.testing.assert_array_equal(recorded.arrays["recorded_motion_steps"], [0, 1, 2])
+    assert recorded.arrays["native_object_part_pose"].shape == (3, 3, 7)
+    assistance = json.loads(str(recorded.arrays["object_assist_metadata_json"]))
+    assert assistance["entity_names"] == ["object", "object", "loose_prop"]
+    assert assistance["body_names"] == ["object_root", "object_lid", "prop_root"]
+    np.testing.assert_array_equal(recorded.arrays["object_assist_force_w"], np.zeros((3, 3, 3), np.float32))

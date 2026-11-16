@@ -85,20 +85,20 @@ robot:
           - right_ctrl_ring_1_joint
           - right_ctrl_little_1_joint
         root_control: ${robot.native_scene.hands.0.root_control}
-    object:
-      entity_name: articulated_object
-      root_body_name: object_0
-      root_joint_name: object_0_free
-      parts:
-        - name: base
-          body_name: object_0
-          mesh_path: ${oc.env:FDR_NATIVE_BOX_BASE_MESH}
-          body_from_mesh_position_m: [0.0, 0.0, 0.0]
-          body_from_mesh_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
-          distance_sign: unsigned
-        - name: lid
-          body_name: object_0_articulated
-          mesh_path: ${oc.env:FDR_NATIVE_BOX_LID_MESH}
-          body_from_mesh_position_m: [0.0, 0.0, 0.0]
-          body_from_mesh_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
-          distance_sign: unsigned
+    objects:
+      - entity_name: articulated_object
+        root_body_name: object_0
+        root_joint_name: object_0_free
+        parts:
+          - name: base
+            body_name: object_0
+            mesh_path: ${oc.env:FDR_NATIVE_BOX_BASE_MESH}
+            body_from_mesh_position_m: [0.0, 0.0, 0.0]
+            body_from_mesh_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+            distance_sign: unsigned
+          - name: lid
+            body_name: object_0_articulated
+            mesh_path: ${oc.env:FDR_NATIVE_BOX_LID_MESH}
+            body_from_mesh_position_m: [0.0, 0.0, 0.0]
+            body_from_mesh_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+            distance_sign: unsigned

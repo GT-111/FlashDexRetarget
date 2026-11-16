@@ -95,7 +95,7 @@ class MotionLibrary:
 
         references = [native_reference(d) for d in motion_dicts]
         first = references[0]
-        for field in ("root_body_names", "object_entity_name", "object_root_body_name",
+        for field in ("root_body_names", "object_root_body_names",
                       "object_part_body_names", "object_joint_names"):
             if any(reference[field] != first[field] for reference in references[1:]):
                 raise ValueError(f"native references select different physical {field}")
@@ -138,7 +138,7 @@ class MotionLibrary:
                     ids = [names.index(str(name)) for name in motion[f"mano_{side}_joint_names"]]
                     arrays.append(reference["source_point_position_support"][side][:, ids])
                 self.native_source_point_position_support[side] = _concat(arrays, self.device, dtype=torch.bool)
-        for field in ("object_entity_name", "object_root_body_name", "object_part_body_names",
+        for field in ("object_root_body_names", "object_part_body_names",
                       "object_joint_names"):
             setattr(self, "native_" + field, first[field])
         for field in ("object_part_state_w", "object_part_pose_support", "object_part_linear_velocity_support",

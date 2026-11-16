@@ -20,7 +20,12 @@ from .entity import (
     _Cached,
     _FreshnessClock,
 )
-from .plant import NativePlantSnapshot, free_root_velocity_to_native, root_drive_indices, root_origin_wrench
+from .plant import (
+    NativePlantSnapshot,
+    free_root_velocity_to_native,
+    root_drive_indices,
+    root_origin_wrench,
+)
 
 
 @dataclass
@@ -281,8 +286,10 @@ class NativeScene:
             "conversion": "link_COM_torque_plus_rotated_COM_offset_cross_force",
             "recorded_wrench_point": "root_link_COM_before_origin_shift",
         }
-        self.object_parts = {p.name: {"entity_name": layout.object.entity_name, "body_name": p.body_name}
-                             for p in layout.object.parts}
+        self.object_parts = {
+            f"{obj.entity_name}/{p.name}": {"entity_name": obj.entity_name, "body_name": p.body_name}
+            for obj, p in layout.part_bindings
+        }
 
     def capture_control_context(self) -> NativeSceneControlContext:
         return NativeSceneControlContext(
@@ -338,12 +345,12 @@ class NativeScene:
         return {
             "pairs": self.sim.plant.contact_facts,
             "addresses": {
-                f"{h.side}/{p.name}": {
+                f"{h.side}/{obj.entity_name}/{p.name}": {
                     "hand_side": h.side, "hand_body_name": h.root_body_name,
-                    "part_entity_name": self.native_layout.object.entity_name,
+                    "part_entity_name": obj.entity_name,
                     "part_body_name": p.body_name,
                 }
-                for h in self.native_layout.hands for p in self.native_layout.object.parts
+                for h in self.native_layout.hands for obj, p in self.native_layout.part_bindings
             },
             "measurement_support": self.sim.plant.contact_support,
             "sample_time_s": self.sim.plant.contact_sample_time_s,

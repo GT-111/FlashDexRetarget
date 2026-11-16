@@ -247,8 +247,8 @@ class NativeRolloutRecord(RolloutRecord):
                 coordinate_frame="env-local p/WXYZ; WORLD link twist and hand-root force/torque",
                 effort_sampling="actual last physics substep; not interval-mean effort")
         self.object_joint_metadata = None
-        if hasattr(self.cmd, "native_object"):
-            self.object_joint_metadata = dict(entity_name=self.cmd.native_layout.object.entity_name,
+        if hasattr(self.cmd, "native_objects"):
+            self.object_joint_metadata = dict(object_root_body_names=self.cmd.native_layout.object_root_body_names,
                 **self.cmd.object_joint_coordinate_metadata,
                 authority="observed simulator scalar state; independent from reference support")
             if self.installed_metadata is not None:
@@ -258,13 +258,17 @@ class NativeRolloutRecord(RolloutRecord):
         self.object_assist_metadata = None
         if self._object_assist_reader is not None:
             facts = self._object_assist_reader()
+            addresses = list(zip(facts["entity_names"], facts["body_names"], strict=True))
             names = [part["body_name"] for part in self.binding["object_parts"].values()]
-            self._object_assist_columns = [facts["body_names"].index(name) for name in names]
+            entities = [part["entity_name"] for part in self.binding["object_parts"].values()]
+            self._object_assist_columns = [addresses.index(address)
+                                           for address in zip(entities, names, strict=True)]
             self.object_assist_metadata = {key: facts[key] for key in (
                 "authority", "unsupported_velocity", "force_unit", "torque_unit", "clock",
             )}
             self.object_assist_metadata.update(
-                body_names=names, sampling="last submitted physics substep, not interval mean or measured force",
+                entity_names=entities, body_names=names,
+                sampling="last submitted physics substep, not interval mean or measured force",
                 reset="no submitted substep: zero request and false submission support",
             )
         self.backend_metadata = getattr(env.scene, "backend_identity", None)

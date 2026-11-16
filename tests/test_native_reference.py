@@ -45,7 +45,7 @@ def _clip():
         root_pose_support={side: np.array((True, False, True)) for side in ("left", "right")},
         root_linear_velocity_support={side: np.zeros(frames, bool) for side in ("left", "right")},
         root_angular_velocity_support={side: np.ones(frames, bool) for side in ("left", "right")},
-        object_entity_name="articulated_object", object_root_body_name="base",
+        object_root_body_names={"articulated_object": "base"},
         object_part_body_names=("lid", "base"), object_part_state_w=part_state,
         object_part_pose_support=np.array(((True, True), (False, True), (True, True))),
         object_part_linear_velocity_support=np.zeros((frames, 2), bool),
@@ -197,9 +197,9 @@ def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_co
             command_actuator_names=["command_" + side], root_control=dict(position_stiffness=0,
                 position_damping=0, rotation_stiffness=0, rotation_damping=0, force_limit_n=None,
                 torque_limit_nm=None)) for side, body in native["root_body_names"].items()],
-        object=dict(entity_name=native["object_entity_name"], root_body_name=native["object_root_body_name"],
+        objects=(dict(entity_name=next(iter(native["object_root_body_names"])), root_body_name=next(iter(native["object_root_body_names"].values())),
             root_joint_name="synthetic_object_free", parts=[dict(name=body, body_name=body, mesh_path="synthetic.obj")
-                for body in native["object_part_body_names"]])))
+                for body in native["object_part_body_names"]]),)))
     obj = SimpleNamespace(joint_names=("hinge_a", "hinge_b"), body_names=("base", "lid"))
     robot = SimpleNamespace(joint_names=joint_names)
     for entity in (obj, robot):
@@ -209,7 +209,7 @@ def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_co
     command = object.__new__(NativeMotionTrackingCommand)
     command.native_layout, command.motion_lib, command.robot = layout, library, robot
     command._env = SimpleNamespace(device="cpu", num_envs=1, step_dt=0.02,
-        scene={native["object_entity_name"]: obj})
+        scene={next(iter(native["object_root_body_names"])): obj})
     command._finger_joint_ids = torch.tensor([0, 2])
     command.motion_ids, command.motion_steps = torch.tensor([0]), torch.tensor([1])
     command._bind_native_reference()
@@ -301,6 +301,35 @@ def test_actual_crop_pack_and_reopen_keep_native_rows_static_names_and_source_in
     np.testing.assert_array_equal(library.native_root_pose_support["left"], (False, True))
     np.testing.assert_array_equal(library.native_object_part_pose_support, ((False, True), (True, True)))
     assert library.native_object_part_body_names == ("lid", "base")
+
+
+def test_multi_object_crop_pack_retains_named_roots_parts_and_independent_support(tmp_path):
+    original = _clip()
+    for key in list(original):
+        if key.startswith("obj_"):
+            del original[key]
+    native = original["native_reference"]
+    native["object_root_body_names"]["loose_prop"] = "prop_root"
+    native["object_part_body_names"] += ("prop_root",)
+    state = np.zeros((3, 1, 13), np.float32)
+    state[:, 0, 0], state[:, 0, 3] = 30., 1.
+    native["object_part_state_w"] = np.concatenate((native["object_part_state_w"], state), axis=1)
+    for field in ("object_part_pose_support", "object_part_linear_velocity_support",
+                  "object_part_angular_velocity_support"):
+        extra = np.zeros((3, 1), bool)
+        if field == "object_part_pose_support":
+            extra[:, 0] = (True, False, True)
+        native[field] = np.concatenate((native[field], extra), axis=1)
+    library = _reader(_pack(tmp_path, _crop(original, 1)))
+    assert library.native_object_root_body_names == {"articulated_object": "base", "loose_prop": "prop_root"}
+    assert library.native_object_part_body_names == ("lid", "base", "prop_root")
+    assert library.native_object_joint_names == ("hinge_b", "hinge_a")
+    np.testing.assert_array_equal(library.native_object_part_state_w, native["object_part_state_w"][1:])
+    np.testing.assert_array_equal(library.native_object_part_pose_support[:, 2], (False, True))
+    assert not library.native_object_part_linear_velocity_support[:, 2].any()
+    np.testing.assert_array_equal(library.native_time_ns, native["time_ns"][1:])
+    np.testing.assert_array_equal(library.source_query_ordinal[0], (3., 5.))
+    assert library.obj_trans == {} and library.contact_flags == {}
 
 
 def test_native_boundary_rejects_clock_row_support_and_actual_joint_identity_mismatch(tmp_path):

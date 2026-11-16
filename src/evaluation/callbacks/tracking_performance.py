@@ -502,11 +502,11 @@ class NativeArticulatedTrackingPerformance:
             "root_position_error_m": (tuple(command._side_list), "root_pose_support"),
             "root_rotation_error_rad": (tuple(command._side_list), "root_pose_support"),
             "part_position_error_m": (
-                tuple(p.name for p in command.native_layout.object.parts),
+                tuple(f"{obj.entity_name}/{p.name}" for obj, p in command.native_layout.part_bindings),
                 "part_pose_support",
             ),
             "part_rotation_error_rad": (
-                tuple(p.name for p in command.native_layout.object.parts),
+                tuple(f"{obj.entity_name}/{p.name}" for obj, p in command.native_layout.part_bindings),
                 "part_pose_support",
             ),
             "joint_position_error_rad": (

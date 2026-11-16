@@ -29,10 +29,11 @@ from simulator.native.scene import NativeScene, NativeSim
 
 
 def _layout():
+    obj = SimpleNamespace(entity_name="assembly", parts=[
+        SimpleNamespace(name=name, body_name=name + "_body") for name in ("fixture", "cover", "latch")])
     return SimpleNamespace(
         hands=[SimpleNamespace(side=side, root_body_name=side + "_mount") for side in ("port", "starboard")],
-        object=SimpleNamespace(entity_name="assembly", parts=[
-            SimpleNamespace(name=name, body_name=name + "_body") for name in ("fixture", "cover", "latch")]),
+        objects=(obj,), part_bindings=tuple((obj, part) for part in obj.parts),
     )
 
 
@@ -48,8 +49,8 @@ class _Plant(NativePlant):
         self.dt, self.slot, self.fail = 0.005, 0, False
         self.q, self.v = torch.zeros(2, 1), torch.zeros(2, 1)
         self._init_buffers(self.model, self.num_envs, self.device, {
-            f"{hand.side}/{part.name}": ([], [])
-            for hand in self.layout.hands for part in self.layout.object.parts
+            f"{hand.side}/{obj.entity_name}/{part.name}": ([], [])
+            for hand in self.layout.hands for obj, part in self.layout.part_bindings
         })
 
     def advance(self):
@@ -153,11 +154,11 @@ def test_every_configured_substep_is_stopped_and_storage_is_bounded(substeps):
         begin = sim.plant.physics_time()
         sim.step()
         clocks.append((begin, sim.plant.physics_time()))
-        forces.append(sim.plant.contact_facts["port/fixture"]["normal_force_n"].detach().clone())
+        forces.append(sim.plant.contact_facts["port/assembly/fixture"]["normal_force_n"].detach().clone())
     sim.end_control_step()
     torch.testing.assert_close(interval.sample_begin_time_s, torch.stack([row[0] for row in clocks], 1), rtol=0, atol=0)
     torch.testing.assert_close(interval.sample_end_time_s, torch.stack([row[1] for row in clocks], 1), rtol=0, atol=0)
-    torch.testing.assert_close(interval.pairs["port/fixture"]["normal_force_n"], torch.stack(forces, 1), rtol=0, atol=0)
+    torch.testing.assert_close(interval.pairs["port/assembly/fixture"]["normal_force_n"], torch.stack(forces, 1), rtol=0, atol=0)
     assert interval.interval_complete.all()
     if substeps > 1:
         assert not interval.measurement_support[1, 1] and interval.sample_recorded[1, 1]
@@ -172,13 +173,13 @@ def test_every_configured_substep_is_stopped_and_storage_is_bounded(substeps):
 def test_partial_reset_state_write_and_stopped_interval_discard_old_samples():
     sim, _scene = _sim()
     _advance_control(sim, 3)
-    old_other_row = sim.plant.contact_interval.pairs["port/fixture"]["normal_force_n"][1].clone()
+    old_other_row = sim.plant.contact_interval.pairs["port/assembly/fixture"]["normal_force_n"][1].clone()
     sim.reset(torch.tensor([0]))
     interval = sim.plant.contact_interval
     assert not interval.sample_recorded[0].any() and not interval.interval_complete[0]
     assert torch.isnan(interval.sample_begin_time_s[0]).all()
-    assert torch.isnan(interval.pairs["port/fixture"]["normal_force_n"][0]).all()
-    torch.testing.assert_close(interval.pairs["port/fixture"]["normal_force_n"][1], old_other_row)
+    assert torch.isnan(interval.pairs["port/assembly/fixture"]["normal_force_n"][0]).all()
+    torch.testing.assert_close(interval.pairs["port/assembly/fixture"]["normal_force_n"][1], old_other_row)
     sim.begin_control_step()
     sim.step()
     sim.plant.fail = True
@@ -333,7 +334,7 @@ def test_measurement_callback_and_current_report_use_all_samples_and_real_denomi
     assert state["qualified_sample_count"][:, 0].tolist() == [1, 1]
     assert state["qualified_duration_s"][:, 0].tolist() == pytest.approx([0.005, 0.005], abs=1e-12)
     assert state["supported_duration_s"][:, 0].tolist() == pytest.approx([0.015, 0.01], abs=1e-12)
-    assert scene.hand_part_contact_facts()["pairs"]["port/fixture"]["normal_force_n"].tolist() == pytest.approx([0.4, 0.4])
+    assert scene.hand_part_contact_facts()["pairs"]["port/assembly/fixture"]["normal_force_n"].tolist() == pytest.approx([0.4, 0.4])
     output = write_current_policy_outcomes(SimpleNamespace(), env,
         OmegaConf.create({"command_name": "motion", "num_per_motion": 1}),
         [callback], {id(callback): [state]}, callback.reduce_state([state]),
