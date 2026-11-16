@@ -108,6 +108,60 @@ def _feed_input_extension_agent(agent):
         })
 
 
+def test_actor_input_extension_preserves_equal_named_layout_with_fresh_learning_owners(tmp_path, monkeypatch):
+    parent, old_info = _input_extension_agent()
+    with torch.no_grad():
+        for tower in parent._alg.actor.sides:
+            norm = tower.embedder.norm
+            norm.weight.copy_(torch.linspace(.6, 1.3, norm.weight.numel()))
+            norm.bias.copy_(torch.linspace(-.2, .15, norm.bias.numel()))
+            norm.running_mean.copy_(torch.linspace(-.3, .4, norm.running_mean.numel()))
+            norm.running_var.copy_(torch.linspace(.5, 1.5, norm.running_var.numel()))
+    checkpoint = tmp_path / "parent-checkpoint"
+    parent.save(str(checkpoint))
+    parent_run = tmp_path / "parent-run"
+    _input_extension_config(parent, old_info, parent_run)
+    child, same_info = _input_extension_agent()
+    child_run = tmp_path / "child-run"
+    _input_extension_config(child, same_info, child_run)
+    fresh = deepcopy(child._alg.save())
+
+    authority = child.initialize_actor_input_extension(
+        str(checkpoint), str(parent_run / "config.yaml"), str(child_run / "config.yaml"),
+    )
+    after = child._alg.save()
+    _tree_equal(after["actor_state_dict"], parent._alg.actor.state_dict())
+    for key in fresh.keys() - {"actor_state_dict"}:
+        _tree_equal(after[key], fresh[key])
+    assert authority["added_flat_terms"] == [] and authority["actor_only"]
+    assert not authority["renormalized_at_initialization"]
+    assert child._alg.replay_buffer._num_in_buffer == 0
+    assert not child._alg.replay_buffer._n_step_transitions
+    assert not child._alg.actor_optimizer.state and not child._alg.critic_optimizer.state
+    assert child._alg._last_obs is child._alg._last_actions is child._alg._cached_noise is None
+    observations = torch.linspace(-.9, 1.1, 5 * parent._layout.full_dim).reshape(5, -1)
+    for actual, expected in zip(child._alg.actor.get_mean_and_std(observations, training=False),
+                                parent._alg.actor.get_mean_and_std(observations, training=False), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(torch.from_numpy(child.act(observations, deterministic=True)),
+                               torch.from_numpy(parent.act(observations, deterministic=True)), rtol=0, atol=0)
+
+    # Equal total width does not admit removal or resizing of an existing named feature.
+    monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: pytest.fail("check names before model read"))
+    for mismatch in ("removed", "resized"):
+        invalid, info = _input_extension_agent()
+        info["obs_terms"][0] = ["actor", "replacement", 3] if mismatch == "removed" else ["actor", "robot_joint_pos", 2]
+        if mismatch == "resized":
+            info["obs_terms"][1] = ["actor", "robot_joint_vel", 4]
+        invalid._obs_terms = info["obs_terms"]
+        invalid_run = tmp_path / mismatch
+        _input_extension_config(invalid, info, invalid_run)
+        with pytest.raises(ValueError, match="cannot remove or resize named feature"):
+            invalid.initialize_actor_input_extension(
+                str(checkpoint), str(parent_run / "config.yaml"), str(invalid_run / "config.yaml"),
+            )
+
+
 @pytest.mark.parametrize("encoded", [False, True])
 def test_actor_input_extension_preserves_named_actor_and_learns_new_columns(tmp_path, encoded):
     parent, old_info = _input_extension_agent(encoded=encoded)

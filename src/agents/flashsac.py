@@ -519,7 +519,7 @@ class FlashSACAgent(Agent):
     def initialize_actor_input_extension(
         self, path: str, parent_config_path: str, current_config_path: str,
     ) -> dict[str, Any]:
-        """Initialize a new native observation layout from its named mature actor only.
+        """Initialize a native actor by retained named inputs, optionally adding features.
 
         Both configurations are ordinary resolved train.py outputs. This is not
         FULL restore: every non-actor owner keeps its newly constructed state.
@@ -577,8 +577,8 @@ class FlashSACAgent(Agent):
             raise ValueError("actor input extension requires unchanged named future window terms")
         if new_width + sum(width for _, width in self._encoded_layout) != self._layout.full_dim:
             raise ValueError("named observations disagree with the constructed actor input")
-        if new_width <= old_width:
-            raise ValueError("actor input extension requires added named flat features")
+        if new_width < old_width:
+            raise ValueError("actor input extension cannot reduce named flat input width")
         indices = []
         for key, (_, width) in old_columns.items():
             if key not in new_columns or new_columns[key][1] != width:
