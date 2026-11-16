@@ -29,7 +29,98 @@ def _source_geometry_mean(value, support, metadata, side):
     return len(_SIDES) * own / count
 
 
+def _source_intent_mean(value, required, metadata, side):
+    """Keep one source-required-hand mass under the existing side split."""
+    count = required.sum(-1).clamp_min(1)
+    value = torch.where(required, value, 0.0)
+    if side is None:
+        return value.sum(-1) / count
+    if side not in metadata["hand_sides"]:
+        return torch.zeros_like(count, dtype=value.dtype)
+    index = metadata["hand_sides"].index(side)
+    return len(_SIDES) * value[:, index] / count
+
+
 class NativeMotionTrackingRewards(MotionTrackingRewards):
+    @staticmethod
+    def native_source_hand_part_proximity(env, command_name, distance_scale_m, side=None):
+        """Source-intended surface approach; SDF proximity is never solved contact."""
+        if not math.isfinite(distance_scale_m) or distance_scale_m <= 0:
+            raise ValueError("source hand-part proximity requires a positive finite distance scale")
+        command = env.command_manager.get_term(command_name)
+        intent = command.source_hand_part_intent_facts()
+        geometry = command.source_tip_geometry_facts()
+        if intent is None or geometry is None:
+            return torch.zeros(env.num_envs, device=env.device)
+        metadata, points = intent["metadata"], geometry["metadata"]
+        execution = intent["execution_valid"] & geometry["execution_valid"]
+        for key in ("reference_motion_ids", "reference_motion_steps", "reference_time_ns"):
+            execution &= intent[key] == geometry[key]
+        active = intent["active"] & intent["known"]
+        required = active.any(-1) & execution[:, None]
+        parts = [points["part_body_names"].index(name) for name in metadata["part_body_names"]]
+        values = []
+        for hand, name in enumerate(metadata["hand_sides"]):
+            index = points["hand_sides"].index(name)
+            begin, end = points["hand_offsets"][index:index + 2]
+            if begin == end:
+                values.append(torch.zeros(env.num_envs, device=env.device))
+                continue
+            distance = geometry["live_part_distance_m"][:, begin:end, parts]
+            support = (geometry["live_part_query_support"][:, begin:end, parts]
+                       & geometry["achieved_position_support"][:, begin:end, None]
+                       & geometry["live_part_pose_support"][:, None, parts]
+                       & active[:, hand, None] & execution[:, None, None]
+                       & torch.isfinite(distance))
+            closest = torch.where(support, distance.abs(), float("inf")).flatten(1).amin(-1)
+            values.append(torch.exp(-closest / distance_scale_m))
+        return _source_intent_mean(torch.stack(values, -1), required, metadata, side)
+
+    @staticmethod
+    def native_source_hand_part_contact(
+        env, command_name, force_scale_n, separation_bound_m, side=None
+    ):
+        """Bounded solved-force credit on installed source candidates, not a task score."""
+        if (not math.isfinite(force_scale_n) or force_scale_n <= 0
+                or not math.isfinite(separation_bound_m) or separation_bound_m < 0):
+            raise ValueError("source hand-part contact requires a positive force scale and nonnegative separation bound")
+        command = env.command_manager.get_term(command_name)
+        intent = command.source_hand_part_intent_facts()
+        interval = env.scene.hand_part_contact_interval_facts()
+        if intent is None or interval is None:
+            return torch.zeros(env.num_envs, device=env.device)
+        active = intent["active"] & intent["known"]
+        required = active.any(-1) & intent["execution_valid"][:, None]
+        # The manager finishes this interval before reward and resets afterwards.
+        endpoint = interval["sample_end_time_s"][:, -1] == env.scene.physics_time_s()
+        valid = (interval["sample_recorded"] & interval["clock_support"]
+                 & interval["interval_complete"][:, None] & endpoint[:, None]
+                 & intent["execution_valid"][:, None])
+        duration = torch.where(valid, interval["sample_end_time_s"] - interval["sample_begin_time_s"], 0.0)
+        total = duration.sum(-1, keepdim=True)
+        weights = duration / torch.where(total > 0, total, torch.ones_like(total))
+        addresses = {(row["hand_side"], row["hand_body_name"], row["part_entity_name"], row["part_body_name"]): name
+                     for name, row in interval["addresses"].items()}
+        hands = {hand.side: hand.root_body_name for hand in command.native_layout.hands}
+        values = []
+        for hand, name in enumerate(intent["metadata"]["hand_sides"]):
+            credit = torch.zeros_like(duration, dtype=torch.float32)
+            for part, body in enumerate(intent["metadata"]["part_body_names"]):
+                address = (name, hands[name], command.native_layout.object.entity_name, body)
+                if address not in addresses:
+                    continue  # No measurement for this actual pair; no contact credit.
+                pair = interval["pairs"][addresses[address]]
+                force, present, distance = (pair[key] for key in (
+                    "normal_force_n", "force_bearing_contact_present", "force_bearing_distance_max_m"))
+                known = (valid & interval["measurement_support"] & torch.isfinite(force)
+                         & (force >= 0) & (~present | (torch.isfinite(distance) & (distance >= 0))))
+                eligible = (known & present & (distance <= separation_bound_m)
+                            & active[:, hand, part, None])
+                bounded = (torch.where(known, force, 0.0) / force_scale_n).clamp(0.0, 1.0)
+                credit = torch.maximum(credit, torch.where(eligible, bounded, 0.0))
+            values.append((credit * weights.to(credit.dtype)).sum(-1))
+        return _source_intent_mean(torch.stack(values, -1), required, intent["metadata"], side)
+
     @staticmethod
     def native_source_tip_position(env, command_name, scale, side=None):
         """Supported source-tip position mechanism, not a target-Q/BC label."""

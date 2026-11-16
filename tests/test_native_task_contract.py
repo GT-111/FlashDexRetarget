@@ -1560,3 +1560,232 @@ def test_native_scalar_velocity_limits_use_object_and_hand_coordinate_units():
             check(env, "motion", **{**params, "joint_m_per_s": invalid})
     _, hinge_env, _ = _command()
     assert not bool(check(hinge_env, "motion", **{**params, "joint_m_per_s": None}).any())
+
+
+def _source_intent_reward_case(widths=(("right", 3), ("left", 5))):
+    """Real command/fact owners with renamed synthetic parts and uneven sites."""
+    from dataclasses import replace
+
+    command, env, installed, _ = _source_geometry_command(widths)
+    names = ("housing_panel", "rotating_leaf")
+    original = command.native_layout.object
+    command.native_layout = replace(command.native_layout, object=replace(
+        original, entity_name="renamed_item", root_body_name=names[0], parts=tuple(
+            replace(part, name=f"surface_{i}", body_name=name)
+            for i, (part, name) in enumerate(zip(original.parts, names, strict=True)))))
+    env.scene["renamed_item"] = env.scene.pop("object")
+    env.scene["renamed_item"].body_names = list(names)
+    ml = command.motion_lib
+    ml.native_object_entity_name, ml.native_object_part_body_names = "renamed_item", names
+    command._bind_native_reference()
+    ml.hand_sides = tuple(command._side_list)
+    shape = (3, len(widths), len(names))
+    active = torch.zeros(shape, dtype=torch.bool)
+    for hand in range(len(widths)):
+        active[0, hand, 1 - hand % 2] = True
+        active[1, hand, hand % 2] = True
+    ml.native_source_hand_part_intent = dict(active=active, known=torch.ones_like(active))
+    for key in ("query_time_ns", "capture_time_ns", "available_time_ns"):
+        ml.native_source_hand_part_intent[key] = ml.native_time_ns.clone()
+    ml.native_source_hand_part_intent["valid_until_time_ns"] = ml.native_time_ns + 20_000_000
+    for key in ("source_frame_index", "canonical_frame_index"):
+        ml.native_source_hand_part_intent[key] = torch.arange(3, dtype=torch.int64)
+    ml.native_source_hand_part_intent_provenance = [{"authority": "synthetic geometric intent, not source force"}]
+    geometry = command.source_tip_geometry_facts()
+    geometry["live_part_distance_m"][:] = 0.0  # Irrelevant candidate minima must be ignored.
+    geometry["live_part_query_support"][:] = False
+    for hand, side in enumerate(command._side_list):
+        begin = geometry["metadata"]["hand_offsets"][hand]
+        geometry["live_part_query_support"][0, begin, hand % 2] = True
+        geometry["live_part_distance_m"][0, begin, hand % 2] = .01 * (hand + 1)
+    addresses, pairs = {}, {}
+    for hand, binding in enumerate(command.native_layout.hands):
+        for part, name in enumerate(names):
+            key = f"arbitrary-{part}-{hand}"
+            addresses[key] = dict(hand_side=binding.side, hand_body_name=binding.root_body_name,
+                part_entity_name="renamed_item", part_body_name=name)
+            force = (.25, 10.) if hand == 0 else (1., 1.)
+            distance = (.01, .01) if hand == 0 else (.01, .03)
+            pairs[key] = dict(normal_force_n=torch.tensor([force]),
+                force_bearing_contact_present=torch.ones(1, 2, dtype=torch.bool),
+                force_bearing_distance_max_m=torch.tensor([distance]))
+    addresses["unrelated"] = dict(hand_side=command._side_list[0], hand_body_name="other_root",
+        part_entity_name="other_item", part_body_name=names[0])
+    pairs["unrelated"] = dict(normal_force_n=torch.full((1, 2), 1e6),
+        force_bearing_contact_present=torch.ones(1, 2, dtype=torch.bool),
+        force_bearing_distance_max_m=torch.zeros(1, 2))
+    interval = dict(addresses=addresses, pairs=dict(reversed(tuple(pairs.items()))),
+        sample_recorded=torch.ones(1, 2, dtype=torch.bool),
+        measurement_support=torch.ones(1, 2, dtype=torch.bool),
+        clock_support=torch.ones(1, 2, dtype=torch.bool), interval_complete=torch.ones(1, dtype=torch.bool),
+        sample_begin_time_s=torch.tensor([[0., .005]], dtype=torch.float64),
+        sample_end_time_s=torch.tensor([[.005, .02]], dtype=torch.float64))
+    env.scene.physics_time_s = lambda: torch.tensor([.02], dtype=torch.float64)
+    env.scene.hand_part_contact_interval_facts = lambda: interval
+    return command, env, installed, geometry, interval
+
+
+@pytest.mark.parametrize("widths", [(("right", 3), ("left", 5)), (("right", 2),)],
+                         ids=["unequal-bilateral", "right-only"])
+def test_source_intent_rewards_use_named_candidates_and_preserve_split_mass(widths):
+    from mjlab.managers import RewardManager
+    from omegaconf import OmegaConf
+
+    from envs import build_rewards
+
+    defaults = Path(__file__).resolve().parents[1] / "config"
+    native = OmegaConf.load(defaults / "envs/native.yaml")
+    actions = OmegaConf.load(defaults / "envs/actions/native.yaml")["actions"]
+    assert "native_source_hand_part_contact" not in native.rewards.reward_weights
+    assert "native_source_hand_part_proximity" not in native.rewards.reward_weights
+    assert actions.finger_residual_rad is None and actions.cutoff_hz.finger is None
+    assert actions.translation_residual_m == .1 and actions.rotation_residual_rad == 1.
+    command, env, _, geometry, interval = _source_intent_reward_case(widths)
+    expected_proximity = torch.exp(-torch.arange(1, len(widths) + 1, dtype=torch.float32)).mean()[None]
+    expected_contact = torch.tensor([.5625 if len(widths) == 2 else .875])
+    for name, params, expected in (
+        ("native_source_hand_part_proximity", dict(distance_scale_m=.01), expected_proximity),
+        ("native_source_hand_part_contact", dict(force_scale_n=.5, separation_bound_m=.02), expected_contact),
+    ):
+        torch.testing.assert_close(getattr(NativeMotionTrackingRewards, name)(env, "motion", **params), expected)
+        recipe = dict(_target_="envs.rewards.native.NativeMotionTrackingRewards",
+            reward_weights={name: .3}, reward_params={name: params})
+        whole = RewardManager(build_rewards(OmegaConf.create(recipe)), env).compute(env.step_dt).clone()
+        recipe["split_sides"] = True
+        split = RewardManager(build_rewards(OmegaConf.create(recipe)), env).compute(env.step_dt).clone()
+        torch.testing.assert_close(split, whole)
+    # Force above the physical scale cannot buy additional credit.
+    key = next(key for key, address in interval["addresses"].items()
+               if address["hand_side"] == command._side_list[0] and address["part_body_name"] == "housing_panel")
+    interval["pairs"][key]["normal_force_n"][0, 1] = 1e6
+    torch.testing.assert_close(NativeMotionTrackingRewards.native_source_hand_part_contact(env, "motion", .5, .02), expected_contact)
+    # Proximity to a non-candidate part and unrelated named-pair force are not credit.
+    assert geometry["live_part_distance_m"].min().item() == 0.
+    assert interval["pairs"]["unrelated"]["normal_force_n"].max().item() == 1e6
+
+
+def test_source_intent_reward_unavailable_stale_and_measured_absence_stay_distinct():
+    command, env, installed, geometry, interval = _source_intent_reward_case()
+    contact = NativeMotionTrackingRewards.native_source_hand_part_contact
+    proximity = NativeMotionTrackingRewards.native_source_hand_part_proximity
+    interval["measurement_support"][:] = False
+    assert contact(env, "motion", .5, .02).item() == 0.
+    assert not interval["measurement_support"].any()  # Reward did not fabricate a known zero sample.
+    interval["measurement_support"][:] = True
+    for pair in interval["pairs"].values():
+        pair["normal_force_n"].zero_()
+        pair["force_bearing_contact_present"].zero_()
+        pair["force_bearing_distance_max_m"][:] = float("nan")
+    assert contact(env, "motion", .5, .02).item() == 0.
+    assert interval["measurement_support"].all()  # Same credit, different factual authority.
+    for pair in interval["pairs"].values():
+        pair["normal_force_n"].fill_(1.)
+        pair["force_bearing_contact_present"].fill_(True)
+        pair["force_bearing_distance_max_m"].fill_(.01)
+    assert contact(env, "motion", .5, .02).item() == 1.
+    interval["sample_end_time_s"][0, -1] = .04
+    assert contact(env, "motion", .5, .02).item() == 0.
+    interval["sample_end_time_s"][0, -1] = .02
+    interval["interval_complete"][:] = False
+    assert contact(env, "motion", .5, .02).item() == 0.
+    interval["interval_complete"][:] = True
+    assert proximity(env, "motion", .01).item() > 0.
+    geometry["reference_motion_steps"] = geometry["reference_motion_steps"] + 1
+    assert proximity(env, "motion", .01).item() == 0.
+    geometry["reference_motion_steps"] -= 1
+    installed["installed_valid"][:] = False
+    assert proximity(env, "motion", .01).item() == 0.
+    assert contact(env, "motion", .5, .02).item() == 0.
+    installed["installed_valid"][:] = True
+    command.motion_lib.native_source_hand_part_intent["known"][:] = False
+    assert proximity(env, "motion", .01).item() == 0.
+    assert contact(env, "motion", .5, .02).item() == 0.
+    command.motion_lib.native_source_hand_part_intent = None
+    assert proximity(env, "motion", .01).item() == 0.
+    assert contact(env, "motion", .5, .02).item() == 0.
+    command.motion_lib.native_source_point_position_support = None
+    env.scene.hand_part_contact_interval_facts = lambda: None
+    assert proximity(env, "motion", .01).item() == 0.
+    assert contact(env, "motion", .5, .02).item() == 0.
+
+
+def test_source_intent_rewards_follow_real_manager_consumed_packet_and_reset():
+    from mjlab.managers import RewardManager
+    from omegaconf import OmegaConf
+
+    from envs import build_rewards
+    from simulator.env import ManagerBasedRlEnv
+    from simulator.native.contacts import ControlIntervalContacts
+
+    command, protocol, installed, _, prior = _source_intent_reward_case()
+    command._source_tip_geometry_cache = None
+    command.cfg.object.entity_names = {side: "renamed_item" for side in command._side_list}
+    command._xfrc_curr_ctrl = None
+    command._eval_mode = True
+    command.cfg.resampling_time_range = (100., 100.)
+    command.time_left, command.command_counter = torch.full((1,), 100.), torch.zeros(1, dtype=torch.long)
+    env = object.__new__(ManagerBasedRlEnv)
+    env.scene, env._device = protocol.scene, "cpu"
+    env.scene.num_envs = 1
+    env.cfg = SimpleNamespace(decimation=2, physics_dt=.01, auto_reset=False)
+    env._sim_step_counter, env.common_step_counter = 0, 0
+    env._manual_reset_pending = torch.zeros(1, dtype=torch.bool)
+    env.episode_length_buf, env.extras = torch.zeros(1, dtype=torch.long), {}
+    command._env = env
+    env.command_manager = SimpleNamespace(get_term=lambda _name: command,
+        compute=lambda dt: command.compute(dt), compute_substep=lambda: None)
+    plant = SimpleNamespace(num_envs=1, device="cpu", contact_facts=prior["pairs"],
+        contact_support=torch.ones(1, dtype=torch.bool),
+        contact_sample_time_s=torch.zeros(1, dtype=torch.float64),
+        time=torch.zeros(1, dtype=torch.float64), execution_clock=lambda: None)
+    # The tape stores one solved sample per advance, not the fixture's two-sample arrays.
+    plant.contact_facts = {name: {key: value[:, 0].clone() for key, value in pair.items()}
+                           for name, pair in prior["pairs"].items()}
+    plant.physics_time = lambda: plant.time
+    tape = ControlIntervalContacts(plant, 2)
+    env.scene.hand_part_contact_interval_facts = lambda: {**tape.facts(), "addresses": prior["addresses"]}
+    env.scene.physics_time_s = plant.physics_time
+
+    def install():
+        installed["installed_valid"][:] = True
+        installed["reference_motion_ids"][:] = command.motion_ids
+        installed["reference_motion_steps"][:] = command.motion_steps
+
+    def advance():
+        plant.contact_sample_time_s = plant.time.clone()
+        plant.time += .01
+        command.robot.data.site_pos_w.add_(torch.tensor([.001, 0., 0.]))
+        tape.append(plant)
+
+    env.action_manager = protocol.action_manager
+    env.action_manager.process_action = lambda _action: None
+    env.action_manager.apply_action = install
+    env.sim = SimpleNamespace(begin_control_step=tape.begin, end_control_step=tape.finish,
+        step=advance, forward=lambda: None, sense=lambda: None)
+    env.scene.write_data_to_sim, env.scene.update = lambda: None, lambda dt: None
+    env.termination_manager = SimpleNamespace(compute=lambda: torch.zeros(1, dtype=torch.bool),
+        terminated=torch.zeros(1, dtype=torch.bool), time_outs=torch.zeros(1, dtype=torch.bool))
+    env.event_manager = SimpleNamespace(available_modes=())
+    recipe = OmegaConf.create(dict(_target_="envs.rewards.native.NativeMotionTrackingRewards",
+        reward_weights=dict(native_source_hand_part_proximity=.3, native_source_hand_part_contact=.3),
+        reward_params=dict(native_source_hand_part_proximity=dict(distance_scale_m=.01),
+                           native_source_hand_part_contact=dict(force_scale_n=.5, separation_bound_m=.02))))
+    env.reward_manager = RewardManager(build_rewards(recipe), env)
+    env.observation_manager = SimpleNamespace(compute=lambda update_history: {})
+    installed["installed_valid"][:] = False
+    assert NativeMotionTrackingRewards.native_source_hand_part_contact(env, "motion", .5, .02).item() == 0.
+    with patch.object(command, "sdf_query_parts", wraps=command.sdf_query_parts) as query:
+        _, reward, _, _, _ = env.step(torch.zeros(1, 1))
+        assert reward.item() > 0 and query.call_count == 2
+        facts = command.source_hand_part_intent_facts()
+        assert facts["reference_motion_steps"].tolist() == [1]
+        assert command.motion_steps.tolist() == [2]
+        assert not command.source_hand_part_intent(command._motion_flat_ids)["active"].any()
+        assert NativeMotionTrackingRewards.native_source_hand_part_contact(env, "motion", .5, .02).item() > 0.
+        assert query.call_count == 2
+    installed["installed_valid"][:] = False
+    tape.discard()
+    command.reset(torch.tensor([0]))
+    command.compute(0.)
+    assert NativeMotionTrackingRewards.native_source_hand_part_proximity(env, "motion", .01).item() == 0.
+    assert NativeMotionTrackingRewards.native_source_hand_part_contact(env, "motion", .5, .02).item() == 0.

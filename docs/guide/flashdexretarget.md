@@ -396,6 +396,53 @@ target force measurements. Source-specific adapters still own qualification and
 construction; this port does not add BOX phase extrema, infer new OakInk labels,
 install a contact reward or establish task/generalization success.
 
+### Optional source-intent interaction credit
+
+The existing reward builder can select `native_source_hand_part_proximity` and
+`native_source_hand_part_contact` through ordinary `reward_weights` and
+`reward_params`. Native defaults remain unchanged. These terms use the
+**installed** source-intent packet; they do not require adding the optional
+intent observation or changing the actor/critic graph.
+
+For each source-known required hand, proximity takes the closest supported
+achieved site to any of that hand's active candidate parts and returns
+`exp(-abs(surface_distance_m) / distance_scale_m)`. It retains the baked grid,
+pose and point-query support; it is geometric approach credit, not measured
+contact, penetration clearance or a guarantee of mesh coverage. Existing
+source-tip position and object-bound terms retain their separate meanings.
+
+Contact reads the completed native control interval, matched to the current
+solver endpoint. For each actual named hand/body and active candidate part,
+positive-force samples contribute `min(normal_force_n / force_scale_n, 1)` only
+when an actual force-bearing contact has supported separation no greater than
+`separation_bound_m`. The best candidate part is used for each hand/substep;
+substeps are weighted by their supported solver durations. Extra force above
+the configured physical scale earns no extra credit. Named addresses, not part
+ordinals or fixed asset names, bind the measurements.
+
+Both terms divide by the same source-known required-hand count, preserving the
+existing split-side reward mass. Missing/expired source cells, reset rows,
+missing site or pair measurements, incomplete/stale control intervals and
+unavailable pair-force backends contribute no credit. Factual source knowledge,
+query support and measured absence remain separate in the existing intent,
+geometry and contact recorder arrays; zero reward does not turn an unavailable
+sample into measured zero force. This endpoint-conditioned training credit is
+not the task layer's source-duration contact score or a task-success gate.
+
+A selected recipe supplies the positive `distance_scale_m` and `force_scale_n`,
+nonnegative `separation_bound_m`, and explicit weights. For example, a declared
+physical force scale is a reward saturation scale, not an author-paper result
+or proof that larger force is productive. Source adapters must provide original
+int64 capture/availability/cell-end clocks, masks and source provenance through
+the ordinary native carrier. Proximity-derived source intent must retain that
+label. The fork does not infer source force from achieved contact.
+
+Changed credit also changes replay reward targets. Ordinary compatible agent
+state can be warm initialized with an explicitly fresh replay/collector; old
+stored rewards must not be relabeled as if they contained the new credit.
+Training assistance/curriculum and evaluation's zero-assistance selection stay
+explicit. These methods establish no source feasibility or successful teacher.
+
 ### Installed dynamics and gravity
 
 The shared MJCF metadata loader requires a built-in scalar actuator roster:
