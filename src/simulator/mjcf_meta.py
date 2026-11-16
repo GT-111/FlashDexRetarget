@@ -40,6 +40,7 @@ class RobotMjcfMeta:
     xml_path: str
     body_names: list[str]  # MJCF order, world excluded
     joint_names: list[str]  # MJCF order == motion .pt column order
+    joint_types: list[str]  # Scalar chart: hinge (rad), slide (m), same order
     joint_range: np.ndarray  # (n_jnt, 2)
     joint_damping: np.ndarray  # (n_jnt,)
     joint_armature: np.ndarray  # (n_jnt,)
@@ -109,6 +110,7 @@ class RobotMjcfMeta:
             body_bound={n: v for n, v in self.body_bound.items() if n in bodies},
             sites={n: s for n, s in self.sites.items() if s.body_name in bodies},
             joint_names=joint_names,
+            joint_types=[self.joint_types[i] for i in ji],
             joint_body_names=[self.joint_body_names[i] for i in ji],
             joint_qpos_address=self.joint_qpos_address[ji],
             joint_dof_address=self.joint_dof_address[ji],
@@ -297,6 +299,10 @@ def load_robot_mjcf_meta(xml_path: str | Path) -> RobotMjcfMeta:
         xml_path=xml_path,
         body_names=body_names,
         joint_names=joint_names,
+        joint_types=[
+            "hinge" if m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE else "slide"
+            for j in scalar_joints
+        ],
         joint_range=m.jnt_range[scalar_joints].copy(),
         joint_damping=np.array([m.dof_damping[d] for d in dof]),
         joint_armature=np.array([m.dof_armature[d] for d in dof]),

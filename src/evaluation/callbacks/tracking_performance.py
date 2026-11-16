@@ -463,7 +463,7 @@ class TrackingPerformance:
 
 
 class NativeArticulatedTrackingPerformance:
-    """Supported registered-root/part/hinge errors, with bounded accumulators.
+    """Supported registered-root/part/typed scalar errors, with bounded accumulators.
 
     No rigid-side alias or mean-centred SPIDER score can certify an articulated
     task. This callback reports the actual fields and their support separately;
@@ -484,6 +484,20 @@ class NativeArticulatedTrackingPerformance:
         self.motion_start_steps = command.motion_steps.clone()
         self.rollout_steps = int(self.valid_steps.max())
         self.t = 0
+        coordinates = command.object_joint_coordinate_metadata
+        angular_names = tuple(name for name, unit in zip(
+            coordinates["joint_names"], coordinates["position_units"], strict=True,
+        ) if unit == "rad")
+        linear_names = tuple(name for name, unit in zip(
+            coordinates["joint_names"], coordinates["position_units"], strict=True,
+        ) if unit == "m")
+        commands = command.command_joint_coordinate_metadata
+        angular_commands = tuple(name for name, unit in zip(
+            commands["joint_names"], commands["position_units"], strict=True,
+        ) if unit == "rad")
+        linear_commands = tuple(name for name, unit in zip(
+            commands["joint_names"], commands["position_units"], strict=True,
+        ) if unit == "m")
         self.groups = {
             "root_position_error_m": (tuple(command._side_list), "root_pose_support"),
             "root_rotation_error_rad": (tuple(command._side_list), "root_pose_support"),
@@ -496,14 +510,22 @@ class NativeArticulatedTrackingPerformance:
                 "part_pose_support",
             ),
             "joint_position_error_rad": (
-                tuple(command.native_object.joint_names),
+                angular_names,
                 "joint_position_support",
             ),
             "command_position_error_rad": (
-                tuple(command.robot.joint_names[int(i)] for i in command.native_command_joint_ids),
+                angular_commands,
                 "command_position_support",
             ),
         }
+        if linear_names:
+            self.groups["joint_position_error_m"] = (
+                linear_names, "joint_linear_position_support",
+            )
+        if linear_commands:
+            self.groups["command_position_error_m"] = (
+                linear_commands, "command_linear_position_support",
+            )
         self.sums, self.maxima, self.masses = {}, {}, {}
         for key, (names, _) in self.groups.items():
             shape = (env.num_envs, len(names))
@@ -548,6 +570,8 @@ class NativeArticulatedTrackingPerformance:
             "metadata": {"meaning": "supported native reference errors; no contact/task success",
                          "grace_steps": self.grace_steps,
                          "feature_names": {key: names for key, (names, _) in self.groups.items()},
+                         "passive_joint_coordinates": self.cmd.object_joint_coordinate_metadata,
+                         "command_joint_coordinates": self.cmd.command_joint_coordinate_metadata,
                          "scored_basis": "at least one observed supported feature; measurement only"},
             "columns": {"motion_start_step": torch.cat([s["motion_start_steps"] for s in states]),
                         "remaining_source_steps": torch.cat([s["valid_steps"] for s in states]),
@@ -587,6 +611,12 @@ class NativeReferenceTrackingPerformance(NativeArticulatedTrackingPerformance):
 
     def on_start(self, env):
         super().on_start(env)
+        for key in ("joint_position_error_m", "command_position_error_m"):
+            if key not in self.groups:
+                continue
+            limit = self.thresholds.get(key)
+            if limit is None or not math.isfinite(limit) or limit < 0:
+                raise ValueError(f"native slide tracking requires finite nonnegative {key}")
         self.failed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         self.failed_object = torch.zeros_like(self.failed)
         self.missing = torch.zeros_like(self.failed)

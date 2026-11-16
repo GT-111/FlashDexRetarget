@@ -14,4 +14,6 @@ native_tracking_tolerances:
   part_position_error_m: ???
   part_rotation_error_rad: ???
   joint_position_error_rad: ???
+  joint_position_error_m: null  # Required only for assets with passive slide coordinates.
   command_position_error_rad: ???
+  command_position_error_m: null  # Required only for selected slide commands.

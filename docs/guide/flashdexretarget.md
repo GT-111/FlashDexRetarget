@@ -254,6 +254,10 @@ contact observations/measurement do not create contact credit or task success.
 This changes reward-head targets and requires its own declared learning condition;
 an unchanged FULL continuation must retain its original reward configuration.
 
+Native scalar coordinates retain the compiled MJCF joint type in actual named entity order: hinge positions/rates are radians and radians per second; slide positions/rates are metres and metres per second. Articulation reward `scale_rad`, angular velocity limit `joint_rad_per_s`, and tracking metrics/thresholds ending in `_rad` keep their hinge meaning and values. An object with passive slides must also supply finite `rewards.reward_params.native_object_articulation.scale_m` (positive) and `native_tracking_tolerances.joint_position_error_m` (nonnegative). Selected slide commands require finite, nonnegative `native_tracking_tolerances.command_position_error_m`. Any hand or object scalar slide also requires finite, nonnegative `terminations.native_velocity_diverged.params.joint_m_per_s`. Unused metre settings stay unset; passive and command error reports separate angular and linear columns with independent support.
+
+Recordings retain raw coordinate values and order. `object_joint_metadata_json` declares passive types and units; `installed_control_metadata_json.finger_joint_coordinates` declares the selected command types and units. Its position units also apply to the existing `installed_finger_target_rad` array and `action_recipe.finger_effective_limits_rad` values; those field names do not convert slide coordinates to radians. This is reference tracking, not an articulated-task or contact success criterion.
+
 **Run length and checkpoints** (`config/runner/base.yaml`)
 
 | key | default | meaning |

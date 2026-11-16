@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from mjlab.utils.lab_api.math import quat_error_magnitude
 
@@ -132,11 +134,16 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         return _supported_mean(value, support)
 
     @staticmethod
-    def native_object_articulation(env, command_name, scale_rad):
+    def native_object_articulation(env, command_name, scale_rad, scale_m=None):
         command = env.command_manager.get_term(command_name)
         ref = command.object_joint_reference()
         error = ref["position"] - command.native_object_joint_pos
-        return _supported_mean(
-            torch.exp(-error.square() / scale_rad**2),
-            ref["position_support"],
-        )
+        value = torch.empty_like(error)
+        for unit, scale in (("rad", scale_rad), ("m", scale_m)):
+            columns = command.object_joint_columns_by_unit[unit]
+            if columns.numel() == 0:
+                continue
+            if unit == "m" and (scale is None or not math.isfinite(scale) or scale <= 0):
+                raise ValueError("native articulation requires a finite positive scale_m for slide joints")
+            value[:, columns] = torch.exp(-error[:, columns].square() / scale**2)
+        return _supported_mean(value, ref["position_support"])

@@ -146,6 +146,7 @@ def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_co
     from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
     from envs.scene.native import NativeSceneCfg
     from retarget import kinematic_retargeting as pipeline
+    from simulator.native.entity import NamedArticulationView
 
     dataset, clip = _prepared_native_dataset(tmp_path)
     # A stale human-demo directory and an unselected carrier must not choose the route or population.
@@ -179,8 +180,13 @@ def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_co
             root_joint_name="synthetic_object_free", parts=[dict(name=body, body_name=body, mesh_path="synthetic.obj")
                 for body in native["object_part_body_names"]])))
     obj = SimpleNamespace(joint_names=("hinge_a", "hinge_b"), body_names=("base", "lid"))
+    robot = SimpleNamespace(joint_names=joint_names)
+    for entity in (obj, robot):
+        entity._meta = SimpleNamespace(joint_names=entity.joint_names,
+                                       joint_types=("hinge",) * len(entity.joint_names))
+        entity.joint_coordinate_metadata = NamedArticulationView.joint_coordinate_metadata.__get__(entity)
     command = object.__new__(NativeMotionTrackingCommand)
-    command.native_layout, command.motion_lib = layout, library
+    command.native_layout, command.motion_lib, command.robot = layout, library, robot
     command._env = SimpleNamespace(device="cpu", num_envs=1, step_dt=0.02,
         scene={native["object_entity_name"]: obj})
     command._finger_joint_ids = torch.tensor([0, 2])

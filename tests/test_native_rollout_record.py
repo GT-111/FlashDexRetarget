@@ -761,3 +761,56 @@ def test_source_tip_geometry_absent_modality_exports_no_invented_group(tmp_path)
     callback.on_start(env)
     arrays = callback.rollout_arrays([callback.collect_state()], 0)
     assert not any(key.startswith("source_tip_geometry_") for key in arrays)
+
+
+def test_native_mixed_passive_coordinates_roundtrip_raw_state_and_units(tmp_path):
+    from dexforge_adaptation.flashdex_retarget import (
+        flashdex_source_mapping,
+        load_flashdex_rollout,
+    )
+    from test_native_task_contract import _declare_joint_coordinates
+
+    source = flashdex_source_mapping(source_id="arctic", source_revision="synthetic", source_unit_id="fixture",
+        source_episode_index=0, fold="train", source_frame_index=(0, 1, 2),
+        source_time_ns=(0, 20_000_000, 40_000_000), selected_source_frame_index=(0, 1, 2),
+        prepared_source_ordinal=(0., 1., 2.), prepared_elapsed_time_ns=(0, 20_000_000, 40_000_000),
+        clock_authority="synthetic reference clock", processing={"fixture": True})
+    binding = dict(producer_identity={"method": "synthetic typed state serialization"},
+        scene_identity={"fixture": True}, scene_from_source_world=np.eye(4).tolist(),
+        assistance_receipt={"evaluation_external_wrenches_cleared": True, "evaluation_object_playback": False},
+        hands={side: dict(body_name=side + "_root", command_joint_names={"driver": side + "_driver"},
+                         physical_joint_names={"driver": side + "_driver"}) for side in ("left", "right")},
+        object_part_names=["proximal", "distal"], object_parts={name: dict(entity_name="object", body_name=body)
+            for name, body in (("proximal", "object_root"), ("distal", "object_lid"))}, clips={"fixture": source})
+
+    def setup(env, command):
+        _declare_joint_coordinates(command.native_object, ("slide", "hinge"))
+        _declare_joint_coordinates(command.robot, ("slide", "hinge", "hinge"))
+        command._bind_native_reference()
+        # A type does not rename, convert, or reorder observed coordinates.
+        command.native_object.data.joint_pos[:] = torch.tensor([[.023, -.4]])
+
+    manifest = record_reference_phase_fixture(tmp_path, binding, native=True, setup_scene=setup)
+    recorded = load_flashdex_rollout(manifest, motion_id=0)
+    metadata = recorded.object_joint_metadata
+    assert metadata["entity_name"] == "object"
+    assert metadata["joint_names"] == ["hinge_a", "hinge_b"]
+    assert metadata["joint_types"] == ["slide", "hinge"]
+    assert metadata["position_units"] == ["m", "rad"]
+    assert metadata["velocity_units"] == ["m/s", "rad/s"]
+    assert "observed simulator scalar state" in metadata["authority"]
+    commands = recorded.installed_control_metadata["finger_joint_coordinates"]
+    assert commands["joint_names"] == ["left_driver", "right_driver"]
+    assert commands["joint_types"] == ["slide", "hinge"]
+    assert commands["position_units"] == ["m", "rad"]
+    assert commands["velocity_units"] == ["m/s", "rad/s"]
+    np.testing.assert_array_equal(recorded.arrays["installed_finger_target_rad"],
+                                  np.array([[0., 0.], [1., 1.], [1., 1.]], np.float32))
+    assert recorded.installed_control_metadata["action_recipe"]["finger_effective_limits_rad"] == [[-1., 1.], [-1., 1.]]
+    expected = torch.tensor([[.023, -.4]]).repeat(3, 1).numpy()
+    np.testing.assert_array_equal(recorded.arrays["object_joint_pos"], expected)
+    np.testing.assert_array_equal(recorded.arrays["object_joint_vel"],
+                                  np.array([[0., 0.], [1.5, 1.5], [2.5, 2.5]], np.float32))
+    assert recorded.arrays["object_joint_pos"].dtype == np.float32
+    assert recorded.arrays["object_joint_position_support"].dtype == bool
+    np.testing.assert_array_equal(recorded.arrays["recorded_motion_steps"], [0, 1, 2])

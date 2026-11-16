@@ -157,6 +157,18 @@ class ArticulationData:
 class NamedArticulationView:
     """Names, derived sites and data views independent of the simulation engine."""
 
+    def joint_coordinate_metadata(self):
+        """Compiled scalar types and SI units in this entity's named order."""
+        columns = [self._meta.joint_names.index(name) for name in self.joint_names]
+        types = tuple(self._meta.joint_types[column] for column in columns)
+        position_units = tuple({"hinge": "rad", "slide": "m"}[kind] for kind in types)
+        return {
+            "joint_names": tuple(self.joint_names),
+            "joint_types": types,
+            "position_units": position_units,
+            "velocity_units": tuple(unit + "/s" for unit in position_units),
+        }
+
     def find_sites(self, names, preserve_order: bool = False):
         from mjlab.utils.lab_api.string import resolve_matching_names
 

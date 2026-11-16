@@ -58,6 +58,26 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             [ml.native_object_joint_names.index(name) for name in names],
             device=self.device, dtype=torch.long,
         )
+        self.object_joint_coordinate_metadata = self.native_object.joint_coordinate_metadata()
+        self.robot_joint_coordinate_metadata = self.robot.joint_coordinate_metadata()
+        command_columns = self.native_command_joint_ids.tolist()
+        self.command_joint_coordinate_metadata = {
+            key: tuple(values[i] for i in command_columns)
+            for key, values in self.robot_joint_coordinate_metadata.items()
+        }
+
+        def unit_columns(metadata):
+            return {
+                unit: torch.tensor(
+                    [i for i, actual in enumerate(metadata["position_units"]) if actual == unit],
+                    device=self.device, dtype=torch.long,
+                )
+                for unit in ("rad", "m")
+            }
+
+        self.object_joint_columns_by_unit = unit_columns(self.object_joint_coordinate_metadata)
+        self.robot_joint_columns_by_unit = unit_columns(self.robot_joint_coordinate_metadata)
+        self.command_joint_columns_by_unit = unit_columns(self.command_joint_coordinate_metadata)
         self._part_body_ids = [self.native_object.body_names.index(p.body_name)
                                for p in self.native_layout.object.parts]
         period_ns = float(self._env.step_dt) * 1e9
@@ -107,6 +127,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         ids = self._motion_flat_ids if ids is None else ids
         ml, columns = self.motion_lib, self.native_command_joint_ids
         return {
+            **self.command_joint_coordinate_metadata,
             "position": ml.robot_joint_pos[ids][..., columns],
             "velocity": ml.robot_joint_vel[ids][..., columns],
             "position_support": ml.native_joint_position_support[ids][..., columns],
@@ -118,6 +139,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         ids = self._motion_flat_ids if ids is None else ids
         ml, columns = self.motion_lib, self._object_joint_columns
         return {
+            **self.object_joint_coordinate_metadata,
             "position": ml.native_object_joint_pos[ids][..., columns],
             "velocity": ml.native_object_joint_vel[ids][..., columns],
             "position_support": ml.native_object_joint_position_support[ids][..., columns],
@@ -414,6 +436,14 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         )
         parts, part_ref = self.sim_object_part_state_w, self.ref_object_part_state_w
         object_ref, command_ref = self.object_joint_reference(), self.command_reference()
+        angular = self.object_joint_columns_by_unit["rad"]
+        linear = self.object_joint_columns_by_unit["m"]
+        joint_error = (object_ref["position"] - self.native_object_joint_pos).abs()
+        command_error = (
+            command_ref["position"] - self.robot.data.joint_pos[:, self.native_command_joint_ids]
+        ).abs()
+        command_angular = self.command_joint_columns_by_unit["rad"]
+        command_linear = self.command_joint_columns_by_unit["m"]
         part_p = (part_ref[..., :3] - parts[..., :3]).norm(dim=-1)
         part_support = ml.native_object_part_pose_support[ids]
         self.metrics["native_root_position_error_m"] = (
@@ -432,14 +462,14 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                 part_ref[..., 3:7], parts[..., 3:7]
             ),
             "part_pose_support": part_support,
-            "joint_position_error_rad": (
-                object_ref["position"] - self.native_object_joint_pos
-            ).abs(),
-            "joint_position_support": object_ref["position_support"],
-            "command_position_error_rad": (
-                command_ref["position"] - self.robot.data.joint_pos[:, self.native_command_joint_ids]
-            ).abs(),
-            "command_position_support": command_ref["position_support"],
+            "joint_position_error_rad": joint_error[:, angular],
+            "joint_position_support": object_ref["position_support"][:, angular],
+            "joint_position_error_m": joint_error[:, linear],
+            "joint_linear_position_support": object_ref["position_support"][:, linear],
+            "command_position_error_rad": command_error[:, command_angular],
+            "command_position_support": command_ref["position_support"][:, command_angular],
+            "command_position_error_m": command_error[:, command_linear],
+            "command_linear_position_support": command_ref["position_support"][:, command_linear],
         }
 
     def _resample_command(self, env_ids):

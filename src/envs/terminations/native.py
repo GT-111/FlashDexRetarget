@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from mjlab.utils.lab_api.math import quat_error_magnitude
 
@@ -56,20 +58,26 @@ class NativeMotionTrackingTerminations(MotionTrackingTerminations):
 
     @staticmethod
     def native_velocity_diverged(
-        env, command_name, linear_m_per_s, angular_rad_per_s, joint_rad_per_s
+        env, command_name, linear_m_per_s, angular_rad_per_s, joint_rad_per_s,
+        joint_m_per_s=None,
     ):
         command = env.command_manager.get_term(command_name)
         parts = command.sim_object_part_state_w
         linear = torch.cat([command.robot_wrist_lin_vel_w, parts[..., 7:10]], 1)
         angular = torch.cat([command.robot_wrist_ang_vel_w, parts[..., 10:13]], 1)
-        joints = torch.cat(
-            [command.robot.data.joint_vel, command.native_object_joint_vel], -1
-        )
-        return (
+        bad = (
             (linear.norm(dim=-1) > linear_m_per_s).any(-1)
             | (angular.norm(dim=-1) > angular_rad_per_s).any(-1)
-            | (joints.abs() > joint_rad_per_s).any(-1)
         )
+        for unit, limit in (("rad", joint_rad_per_s), ("m", joint_m_per_s)):
+            robot = command.robot.data.joint_vel[:, command.robot_joint_columns_by_unit[unit]]
+            obj = command.native_object_joint_vel[:, command.object_joint_columns_by_unit[unit]]
+            if robot.shape[-1] + obj.shape[-1] == 0:
+                continue
+            if unit == "m" and (limit is None or not math.isfinite(limit) or limit < 0):
+                raise ValueError("native slide velocity requires a finite nonnegative joint_m_per_s")
+            bad |= (robot.abs() > limit).any(-1) | (obj.abs() > limit).any(-1)
+        return bad
 
     @staticmethod
     def native_state_nonfinite(env, command_name):

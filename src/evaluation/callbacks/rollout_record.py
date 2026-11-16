@@ -244,8 +244,11 @@ class NativeRolloutRecord(RolloutRecord):
         self.object_joint_metadata = None
         if hasattr(self.cmd, "native_object"):
             self.object_joint_metadata = dict(entity_name=self.cmd.native_layout.object.entity_name,
-                joint_names=list(self.cmd.native_object.joint_names),
+                **self.cmd.object_joint_coordinate_metadata,
                 authority="observed simulator scalar state; independent from reference support")
+            if self.installed_metadata is not None:
+                # Target/limit arrays retain raw scalar SI values despite their field names.
+                self.installed_metadata["finger_joint_coordinates"] = self.cmd.command_joint_coordinate_metadata
         self._object_assist_reader = getattr(self.cmd, "object_assist_facts", None)
         self.object_assist_metadata = None
         if self._object_assist_reader is not None:

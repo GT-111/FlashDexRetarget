@@ -18,9 +18,16 @@ from simulator.isaacsim.commands_isaac import (
     IsaacMotionTrackingCommand,
 )
 from simulator.isaacsim.entity import FreeArticulationAdapter
+from simulator.native.entity import NamedArticulationView
 
 
-def _command(*, rigid=False):
+def _declare_joint_coordinates(entity, kinds):
+    """Declare the compiled scalar chart bypassed by a synthetic entity."""
+    entity._meta = SimpleNamespace(joint_names=list(entity.joint_names), joint_types=list(kinds))
+    entity.joint_coordinate_metadata = NamedArticulationView.joint_coordinate_metadata.__get__(entity)
+
+
+def _command(*, rigid=False, passive_types=None, hand_types=None):
     """Explicit synthetic source and physical-state protocol, never native-data qualification."""
 
     def states(count):
@@ -72,6 +79,7 @@ def _command(*, rigid=False):
     if not rigid:
         object_q[:] = torch.tensor([0.2, 0.1])
     ml = SimpleNamespace(
+        native_source_point_position_support=None,
         native_time_ns=torch.tensor(
             [1_000_000_000, 1_020_000_000, 1_040_000_000], dtype=torch.int64
         ),
@@ -156,6 +164,8 @@ def _command(*, rigid=False):
             ("hand_joints", q.clone(), v.clone())
         ),
     )
+    _declare_joint_coordinates(obj, ("hinge",) * len(object_joints) if passive_types is None else passive_types)
+    _declare_joint_coordinates(robot, ("hinge",) * len(robot.joint_names) if hand_types is None else hand_types)
 
     class Scene(dict):
         env_origins = torch.zeros(1, 3)
@@ -679,6 +689,8 @@ def _configured_native_runner(tmp_path, monkeypatch, command_name):
         data=SimpleNamespace(joint_pos=torch.zeros(1, 2), joint_vel=torch.zeros(1, 2),
             body_link_pos_w=object_state[..., :3], body_link_quat_w=object_state[..., 3:7],
             body_link_lin_vel_w=object_state[..., 7:10], body_link_ang_vel_w=object_state[..., 10:13]))
+    _declare_joint_coordinates(obj, ("hinge",) * len(obj.joint_names))
+    _declare_joint_coordinates(robot, ("hinge",) * len(robot.joint_names))
 
     class Scene(dict):
         env_origins = torch.zeros(1, 3)
@@ -1407,3 +1419,143 @@ def test_native_source_geometry_reward_split_conserves_supported_mass(widths):
         command.native_layout.object, parts=(parts[0], replace(parts[1], distance_sign="winding"))))
     with pytest.raises(ValueError, match="compatible part distance signs"):
         NativeMotionTrackingRewards.native_source_tip_object_bound(env, "motion", sigma)
+
+
+def test_native_mixed_passive_reward_and_tracking_keep_dimensional_columns():
+    from mjlab.managers import RewardManager
+    from omegaconf import OmegaConf
+
+    from envs import build_rewards
+
+    command, env, _ = _command(passive_types=("slide", "hinge"),
+                                hand_types=("slide", "hinge", "hinge"))
+    command.motion_steps.fill_(1)
+    reference = command.object_joint_reference()
+    assert reference["joint_names"] == ("hinge_a", "hinge_b")
+    assert reference["joint_types"] == ("slide", "hinge")
+    assert reference["position_units"] == ("m", "rad")
+    # The prepared columns are reversed relative to the physical entity.
+    torch.testing.assert_close(reference["position"], torch.tensor([[.1, .2]]))
+    command.native_object.data.joint_pos += torch.tensor([[.02, .05]])
+    command.motion_lib.robot_joint_pos[1] = torch.tensor([.03, .8, .4])
+    command.robot.data.joint_pos[0] = torch.tensor([.05, -.2, .45])
+    command_ref = command.command_reference()
+    assert command_ref["joint_names"] == ("left_driver", "right_driver")
+    assert command_ref["joint_types"] == ("slide", "hinge")
+    assert command_ref["position_units"] == ("m", "rad")
+    torch.testing.assert_close(command_ref["position"], torch.tensor([[.03, .4]]))
+    recipe = OmegaConf.create(dict(
+        _target_="envs.rewards.native.NativeMotionTrackingRewards", split_sides=True,
+        shared_terms=["native_object_articulation"],
+        reward_weights=dict(native_object_articulation=.3),
+        reward_params=dict(native_object_articulation=dict(scale_rad=.1, scale_m=.04)),
+    ))
+    manager = RewardManager(build_rewards(recipe), env)
+    error = reference["position"] - command.native_object_joint_pos
+    expected = (torch.exp(-error[:, 0].square() / .04**2)
+                + torch.exp(-error[:, 1].square() / .1**2)) / 2
+    torch.testing.assert_close(manager.compute(dt=1.), expected * .3)
+    with pytest.raises(ValueError, match="scale_m"):
+        NativeMotionTrackingRewards.native_object_articulation(env, "motion", .1)
+    for invalid in (float("nan"), float("inf"), 0.):
+        with pytest.raises(ValueError, match="scale_m"):
+            NativeMotionTrackingRewards.native_object_articulation(env, "motion", .1, invalid)
+
+    thresholds = dict(root_position_error_m=.1, root_rotation_error_rad=.1,
+        part_position_error_m=.1, part_rotation_error_rad=.1,
+        joint_position_error_rad=.1, joint_position_error_m=.01,
+        command_position_error_rad=.1, command_position_error_m=.03)
+    command._update_metrics()
+    torch.testing.assert_close(command.native_step_metrics["command_position_error_rad"], torch.tensor([[.05]]))
+    torch.testing.assert_close(command.native_step_metrics["command_position_error_m"], torch.tensor([[.02]]))
+    callback = NativeReferenceTrackingPerformance("motion", thresholds)
+    callback.on_start(env)
+    callback.on_step(env)
+    raw = callback.current_policy_outcomes([callback.collect_state()])
+    assert raw["metadata"]["feature_names"]["joint_position_error_rad"] == ("hinge_b",)
+    assert raw["metadata"]["feature_names"]["joint_position_error_m"] == ("hinge_a",)
+    assert raw["metadata"]["passive_joint_coordinates"]["velocity_units"] == ("m/s", "rad/s")
+    assert raw["metadata"]["feature_names"]["command_position_error_rad"] == ("right_driver",)
+    assert raw["metadata"]["feature_names"]["command_position_error_m"] == ("left_driver",)
+    assert raw["metadata"]["command_joint_coordinates"]["velocity_units"] == ("m/s", "rad/s")
+    assert raw["columns"]["masses"]["joint_position_error_rad"].tolist() == [[1]]
+    assert raw["columns"]["masses"]["joint_position_error_m"].tolist() == [[1]]
+    assert raw["columns"]["masses"]["command_position_error_rad"].tolist() == [[1]]
+    assert raw["columns"]["masses"]["command_position_error_m"].tolist() == [[1]]
+    assert bool(callback.per_env_fail_obj([callback.collect_state()]).all())  # Passive metre bound only.
+    with pytest.raises(ValueError, match="joint_position_error_m"):
+        NativeReferenceTrackingPerformance("motion", {**thresholds, "joint_position_error_m": None}).on_start(env)
+    for invalid in (None, float("nan"), float("inf"), -1.):
+        with pytest.raises(ValueError, match="command_position_error_m"):
+            NativeReferenceTrackingPerformance("motion", {**thresholds, "command_position_error_m": invalid}).on_start(env)
+    command_only = NativeReferenceTrackingPerformance("motion", {
+        **thresholds, "joint_position_error_m": .03, "command_position_error_m": .01})
+    command_only.on_start(env)
+    command_only.on_step(env)
+    assert bool(command_only.per_env_fail([command_only.collect_state()]).all())
+    assert not bool(command_only.per_env_fail_obj([command_only.collect_state()]).any())
+
+    # Missing source support never adds a metre observation or a passing attempt.
+    column = command.motion_lib.native_object_joint_names.index("hinge_a")
+    command.motion_lib.native_object_joint_position_support[1, column] = False
+    command._update_metrics()
+    callback.on_start(env)
+    callback.on_step(env)
+    raw = callback.current_policy_outcomes([callback.collect_state()])
+    assert raw["columns"]["masses"]["joint_position_error_m"].tolist() == [[0]]
+    assert not bool(callback.per_env_scored([callback.collect_state()]).any())
+    torch.testing.assert_close(NativeMotionTrackingRewards.native_object_articulation(env, "motion", .1, .04),
+                               torch.exp(-error[:, 1].square() / .1**2))
+    command.motion_lib.native_object_joint_position_support[1, column] = True
+    command.motion_lib.native_joint_position_support[1, 0] = False
+    command._update_metrics()
+    callback.on_start(env)
+    callback.on_step(env)
+    raw = callback.current_policy_outcomes([callback.collect_state()])
+    assert raw["columns"]["masses"]["command_position_error_m"].tolist() == [[0]]
+    assert raw["columns"]["masses"]["command_position_error_rad"].tolist() == [[1]]
+    assert not bool(callback.per_env_scored([callback.collect_state()]).any())
+
+    # The existing hinge-only formula and empty rigid reduction stay exact.
+    hinge, hinge_env, _ = _command()
+    hinge.native_object.data.joint_pos += torch.tensor([[.031, .087]])
+    ref = hinge.object_joint_reference()
+    old = torch.exp(-(ref["position"] - hinge.native_object_joint_pos).square() / .1**2).mean(-1)
+    assert torch.equal(NativeMotionTrackingRewards.native_object_articulation(hinge_env, "motion", .1), old)
+    hinge._update_metrics()
+    command_error = (hinge.command_reference()["position"]
+                     - hinge.robot.data.joint_pos[:, hinge.native_command_joint_ids]).abs()
+    assert torch.equal(hinge.native_step_metrics["command_position_error_rad"], command_error)
+    assert hinge.native_step_metrics["command_position_error_m"].shape == (1, 0)
+    rigid, rigid_env, _ = _command(rigid=True)
+    assert NativeMotionTrackingRewards.native_object_articulation(rigid_env, "motion", .1).tolist() == [0.]
+    rigid._update_metrics()
+    callback.on_start(rigid_env)
+    assert callback.groups["joint_position_error_rad"][0] == ()
+    assert "joint_position_error_m" not in callback.groups
+    assert "command_position_error_m" not in callback.groups
+
+
+def test_native_scalar_velocity_limits_use_object_and_hand_coordinate_units():
+    command, env, _ = _command(passive_types=("slide", "hinge"),
+                                hand_types=("hinge", "slide", "hinge"))
+    params = dict(linear_m_per_s=100., angular_rad_per_s=200., joint_rad_per_s=.05, joint_m_per_s=.5)
+    check = NativeMotionTrackingTerminations.native_velocity_diverged
+    command.native_object.data.joint_vel[0, 0] = .4
+    command.robot.data.joint_vel[0, 1] = .4
+    assert not bool(check(env, "motion", **params).any())  # Metres are not checked as radians.
+    for values, column, speed in ((command.native_object.data.joint_vel, 1, .06),
+                                  (command.native_object.data.joint_vel, 0, .6),
+                                  (command.robot.data.joint_vel, 0, .06),
+                                  (command.robot.data.joint_vel, 1, .6)):
+        before = values[0, column].clone()
+        values[0, column] = speed
+        assert bool(check(env, "motion", **params).all())
+        values[0, column] = before
+    with pytest.raises(ValueError, match="joint_m_per_s"):
+        check(env, "motion", **{**params, "joint_m_per_s": None})
+    for invalid in (float("nan"), float("inf"), -1.):
+        with pytest.raises(ValueError, match="joint_m_per_s"):
+            check(env, "motion", **{**params, "joint_m_per_s": invalid})
+    _, hinge_env, _ = _command()
+    assert not bool(check(hinge_env, "motion", **{**params, "joint_m_per_s": None}).any())

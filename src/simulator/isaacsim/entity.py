@@ -341,6 +341,13 @@ class RigidObjectAdapter:
 
     is_fixed_base = False
 
+    def joint_coordinate_metadata(self):
+        """A physical rigid body has no scalar joint coordinates."""
+        return {
+            "joint_names": (), "joint_types": (),
+            "position_units": (), "velocity_units": (),
+        }
+
     def __init__(
         self,
         obj: "RigidObject",

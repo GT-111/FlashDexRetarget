@@ -87,7 +87,7 @@ rewards:
   reward_params:
     native_root_pose: {position_scale_m: 0.1, rotation_scale_rad: 0.3333333333333333}
     native_object_part_pose: {position_scale_m: 0.1, rotation_scale_rad: 0.3333333333333333}
-    native_object_articulation: {scale_rad: 0.1}
+    native_object_articulation: {scale_rad: 0.1, scale_m: null}
 
 terminations:
   _target_: envs.terminations.native.NativeMotionTrackingTerminations
@@ -103,5 +103,5 @@ terminations:
       part_rotation_rad: 1.5707963267948966
       grace_steps: 15
   native_velocity_diverged:
-    params: {linear_m_per_s: 100.0, angular_rad_per_s: 200.0, joint_rad_per_s: 200.0}
+    params: {linear_m_per_s: 100.0, angular_rad_per_s: 200.0, joint_rad_per_s: 200.0, joint_m_per_s: null}
   native_state_nonfinite: {}

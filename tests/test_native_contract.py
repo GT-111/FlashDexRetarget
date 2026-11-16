@@ -909,3 +909,42 @@ if __name__ == "__main__":
     print(
         f"{len(cases)} passed; no FK, dynamics steps or Isaac application", flush=True
     )
+
+
+def test_native_scalar_coordinate_metadata_preserves_compiled_type_and_named_order(tmp_path):
+    from simulator.isaacsim.entity import RigidObjectAdapter
+    from simulator.native.entity import NamedArticulationView
+
+    source = tmp_path / "mixed-coordinates.xml"
+    source.write_text("""<mujoco><compiler angle="degree"/>
+      <worldbody><body name="assembly"><freejoint name="root"/>
+        <geom type="sphere" size=".02" mass=".1"/>
+        <body name="carriage"><joint name="translation" type="slide" range="-.1 .2"/>
+          <geom type="sphere" size=".01" mass=".02"/>
+          <body name="flap"><joint name="rotation" type="hinge" range="-90 90"/>
+            <geom type="sphere" size=".01" mass=".01"/>
+          </body>
+        </body>
+      </body></worldbody></mujoco>""")
+    meta = load_robot_mjcf_meta(source)
+    assert meta.joint_names == ["translation", "rotation"]
+    assert meta.joint_types == ["slide", "hinge"]
+    np.testing.assert_allclose(meta.joint_range, [[-.1, .2], [-np.pi / 2, np.pi / 2]])
+    part = meta.subtree("carriage")
+    assert part.joint_names == meta.joint_names and part.joint_types == meta.joint_types
+    leaf = meta.subtree("flap")
+    assert leaf.joint_names == ["rotation"] and leaf.joint_types == ["hinge"]
+    entity = object.__new__(NamedArticulationView)
+    entity._meta, entity.joint_names = meta, ["rotation", "translation"]
+    assert entity.joint_coordinate_metadata() == {
+        "joint_names": ("rotation", "translation"),
+        "joint_types": ("hinge", "slide"),
+        "position_units": ("rad", "m"),
+        "velocity_units": ("rad/s", "m/s"),
+    }
+    rigid = object.__new__(RigidObjectAdapter)
+    rigid.joint_names = ()  # Actual public rigid owner, without constructing PhysX.
+    assert rigid.joint_coordinate_metadata() == {
+        "joint_names": (), "joint_types": (),
+        "position_units": (), "velocity_units": (),
+    }
