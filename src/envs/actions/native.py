@@ -190,6 +190,21 @@ class NativeResidualAction(ActionTerm):
         return torch.stack((self._lower, self._upper), -1)
 
     @property
+    def wrist_control_state(self) -> dict:
+        """Effective prior filter coordinates in the configured hand order."""
+        coordinates = torch.cat((
+            self._filter_state[:, self._translation_slice].reshape(self.num_envs, -1, 3),
+            self._filter_state[:, self._rotation_slice].reshape(self.num_envs, -1, 3),
+        ), -1)
+        # A pending first action overwrites obsolete carry, even after partial reset.
+        return {
+            "hand_sides": self.hand_sides,
+            "filtered_coordinates": torch.where(
+                self._filter_pending[:, None, None], 0., coordinates).detach(),
+            "filter_pending": self._filter_pending.detach(),
+        }
+
+    @property
     def installed_control(self) -> dict:
         """Accepted targets, separate from raw SAC outputs and source authority."""
         return {

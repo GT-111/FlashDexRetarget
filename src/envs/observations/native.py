@@ -160,6 +160,13 @@ def build_native_future_reference(
 
 class NativeMotionTrackingObs(MotionTrackingObs):
     @staticmethod
+    def native_wrist_control_state(env):
+        """Prior processed wrist coordinates and pending reset, independent of source support."""
+        state = action_term(env).wrist_control_state
+        return torch.cat((state["filtered_coordinates"].flatten(1),
+                          state["filter_pending"][:, None].float()), -1)
+
+    @staticmethod
     def native_source_hand_part_intent(env, command_name):
         """Current decision's active values and independent knowledge masks."""
         command = env.command_manager.get_term(command_name)

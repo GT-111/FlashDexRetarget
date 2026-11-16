@@ -174,6 +174,21 @@ describe geometry queries, not measured contact or task success.
 
 The optional native source-geometry observation `native_source_tip_reference_error` exposes current supported observed source-tip errors in the actual physical wrist axes, followed by their masks. Select it for both actor and critic through the existing observation config. Point counts and source/site names come from the admitted library and physical registrations; registered target-root support or target FK cannot supply source-point support. Old carriers without the named independent mask cannot enable these consumers.
 
+The optional native observation `native_wrist_control_state` exposes the prior
+filtered wrist action coordinates: translation XYZ then rotation-vector XYZ
+for each hand in the action's configured `hand_sides` order, followed by one
+`filter_pending` bit per world. These are processed action-chart values, before
+the physical residual scales, not achieved poses or source facts. Pending reset
+overwrites the old filter on the next action, so its effective carry is zero.
+Otherwise the carry remains available even when the current source root is
+unsupported. Select this term in both `obs.obs_dict.actor_obs` and
+`obs.obs_dict.critic_obs` through the ordinary observation configuration; it is
+absent from the default recipe. The action's public `wrist_control_state`
+accessor supplies the same detached coordinates, pending state and hand order.
+This changes the selected actor/critic input graph and needs an explicit new
+condition initializer; a strict old FULL cannot silently acquire the inputs.
+It does not change filtering, installed targets, physics, reward or assistance.
+
 The optional native rewards `native_source_tip_position` (`reward_scales.<name>: scale`, inverse meters) and `native_source_tip_object_bound` (`reward_params.<name>.sigma_m`, meters) adapt the official source-tip position and object-proximity mechanisms. They use the action's consumed reference IDs/steps at the achieved endpoint, while the observation uses the current decision cursor. They are absent from the default recipe. Split-side values share the full supported denominator and conserve the existing two half-weight terms, including unilateral/no-support cases. This is environmental scalar reward, not replay-action actor BC or a new gradient into the reference producer.
 
 The object-bound adaptation queries desired and live named-part SDFs and takes both minima over the same compatible supported part subset. A point with no common admitted part has unavailable reward mass. Domain masks certify only finite samples inside the configured baked grid. They do not certify full source-mesh coverage, signed penetration, force/contact, source engagement or task success; mixed declared distance-sign unions reject. This articulated-SDF adaptation is not a claim of numerical equivalence to the stock visual-vertex reference distance. The ordinary recorder may retain the same detached endpoint operands through `source_tip_geometry_facts`, independently of success.

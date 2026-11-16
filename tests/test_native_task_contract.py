@@ -1206,6 +1206,83 @@ def _source_geometry_observations(env):
     return ObservationManager(build_observations(recipe, command_name="motion"), env)
 
 
+def _wrist_control_case(widths=(("left", 5), ("right", 5))):
+    """Real action/observation owners over fixed synthetic source/physical facts."""
+    from dataclasses import asdict
+
+    from mjlab.utils.lab_api.string import resolve_matching_names
+
+    from envs.actions.native import NativeResidualAction, NativeResidualActionCfg
+
+    command, env, _, _ = _source_geometry_command(widths)
+    robot = command.robot
+    robot.data.joint_pos_target = torch.zeros_like(robot.data.joint_pos)
+    robot.data.site_lin_vel_w = torch.zeros_like(robot.data.site_pos_w)
+    robot.num_joints = len(robot.joint_names)
+    robot.find_joints = lambda names, preserve_order=False: resolve_matching_names(
+        names, robot.joint_names, preserve_order=preserve_order)
+    joint_ids = {"left": 0, "right": 2}
+    actuators = {name: joint_ids[hand.side] for hand in command.native_layout.hands
+                 for name in hand.command_actuator_names}
+    robot.native_command_limits = lambda names: torch.tensor([[0., 1.]] * len(names))
+    robot.find_joints_by_actuator_names = lambda names: (
+        [actuators[name] for name in names], [robot.joint_names[actuators[name]] for name in names])
+    robot.set_joint_position_target = lambda value, ids: robot.data.joint_pos_target.__setitem__(
+        (slice(None), ids), value)
+    for hand in command.native_layout.hands:
+        robot.hands[hand.side].apply_root_pose_target = lambda target, support, control: (
+            torch.zeros_like(target[:, :3]), torch.zeros_like(target[:, :3]))
+    action = NativeResidualAction(NativeResidualActionCfg(
+        entity_name="robot", command_name="motion", native_scene=asdict(command.native_layout),
+        translation_residual_m=.1, rotation_residual_rad=1.,
+        cutoff_hz={"wrist_trans": 5., "wrist_rot": 5.}, clip={".*": (-1., 1.)}), env)
+    command._finger_joint_ids = action._finger_ids.clone()
+    env.action_manager = SimpleNamespace(_terms={"configured_action": action})
+    return command, env, action
+
+
+@pytest.mark.parametrize("widths", [(("right", 3), ("left", 5)), (("left", 3),)],
+                         ids=["right-left", "left-only"])
+def test_native_wrist_control_observation_retains_named_carry_and_ignores_obsolete_reset(widths):
+    from mjlab.managers import ObservationManager
+    from omegaconf import OmegaConf
+
+    from envs import build_observations
+
+    command, env, action = _wrist_control_case(widths)
+    recipe = OmegaConf.create(dict(_target_="envs.observations.native.NativeMotionTrackingObs",
+        obs_dict=dict(actor_obs=["native_wrist_control_state"],
+                      critic_obs=["native_wrist_control_state"])))
+    manager = ObservationManager(build_observations(recipe), env)
+    raw = torch.linspace(-.7, .7, action.action_dim)[None]
+    action.process_actions(raw)
+    state = action.wrist_control_state
+    roots = len(widths)
+    expected = torch.cat((raw[:, :3 * roots].reshape(1, roots, 3),
+                          raw[:, 3 * roots:6 * roots].reshape(1, roots, 3)), -1)
+    assert state["hand_sides"] == tuple(side for side, _ in widths)
+    torch.testing.assert_close(state["filtered_coordinates"], expected, rtol=0, atol=0)
+    observed = manager.compute(update_history=True)
+    assert observed["actor"].shape == (1, 6 * roots + 1)
+    torch.testing.assert_close(observed["actor"], observed["critic"], rtol=0, atol=0)
+    torch.testing.assert_close(observed["actor"][:, :-1], expected.flatten(1), rtol=0, atol=0)
+    assert observed["actor"][0, -1] == 0 and not observed["actor"].requires_grad
+    for side, _ in widths:
+        command.motion_lib.native_root_pose_support[side][:] = False
+    torch.testing.assert_close(manager.compute(update_history=True)["actor"], observed["actor"], rtol=0, atol=0)
+    old_filter = action.capture_control_context().filter_state
+    action.reset(torch.tensor([0]))
+    reset = manager.compute(update_history=True)
+    torch.testing.assert_close(reset["actor"][:, :-1], torch.zeros_like(observed["actor"][:, :-1]), rtol=0, atol=0)
+    assert reset["actor"][0, -1] == 1
+    torch.testing.assert_close(action.capture_control_context().filter_state, old_filter, rtol=0, atol=0)
+    action.process_actions(-raw)
+    torch.testing.assert_close(action.wrist_control_state["filtered_coordinates"], -expected, rtol=0, atol=0)
+    assert not action.wrist_control_state["filter_pending"].any()
+    default = OmegaConf.load(Path(__file__).resolve().parents[1] / "config/envs/native.yaml")
+    assert all("native_wrist_control_state" not in values for values in default.obs.obs_dict.values())
+
+
 @pytest.mark.parametrize("widths", [(("right", 3), ("left", 5)), (("left", 3),)],
                          ids=["bilateral-3-5", "left-only-3"])
 def test_native_source_tip_decision_observation_has_named_independent_support(widths):
