@@ -354,6 +354,36 @@ unavailable. Derived target-force evidence does not replace original
 ARCTIC/OakInk source-contact support. Source roles, missing spans, phase
 durations and full-horizon outcomes retain their separate source/task authority.
 
+### Initial native control contexts
+
+`ManagerBasedRlEnv.capture_initial_control_context()` captures a committed
+all-world reset boundary before the first control interval.
+`restore_initial_control_context(context)` restores that context in the same
+environment instance and configuration without resetting, resampling the source
+or advancing physics. The context includes the NativePlant integration and
+contact state, scene targets, pending native state installation, action LPF and
+three-action history, installed goals and support, current command cursor and
+consumed reference phase, manager buffers/counters and global RNG state.
+Restoration invalidates cached physical/reference readouts; it does not reinstall
+a target over the restored plant control.
+
+This interface requires native action and command owners with paused assistance
+curriculum and inactive manager metrics/recorders. Nonempty observation history
+or delay, stateful observation/reward/reset/termination terms, running step or
+interval events, and non-NativePlant backends reject explicitly. It provides no
+arbitrary mid-interval, cross-instance or Isaac state restoration. Static assets,
+model weights and configuration stay with their existing owners.
+
+The manager's action space contains shape metadata, not a sampler. Its context
+captures global Python, NumPy and Torch generators through
+`capture_rng_state(None)`. A caller that owns a real Gym action-space sampler
+must capture it separately with `capture_rng_state(action_space)` and restore it
+last through `restore_rng_state`; the supplied-sampler helper behavior is
+unchanged. Evaluation callbacks and recording remain caller-owned. An exact
+repeated action sequence is the required physical repeatability check before
+interpreting a declared control intervention; the software context contract
+alone establishes no task success.
+
 ### Optional source hand/part intent
 
 An explicit `native_reference.source_hand_part_intent` carries desired source

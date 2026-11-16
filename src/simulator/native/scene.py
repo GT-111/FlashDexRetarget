@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,7 +20,21 @@ from .entity import (
     _Cached,
     _FreshnessClock,
 )
-from .plant import free_root_velocity_to_native, root_drive_indices, root_origin_wrench
+from .plant import NativePlantSnapshot, free_root_velocity_to_native, root_drive_indices, root_origin_wrench
+
+
+@dataclass
+class NativeSimControlContext:
+    """Same-plant integration plus an uncommitted authored reset, if present."""
+
+    plant: NativePlantSnapshot
+    pending: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+
+
+@dataclass
+class NativeSceneControlContext:
+    simulation: NativeSimControlContext
+    joint_position_targets: dict[str, torch.Tensor]
 
 
 class NativeArticulation(FloatingRootView, NamedArticulationView):
@@ -166,6 +181,26 @@ class NativeSim:
         self._clock = _FreshnessClock()
         self._pending = None
 
+    def capture_control_context(self) -> NativeSimControlContext:
+        """Capture outside a control interval; assets and model remain borrowed.
+
+        Plant restore deliberately discards executed interval evidence. This
+        context is used at the initial reset boundary, not to replay an interval.
+        """
+        if self.plant.contact_interval is not None and self.plant.contact_interval._active:
+            raise RuntimeError("native control context requires a closed control interval")
+        return NativeSimControlContext(
+            self.plant.snapshot(),
+            None if self._pending is None else tuple(value.clone() for value in self._pending),
+        )
+
+    def restore_control_context(self, context: NativeSimControlContext) -> None:
+        if self.plant.contact_interval is not None and self.plant.contact_interval._active:
+            raise RuntimeError("native control context requires a closed control interval")
+        self.plant.restore(context.plant)
+        self._pending = None if context.pending is None else tuple(value.clone() for value in context.pending)
+        self._clock.bump()  # Invalidate named kinematics; the token is not physics time.
+
     def begin_control_step(self):
         if self.plant.contact_interval is not None:
             self.plant.contact_interval.begin()
@@ -248,6 +283,19 @@ class NativeScene:
         }
         self.object_parts = {p.name: {"entity_name": layout.object.entity_name, "body_name": p.body_name}
                              for p in layout.object.parts}
+
+    def capture_control_context(self) -> NativeSceneControlContext:
+        return NativeSceneControlContext(
+            self.sim.capture_control_context(),
+            {binding.entity_name: self.entities[binding.entity_name]._joint_pos_target.clone()
+             for binding in self.native_layout.articulations},
+        )
+
+    def restore_control_context(self, context: NativeSceneControlContext) -> None:
+        self.sim.restore_control_context(context.simulation)
+        for name, target in context.joint_position_targets.items():
+            # Plant control is already restored; reinstalling would overwrite it.
+            self.entities[name]._joint_pos_target.copy_(target)
 
     def bind_tracking_command(self, command):
         # Native task geometry reads admitted references directly; actual pair

@@ -35,6 +35,26 @@ class NativeResidualActionCfg(ActionTermCfg):
         return NativeResidualAction(self, env)
 
 
+@dataclass
+class NativeActionControlContext:
+    raw_actions: torch.Tensor
+    processed_actions: torch.Tensor
+    filter_state: torch.Tensor
+    filter_pending: torch.Tensor
+    finger_target: torch.Tensor
+    finger_source_support: torch.Tensor
+    root_target: torch.Tensor
+    root_support: torch.Tensor
+    linear_support: torch.Tensor
+    angular_support: torch.Tensor
+    installed_valid: torch.Tensor
+    reference_motion_ids: torch.Tensor
+    reference_motion_steps: torch.Tensor
+    root_force: torch.Tensor
+    root_torque: torch.Tensor
+    reference_joint_position: torch.Tensor | None
+
+
 class NativeResidualAction(ActionTerm):
     """WORLD-left SE(3) root residuals plus independent native finger commands.
 
@@ -191,6 +211,24 @@ class NativeResidualAction(ActionTerm):
             "root_control": self._root_control_metadata,
             "action_recipe": self._action_recipe,
         }
+
+    def capture_control_context(self) -> NativeActionControlContext:
+        reference = getattr(self, "ref_joint_pos_used", None)
+        return NativeActionControlContext(
+            **{name: getattr(self, "_" + name).clone()
+               for name in NativeActionControlContext.__dataclass_fields__
+               if name != "reference_joint_position"},
+            reference_joint_position=None if reference is None else reference.clone(),
+        )
+
+    def restore_control_context(self, context: NativeActionControlContext) -> None:
+        for name, value in vars(context).items():
+            if name != "reference_joint_position":
+                getattr(self, "_" + name).copy_(value)
+        if context.reference_joint_position is None:
+            self.__dict__.pop("ref_joint_pos_used", None)
+        else:
+            self.ref_joint_pos_used = context.reference_joint_position.clone()
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions

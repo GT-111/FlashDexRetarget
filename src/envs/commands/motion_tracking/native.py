@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
@@ -11,6 +12,19 @@ from envs.scene.native import NativeSceneCfg
 
 from .motion_tracking import MotionTrackingCommand
 from .motion_tracking_cfg import MotionTrackingCommandCfg
+
+
+@dataclass
+class NativeCommandControlContext:
+    motion_ids: torch.Tensor
+    motion_steps: torch.Tensor
+    time_left: torch.Tensor
+    command_counter: torch.Tensor
+    reference_phase: dict[str, torch.Tensor] | None
+    metrics: dict[str, torch.Tensor]
+    native_step_metrics: dict[str, torch.Tensor] | None
+    object_state_version: int
+    assist_buffers: dict[str, torch.Tensor]
 
 
 class NativeMotionTrackingCommand(MotionTrackingCommand):
@@ -29,6 +43,40 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         super().__init__(cfg, env)
         self._bind_native_reference()
         self._init_native_object_assist()
+
+    def capture_control_context(self) -> NativeCommandControlContext:
+        """Native eval carry; no resampling, source queries or physics writes."""
+        if not self._eval_mode or self._xfrc_curr_ctrl is not None:
+            raise NotImplementedError("native control context requires paused eval curriculum")
+        return NativeCommandControlContext(
+            self.motion_ids.clone(), self.motion_steps.clone(), self.time_left.clone(),
+            self.command_counter.clone(), deepcopy(getattr(self, "reference_phase", None)),
+            deepcopy(self.metrics), deepcopy(getattr(self, "native_step_metrics", None)),
+            int(getattr(self, "_obj_state_version", 0)),
+            {name: value.clone() for name, value in vars(self).items()
+             if name.startswith("_assist_") and torch.is_tensor(value)},
+        )
+
+    def restore_control_context(self, context: NativeCommandControlContext) -> None:
+        if not self._eval_mode or self._xfrc_curr_ctrl is not None:
+            raise NotImplementedError("native control context requires paused eval curriculum")
+        for name in ("motion_ids", "motion_steps", "time_left", "command_counter"):
+            getattr(self, name).copy_(getattr(context, name))
+        self.metrics = deepcopy(context.metrics)
+        for name in ("reference_phase", "native_step_metrics"):
+            value = getattr(context, name)
+            if value is None:
+                self.__dict__.pop(name, None)
+            else:
+                setattr(self, name, deepcopy(value))
+        for name, value in context.assist_buffers.items():
+            getattr(self, name).copy_(value)
+        self._obj_state_version = context.object_state_version
+        # A rewound step/version can equal an old cache key. Derived reads must
+        # be invalidated rather than mistaken for restored operative state.
+        for name in ("_sim_obj_cache", "_sim_obj_cache_token_val",
+                     "_source_tip_geometry_cache", "_source_tip_geometry_token"):
+            self.__dict__.pop(name, None)
 
     @property
     def object_distance_sign(self) -> str:

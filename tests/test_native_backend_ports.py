@@ -543,3 +543,262 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
     metadata = json.loads(str(arrays["hand_part_contact_metadata_json"]))
     assert len(metadata["pairs"]) == 4 and "not original" in metadata["provenance"]
     assert json.loads(str(arrays["native_backend_metadata_json"]))["backend"] == "synthetic_port_protocol_not_physics"
+
+
+# Control-context cases use real native/manager owners with a synthetic plant.
+# They do not certify an SDK/GPU replay or integrate a physical MuJoCo scene.
+def _initial_control_case(tmp_path):
+    from mjlab.managers.action_manager import ActionManager
+    from mjlab.managers.command_manager import CommandManager
+    from mjlab.managers.event_manager import EventManager, EventTermCfg
+    from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationManager, ObservationTermCfg
+    from mjlab.managers.reward_manager import RewardManager, RewardTermCfg
+
+    from envs.actions.native import NativeResidualActionCfg
+    from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
+    from evaluation.shared import _NullTerminationManager
+    from simulator.env import ManagerBasedRlEnv, _NullManager
+
+    layout, mapping, model = _mechanics(tmp_path)
+
+    class ContextPlant(_ProtocolPlant):
+        def capture_physics(self):
+            return (*super().capture_physics(), self.effort.clone())
+
+        def restore_physics(self, state):
+            super().restore_physics(state[:3])
+            self.effort.copy_(state[3])
+
+        def body_state(self, body_ids):
+            # Explicit synthetic body facts, not FK or physical qualification.
+            shape = (2, len(body_ids))
+            position = self.q[:, None, :3].expand(*shape, 3).clone()
+            quaternion = torch.zeros(*shape, 4)
+            quaternion[..., 0] = 1
+            return position, quaternion, torch.zeros(*shape, 3), torch.zeros(*shape, 3)
+
+        def advance(self):
+            self.prepare_contact_substep()
+            self.contact_sample_time_s.copy_(self._time)
+            super().advance()
+            self.q[:, -1] += self.control[:, 0] * .01
+            self.effort[:, -1] = self.control[:, 0]
+            self.record_contact_substep()
+
+    plant = ContextPlant(model)
+    plant.configure_control_interval(4)
+    sim = NativeSim(plant)
+    scene = NativeScene(layout, load_robot_mjcf_meta(layout.scene_xml_path), sim, "robot")
+    env = object.__new__(ManagerBasedRlEnv)
+    env.scene, env.sim, env._device = scene, sim, "cpu"
+    env.cfg = SimpleNamespace(decimation=4, physics_dt=.005, auto_reset=False, episode_length_s=5.)
+    env._sim_step_counter = env.common_step_counter = 0
+    env.episode_length_buf = torch.zeros(2, dtype=torch.long)
+    env._manual_reset_pending = torch.zeros(2, dtype=torch.bool)
+    env.extras, env.obs_buf = {}, {}
+    env.metrics_manager = env.recorder_manager = env.curriculum_manager = _NullManager()
+    env.termination_manager = _NullTerminationManager(2, "cpu")
+    command = object.__new__(NativeMotionTrackingCommand)
+    command._env, command.native_layout, command.robot = env, layout, scene["robot"]
+    command._side_list = [hand.side for hand in layout.hands]
+    command._root_body_ids = [command.robot.body_names.index(hand.root_body_name) for hand in layout.hands]
+    ids, _ = command.robot.find_joints_by_actuator_names(tuple(a for hand in layout.hands for a in hand.command_actuator_names))
+    command._finger_joint_ids = torch.tensor(ids)
+    command._refn_enabled = False
+    command._eval_mode, command._park_inactive_on_ground = True, False
+    command.motion_ids = torch.zeros(2, dtype=torch.long)
+    command.motion_steps = torch.zeros(2, dtype=torch.long)
+    command.time_left = torch.zeros(2)
+    command.command_counter = torch.zeros(2, dtype=torch.long)
+    command.metrics = {}
+    roots = {hand.side: scene[hand.entity_name]._default_root_state[:1].repeat(3, 1) for hand in layout.hands}
+    parts = torch.zeros(3, len(layout.object.parts), 13)
+    parts[..., 3] = 1
+    command.motion_lib = SimpleNamespace(
+        num_trajectories=1, length_starts=torch.tensor([0]), _motion_num_frames=torch.tensor([3]),
+        native_time_ns=torch.arange(3, dtype=torch.int64) * 20_000_000,
+        robot_joint_pos=torch.zeros(3, command.robot.num_joints), robot_joint_vel=torch.zeros(3, command.robot.num_joints),
+        native_joint_position_support=torch.ones(3, command.robot.num_joints, dtype=torch.bool),
+        native_joint_velocity_support=torch.ones(3, command.robot.num_joints, dtype=torch.bool),
+        native_root_body_names={hand.side: hand.root_body_name for hand in layout.hands},
+        native_root_state_w=roots, native_root_pose_support={side: torch.ones(3, dtype=torch.bool) for side in roots},
+        native_root_linear_velocity_support={side: torch.ones(3, dtype=torch.bool) for side in roots},
+        native_root_angular_velocity_support={side: torch.ones(3, dtype=torch.bool) for side in roots},
+        native_object_entity_name=layout.object.entity_name,
+        native_object_part_body_names=tuple(part.body_name for part in layout.object.parts),
+        native_object_joint_names=tuple(scene[layout.object.entity_name].joint_names),
+        native_object_joint_pos=torch.zeros(3, scene[layout.object.entity_name].num_joints),
+        native_object_joint_vel=torch.zeros(3, scene[layout.object.entity_name].num_joints),
+        native_object_joint_position_support=torch.ones(3, scene[layout.object.entity_name].num_joints, dtype=torch.bool),
+        native_object_joint_velocity_support=torch.ones(3, scene[layout.object.entity_name].num_joints, dtype=torch.bool),
+        native_object_part_state_w=parts, native_object_part_pose_support=torch.ones(3, len(layout.object.parts), dtype=torch.bool),
+        native_object_part_linear_velocity_support=torch.ones(3, len(layout.object.parts), dtype=torch.bool),
+        native_object_part_angular_velocity_support=torch.ones(3, len(layout.object.parts), dtype=torch.bool),
+    )
+    command.cfg = SimpleNamespace(sampling=SimpleNamespace(mode="start", start_frame=0),
+        resampling_time_range=(1000., 1000.), hand=SimpleNamespace(zero_init_vel=False),
+        object=SimpleNamespace(zero_init_vel=False, pin_objects=False,
+                               entity_names={side: layout.object.entity_name for side in roots}))
+    command._bind_native_reference()
+    command._init_metrics()
+    command._init_object_assist()
+    command._init_native_object_assist()
+    env.command_manager = object.__new__(CommandManager)
+    env.command_manager._terms = {"tracking": command}
+    env.action_manager = ActionManager({"native": NativeResidualActionCfg(
+        entity_name="robot", command_name="tracking", native_scene=mapping,
+        translation_residual_m=.1, rotation_residual_rad=1.,
+        cutoff_hz={"wrist_trans": 5., "wrist_rot": 5.}, clip={".*": (-1., 1.)},
+    )}, env)
+    env.event_manager = EventManager({"reset": EventTermCfg(func=lambda env, env_ids: None, mode="reset")}, env)
+    env.reward_manager = RewardManager({"action": RewardTermCfg(
+        func=lambda env: env.action_manager.action.square().sum(-1), weight=.3)}, env)
+    env.observation_manager = ObservationManager({"actor": ObservationGroupCfg(terms={"state": ObservationTermCfg(
+        func=lambda env: torch.cat((env.sim.plant.q, env.action_manager.action), -1))})}, env)
+    from mjlab.utils.spaces import Box
+
+    env.action_space = Box(low=-1., high=1., shape=(env.action_manager.total_action_dim,))
+    env.reset(seed=39)
+    return env, command
+
+
+def _assert_control_values_equal(actual, expected):
+    from dataclasses import fields, is_dataclass
+
+    if torch.is_tensor(actual):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    elif isinstance(actual, np.ndarray):
+        np.testing.assert_array_equal(actual, expected)
+    elif is_dataclass(actual):
+        for field in fields(actual):
+            _assert_control_values_equal(getattr(actual, field.name), getattr(expected, field.name))
+    elif isinstance(actual, dict):
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            _assert_control_values_equal(actual[key], expected[key])
+    elif isinstance(actual, (tuple, list)):
+        assert len(actual) == len(expected)
+        for left, right in zip(actual, expected, strict=True):
+            _assert_control_values_equal(left, right)
+    else:
+        assert actual == expected
+
+
+def test_native_scene_control_context_restores_pending_targets_and_invalidates_reads(tmp_path):
+    env, _ = _initial_control_case(tmp_path)
+    sim, scene, plant = env.sim, env.scene, env.sim.plant
+    hand = scene[scene.native_layout.hands[0].entity_name]
+    rows = torch.tensor([1])
+    q, v = sim.pending_state(rows)
+    q[:, :3] = torch.tensor([[.2, .3, .4]])
+    v[:, :3] = .5
+    hand._joint_pos_target[1] = .27
+    context = scene.capture_control_context()
+    snapshot_target = context.joint_position_targets[hand.binding.entity_name].clone()
+    cached = hand.data.body_link_pos_w.clone()
+    scene.write_data_to_sim()
+    hand._joint_pos_target[:] = .8
+    assert not torch.equal(hand.data.body_link_pos_w, cached)
+    after_write = plant.set_calls
+    scene.restore_control_context(context)
+    assert plant.set_calls == after_write  # no reset or state-write substitute
+    _assert_control_values_equal(sim._pending, context.simulation.pending)
+    _assert_control_values_equal(hand._joint_pos_target, snapshot_target)
+    _assert_control_values_equal(hand.data.body_link_pos_w, cached)
+    scene.write_data_to_sim()
+    _assert_control_values_equal(plant.q[rows, :3], torch.tensor([[.2, .3, .4]]))
+    # Restore copies, so using the context again cannot inherit a mutated pending write.
+    scene.restore_control_context(context)
+    sim._pending[1][:] = 77
+    assert not bool((context.simulation.pending[1] == 77).any())
+    sim._pending = None
+    sim.begin_control_step()
+    with pytest.raises(RuntimeError, match="closed control interval"):
+        scene.capture_control_context()
+
+
+def test_native_initial_control_context_repeats_real_manager_lpf_phase_and_rng(tmp_path):
+    import random
+
+    from common.utils import capture_rng_state
+
+    env, command = _initial_control_case(tmp_path)
+    action = env.action_manager.get_term("native")
+    assert command.reference_phase["motion_steps"].tolist() == [0, 0]
+    assert command.motion_steps.tolist() == [1, 1]
+    initial = env.capture_initial_control_context()
+    raw = torch.linspace(-.8, .8, action.action_dim).repeat(2, 1)
+
+    def run_two_steps():
+        values = []
+        for requested in (raw, -raw):
+            obs, reward, terminated, time_out, _ = env.step(requested)
+            values.append((env.scene.capture_control_context(), action.capture_control_context(),
+                           command.capture_control_context(), obs, reward.clone(), terminated.clone(), time_out.clone(),
+                           env.action_manager.prev_action.clone(), env.action_manager.prev_prev_action.clone()))
+        return values, (random.random(), np.random.rand(), torch.rand(3)), capture_rng_state(None)
+
+    first = run_two_steps()
+    assert not torch.equal(action._processed_actions, -raw)  # real second-step LPF carry
+    assert command.reference_phase["motion_steps"].tolist() == [2, 2]
+    assert env.common_step_counter == 2 and env._sim_step_counter == 8
+    with pytest.raises(RuntimeError, match="reset boundary"):
+        env.capture_initial_control_context()
+    command._source_tip_geometry_cache = {"stale": torch.tensor(99)}
+    command._source_tip_geometry_token = (0, initial.commands["tracking"].object_state_version)
+    reset_writes = env.sim.plant.set_calls
+    env.restore_initial_control_context(initial)
+    assert env.sim.plant.set_calls == reset_writes
+    assert "_source_tip_geometry_cache" not in vars(command)
+    assert command.reference_phase["motion_steps"].tolist() == [0, 0]
+    assert command.motion_steps.tolist() == [1, 1]
+    assert bool(action._filter_pending.all()) and not bool(action._installed_valid.any())
+    assert not hasattr(action, "ref_joint_pos_used")
+    assert not hasattr(env, "reward_buf")
+    _assert_control_values_equal(env.capture_initial_control_context(), initial)
+    repeated = run_two_steps()
+    _assert_control_values_equal(repeated, first)
+    assert env.common_step_counter == 2 and env._sim_step_counter == 8
+    assert env.sim.plant.advance_calls == 16  # only the two ordinary 2×4-step arms
+
+
+def test_native_initial_control_context_refuses_unowned_history_and_backend(tmp_path):
+    env, _ = _initial_control_case(tmp_path)
+    for field in ("_group_obs_term_history_buffer", "_group_obs_term_delay_buffer"):
+        buffers = getattr(env.observation_manager, field)
+        buffers["actor"]["state"] = object()
+        with pytest.raises(NotImplementedError, match="delay/history"):
+            env.capture_initial_control_context()
+        buffers["actor"].clear()
+    env.sim.begin_control_step()
+    with pytest.raises(RuntimeError, match="no executed control interval"):
+        env.capture_initial_control_context()
+    native_scene = env.scene
+    env.scene = SimpleNamespace(num_envs=2)
+    with pytest.raises(NotImplementedError, match="NativePlant scenes"):
+        env.capture_initial_control_context()
+    env.scene = native_scene
+
+
+
+def test_native_context_rng_keeps_real_gym_sampler_separate(tmp_path):
+    import random
+
+    from gymnasium.spaces import Box
+
+    from common.utils import capture_rng_state, restore_rng_state
+
+    env, _ = _initial_control_case(tmp_path)
+    initial = env.capture_initial_control_context()
+    assert initial.rng["action_space"] is None
+    assert not hasattr(env.action_space, "np_random")  # Real mjlab metadata Box.
+    sampler = Box(low=-1., high=1., shape=(3,), dtype=np.float32)
+    sampler.seed(17)
+    saved = capture_rng_state(sampler)
+    expected = (random.random(), np.random.rand(), torch.rand(3), sampler.sample())
+    restore_rng_state(saved, sampler)
+    actual = (random.random(), np.random.rand(), torch.rand(3), sampler.sample())
+    _assert_control_values_equal(actual, expected)
+    # The manager restores only its globals; it never fabricates a sampler.
+    env.restore_initial_control_context(initial)
+    _assert_control_values_equal(capture_rng_state(None), initial.rng)
