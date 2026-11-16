@@ -318,7 +318,7 @@ def test_frozen_attempt_npz_keeps_actual_native_schema_clocks_interval_and_first
     assert success_manifest.read_bytes() == original_manifest
 
 
-def _prepared_native_recorder_fixture(tmp_path, *, hand_sides=("left", "right")):
+def _prepared_native_recorder_fixture(tmp_path, *, hand_sides=("left", "right"), source_intent=False):
     """Real prepared-input/pack/library admission; only achieved state is synthetic."""
     from dexforge_adaptation.flashdex_retarget import flashdex_source_mapping
     from test_native_reference import _pipeline_config, _prepared_native_dataset
@@ -359,6 +359,10 @@ def _prepared_native_recorder_fixture(tmp_path, *, hand_sides=("left", "right"))
     clip["source_lineage_json"] = np.asarray(json.dumps(source))
     clip["source_query_ordinal"] = np.asarray(source["prepared_source_ordinal"])
     clip["source_import_elapsed_ns"] = elapsed.copy()
+    if source_intent:
+        from test_native_reference import _with_source_hand_part_intent
+
+        _with_source_hand_part_intent(clip)
     C.save_clip(dataset / "native_reference/synthetic-stage.npz", clip)
     cfg = _pipeline_config(dataset)
     prepared = PreparedNativeInput(dataset, cfg, workers=1, manifest="native-reference.json")
@@ -397,6 +401,44 @@ def _prepared_native_recorder_fixture(tmp_path, *, hand_sides=("left", "right"))
             for name in ("lid", "base")}, clips={"synthetic-stage": source})
     binding["hands"] = {side: binding["hands"][side] for side in hand_sides}
     return env, binding
+
+
+def test_source_hand_part_intent_export_keeps_consumed_phase_clocks_and_owned_masks(tmp_path):
+    from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
+
+    env, binding = _prepared_native_recorder_fixture(tmp_path, source_intent=True)
+    command = env.command_manager.get_term("motion")
+    command._side_list, command._env = ["left", "right"], env
+    for name in ("source_hand_part_intent", "_consumed_reference_phase", "source_hand_part_intent_facts"):
+        setattr(command, name, MethodType(getattr(NativeMotionTrackingCommand, name), command))
+    installed = dict(installed_valid=torch.tensor([False]), reference_motion_ids=torch.tensor([0]),
+                     reference_motion_steps=torch.tensor([0]))
+    env.action_manager._terms = {"native": SimpleNamespace(installed_control=installed)}
+    recorder = NativeRolloutRecord(binding=binding)
+    recorder.on_start(env)
+    # Installation owns the consumed packet even after the command advances.
+    installed["installed_valid"][:] = True
+    installed["reference_motion_steps"][:] = 2
+    command.reference_phase["motion_steps"][:] = 1
+    command.motion_steps[:] = 2
+    recorder.on_step(env)
+    state = recorder.collect_state(torch.tensor([True]))
+    command.motion_lib.native_source_hand_part_intent["active"][:] = False
+    recorder.source_hand_part_intent_metadata_json = "not this collected batch"
+    arrays = recorder.rollout_arrays([state], 0)
+    np.testing.assert_array_equal(arrays["source_hand_part_intent_reference_motion_steps"], [0, 2])
+    np.testing.assert_array_equal(arrays["source_hand_part_intent_execution_valid"], [False, True])
+    np.testing.assert_array_equal(arrays["source_hand_part_intent_query_time_ns"],
+                                  2**60 + 37 + np.array((0, 40_000_000), np.int64))
+    assert arrays["source_hand_part_intent_capture_time_ns"].dtype == np.int64
+    assert arrays["source_hand_part_intent_known"].dtype == bool
+    assert arrays["source_hand_part_intent_active"][0, 0, 1]
+    assert arrays["source_hand_part_intent_active"][1, 0, 0]
+    assert not arrays["source_hand_part_intent_known"][1, 0, 1]
+    metadata = json.loads(str(arrays["source_hand_part_intent_metadata_json"]))
+    assert metadata["hand_sides"] == ["left", "right"]
+    assert metadata["part_body_names"] == ["lid", "base"]
+    assert metadata["source_provenance"][0]["provenance"]["resource"].startswith("synthetic source")
 
 
 def test_prepared_native_input_pack_library_recorder_keeps_canonical_source_and_placement(tmp_path):

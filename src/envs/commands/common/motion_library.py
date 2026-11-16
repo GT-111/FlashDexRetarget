@@ -48,6 +48,7 @@ class MotionLibrary:
 
         # Independent source masks are unavailable in older native and stock clips.
         self.native_source_point_position_support: dict[str, torch.Tensor] | None = None
+        self.native_source_hand_part_intent: dict[str, torch.Tensor] | None = None
         self._parse_robot_data(motion_dicts)
         self._parse_mano_data(motion_dicts, motion_files)
         self._parse_contact_data(motion_dicts, motion_files)
@@ -146,6 +147,48 @@ class MotionLibrary:
             dtype = torch.bool if field.endswith("support") else torch.float32
             setattr(self, "native_" + field,
                     _concat([reference[field] for reference in references], self.device, dtype=dtype))
+        self._parse_source_hand_part_intent(references)
+
+    def _parse_source_hand_part_intent(self, references: list[dict]) -> None:
+        """Resolve causal cells once; all runtime gathers use exact prepared rows."""
+        intents = [reference.get("source_hand_part_intent") for reference in references]
+        if not any(intent is not None for intent in intents):
+            return
+        parts = self.native_object_part_body_names
+        rows = []
+        self.native_source_hand_part_intent_provenance = []
+        for reference, intent in zip(references, intents, strict=True):
+            frames = len(reference["time_ns"])
+            shape = (frames, len(self.hand_sides), len(parts))
+            row = {field: np.zeros(shape, bool) for field in ("active", "known")}
+            for field in ("query_time_ns", "capture_time_ns", "available_time_ns", "valid_until_time_ns",
+                          "source_frame_index", "canonical_frame_index"):
+                row[field] = np.full(frames, -1, np.int64)
+            self.native_source_hand_part_intent_provenance.append(
+                None if intent is None else {key: intent[key] for key in ("authority", "provenance")})
+            if intent is not None:
+                query = intent["query_time_ns"]
+                address = np.searchsorted(intent["available_time_ns"], query, side="right") - 1
+                index = np.maximum(address, 0)
+                admitted = ((address >= 0) & (intent["capture_time_ns"][index] <= query)
+                            & (query < intent["valid_until_time_ns"][index]))
+                row["query_time_ns"] = query
+                for field in ("capture_time_ns", "available_time_ns", "valid_until_time_ns",
+                              "source_frame_index", "canonical_frame_index"):
+                    row[field] = np.where(address >= 0, intent[field][index], -1)
+                for hand, side in enumerate(intent["hand_sides"]):
+                    target_hand = self.hand_sides.index(side)
+                    for part, name in enumerate(intent["part_body_names"]):
+                        target_part = parts.index(name)
+                        known = intent["known"][index, hand, part] & admitted
+                        row["known"][:, target_hand, target_part] = known
+                        row["active"][:, target_hand, target_part] = intent["active"][index, hand, part] & known
+            rows.append(row)
+        self.native_source_hand_part_intent = {
+            field: _concat([row[field] for row in rows], self.device,
+                           dtype=torch.bool if field in ("active", "known") else torch.int64)
+            for field in rows[0]
+        }
 
     # ── MANO reference ──────────────────────────────────────────────────
 

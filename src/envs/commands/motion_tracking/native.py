@@ -268,6 +268,46 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             reference_time_ns=ml.native_time_ns[ids],
         )
 
+    def source_hand_part_intent(self, ids):
+        """Source-owned intent in actual hand/part order; absent labels stay unknown."""
+        ml = self.motion_lib
+        intent = ml.native_source_hand_part_intent
+        if intent is None:
+            return None
+        hands = [ml.hand_sides.index(side) for side in self._side_list]
+        return {
+            "metadata": dict(
+                hand_sides=tuple(self._side_list), part_body_names=tuple(ml.native_object_part_body_names),
+                authority="declared source intent; not measured target contact, force or task success",
+                source_provenance=ml.native_source_hand_part_intent_provenance,
+                clock="original int64 source capture/availability/cell end; query phase retained independently",
+            ),
+            **{field: values[ids][..., hands, :] if field in ("active", "known") else values[ids]
+               for field, values in intent.items()},
+            "reference_time_ns": ml.native_time_ns[ids],
+        }
+
+    def _consumed_reference_phase(self):
+        from envs._common import action_term
+
+        installed = action_term(self._env).installed_control
+        execution = installed["installed_valid"].detach().clone()
+        phase = self.reference_phase
+        motion_ids = torch.where(execution, installed["reference_motion_ids"], phase["motion_ids"])
+        steps = torch.where(execution, installed["reference_motion_steps"], phase["motion_steps"])
+        return self.motion_lib.length_starts[motion_ids] + steps, motion_ids, steps, execution
+
+    @torch.no_grad()
+    def source_hand_part_intent_facts(self):
+        """Recorder/reward endpoint uses the installed packet, not an advanced cursor."""
+        if self.motion_lib.native_source_hand_part_intent is None:
+            return None
+        ids, motion_ids, steps, execution = self._consumed_reference_phase()
+        facts = self.source_hand_part_intent(ids)
+        if facts is not None:
+            facts.update(reference_motion_ids=motion_ids, reference_motion_steps=steps, execution_valid=execution)
+        return facts
+
     @torch.no_grad()
     def source_tip_geometry_facts(self):
         """One stopped consumed-endpoint packet, shared by reward and recorder.
@@ -282,14 +322,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         cached = getattr(self, "_source_tip_geometry_cache", None)
         if cached is not None and self._source_tip_geometry_token == token:
             return cached
-        from envs._common import action_term
-
-        installed = action_term(self._env).installed_control
-        execution = installed["installed_valid"].detach().clone()
-        phase = self.reference_phase
-        motion_ids = torch.where(execution, installed["reference_motion_ids"], phase["motion_ids"])
-        steps = torch.where(execution, installed["reference_motion_steps"], phase["motion_steps"])
-        ids = self.motion_lib.length_starts[motion_ids] + steps
+        ids, motion_ids, steps, execution = self._consumed_reference_phase()
         reference = self.source_point_reference(ids)
         source, source_support, achieved = [], [], []
         source_names, target_names, point_sides, offsets = [], [], [], [0]

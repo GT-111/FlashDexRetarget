@@ -156,6 +156,11 @@ _SOURCE_TIP_GEOMETRY_ARRAYS = (
     "desired_part_pose_support", "live_part_pose_support", "desired_part_distance_m", "live_part_distance_m",
     "desired_part_query_support", "live_part_query_support",
 )
+_SOURCE_HAND_PART_INTENT_ARRAYS = (
+    "reference_motion_ids", "reference_motion_steps", "reference_time_ns", "execution_valid",
+    "query_time_ns", "capture_time_ns", "available_time_ns", "valid_until_time_ns",
+    "source_frame_index", "canonical_frame_index", "active", "known",
+)
 
 
 class NativeRolloutRecord(RolloutRecord):
@@ -313,6 +318,8 @@ class NativeRolloutRecord(RolloutRecord):
                 self.contact_interval_metadata["execution_clock"] = dict(interval["execution_clock"])
         self._source_tip_geometry_reader = getattr(self.cmd, "source_tip_geometry_facts", None)
         self.source_tip_geometry_metadata_json = None
+        self._source_hand_part_intent_reader = getattr(self.cmd, "source_hand_part_intent_facts", None)
+        self.source_hand_part_intent_metadata_json = None
         self.native_frames = []
         phase = self.cmd.reference_phase
         self.valid_steps_per_env = (
@@ -408,11 +415,20 @@ class NativeRolloutRecord(RolloutRecord):
                 }
                 for field in ("source_position_w", "achieved_position_w"):
                     frame["source_tip_geometry"][field] -= self._env_origins.cpu()[:, None]
+        if self._source_hand_part_intent_reader is not None:
+            facts = self._source_hand_part_intent_reader()
+            if facts is not None:
+                if self.source_hand_part_intent_metadata_json is None:
+                    self.source_hand_part_intent_metadata_json = json.dumps(facts["metadata"])
+                frame["source_hand_part_intent"] = {
+                    field: facts[field].detach().cpu().clone() for field in _SOURCE_HAND_PART_INTENT_ARRAYS
+                }
         self.native_frames.append(frame)
 
     def collect_state(self, active_mask=None):
         state = super().collect_state(active_mask)
         state["source_tip_geometry_metadata_json"] = self.source_tip_geometry_metadata_json
+        state["source_hand_part_intent_metadata_json"] = self.source_hand_part_intent_metadata_json
         select = slice(None) if active_mask is None else active_mask.cpu()
         state["native_frames"] = [{**frame, "hands": frame["hands"][select],
                                    "hand_twist_w": frame["hand_twist_w"][select],
@@ -423,6 +439,10 @@ class NativeRolloutRecord(RolloutRecord):
                                    "command_motion_ids": frame["command_motion_ids"][select]}
                                   for frame in self.native_frames]
         for selected, frame in zip(state["native_frames"], self.native_frames, strict=True):
+            if "source_hand_part_intent" in frame:
+                selected["source_hand_part_intent"] = {
+                    field: value[select] for field, value in frame["source_hand_part_intent"].items()
+                }
             if "source_tip_geometry" in frame:
                 selected["source_tip_geometry"] = {
                     field: value[select] for field, value in frame["source_tip_geometry"].items()
@@ -478,6 +498,12 @@ class NativeRolloutRecord(RolloutRecord):
                     native_binding_json=np.asarray(json.dumps(binding)),
                     prepared_name=np.asarray(name),
                 )
+                if state["source_hand_part_intent_metadata_json"] is not None:
+                    result["source_hand_part_intent_metadata_json"] = np.asarray(state["source_hand_part_intent_metadata_json"])
+                    for field in _SOURCE_HAND_PART_INTENT_ARRAYS:
+                        result["source_hand_part_intent_" + field] = np.stack([
+                            frame["source_hand_part_intent"][field][row].numpy() for frame in frames
+                        ])
                 if state["source_tip_geometry_metadata_json"] is not None:
                     result["source_tip_geometry_metadata_json"] = np.asarray(state["source_tip_geometry_metadata_json"])
                     for field in _SOURCE_TIP_GEOMETRY_ARRAYS:

@@ -354,6 +354,48 @@ unavailable. Derived target-force evidence does not replace original
 ARCTIC/OakInk source-contact support. Source roles, missing spans, phase
 durations and full-horizon outcomes retain their separate source/task authority.
 
+### Optional source hand/part intent
+
+An explicit `native_reference.source_hand_part_intent` carries desired source
+engagement independently of achieved target contacts. It names `hand_sides` and
+`part_body_names` drawn from the actual native reference; neither order nor count
+is fixed. A source may declare only a subset. The remaining hand/part pairs stay
+unknown. The carrier contains:
+
+- `query_time_ns`: one original-source-clock query for each prepared native row.
+  Its offsets must match `native_reference.time_ns`; cropping retains its phase.
+- `capture_time_ns`, `available_time_ns`, `valid_until_time_ns`,
+  `source_frame_index`, `canonical_frame_index`: chronological int64 source-row
+  vectors, independent of the prepared query count.
+- `active`, `known`: boolean `[source row, declared hand, declared part]` masks.
+  An active value requires independent knowledge support.
+- `authority` and `provenance`: the source method and original resource identity.
+  Geometric intent must not be described as measured force or task success.
+
+The reader selects the last source row available at each exact int64 query and
+admits it only within its declared clock cell. Delayed, missing and expired rows
+cannot become active through interpolation or endpoint hold. Native NPZ, normal
+crop, packed PT and `MotionLibrary` preserve this carrier. Libraries may contain
+clips without it; their pairs remain unknown, and a completely absent modality
+remains `None`.
+
+Select `native_source_hand_part_intent` through the existing actor/critic
+`obs_dict` to append active values and knowledge masks in actual hand/part order.
+Its width is derived from those names. Selecting it without any declared source
+carrier fails explicitly. This changes the observation graph and requires the
+ordinary explicit actor initialization and replay/continuation contract; an old
+FULL must not silently acquire the new inputs. Default observations and rewards
+are unchanged.
+
+`source_hand_part_intent_facts()` and `NativeRolloutRecord` use the installed
+packet's motion/step, independently of command-cursor advance. Reset rows retain
+their source intent with false execution support. The recorder exports exact
+integer clocks, source addresses, active/known masks and original provenance
+under `source_hand_part_intent_*`. These arrays are desired source facts, not
+target force measurements. Source-specific adapters still own qualification and
+construction; this port does not add BOX phase extrema, infer new OakInk labels,
+install a contact reward or establish task/generalization success.
+
 ### Installed dynamics and gravity
 
 The shared MJCF metadata loader requires a built-in scalar actuator roster:

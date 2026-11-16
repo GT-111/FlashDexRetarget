@@ -99,6 +99,27 @@ def _with_source_point_support(clip):
     return clip
 
 
+def _with_source_hand_part_intent(clip):
+    native = clip["native_reference"]
+    offsets = native["time_ns"] - native["time_ns"][0]
+    origin = 2**60 + 37
+    known = np.ones((2, 2, 2), bool)
+    known[1, 0, 0] = False
+    active = np.zeros_like(known)
+    active[0, 0, 0] = active[0, 1, 1] = active[1, 0, 1] = True
+    native["source_hand_part_intent"] = dict(
+        hand_sides=("left", "right"), part_body_names=("base", "lid"),
+        query_time_ns=origin + offsets,
+        capture_time_ns=origin + np.array((0, int(offsets[-1]) - 1), np.int64),
+        available_time_ns=origin + np.array((0, int(offsets[-1])), np.int64),
+        valid_until_time_ns=origin + np.array((int(offsets[1]) // 2, int(offsets[-1]) + 1), np.int64),
+        source_frame_index=np.array((100, 120), np.int64), canonical_frame_index=np.array((10, 12), np.int64),
+        active=active, known=known, authority="synthetic source geometric intent, not measured contact",
+        provenance={"resource": "synthetic source tape with a missing clock cell"},
+    )
+    return clip
+
+
 def _mesh(dataset):
     mesh = dataset / "objects/synthetic-mesh/visual.obj"
     mesh.parent.mkdir(parents=True)
@@ -380,6 +401,126 @@ def test_native_reader_rejects_mixed_source_point_modality_presence(tmp_path):
         _reader(dataset / "motion.pt")
 
 
+def test_source_hand_part_intent_crop_pack_preserves_causal_cells_and_exact_clocks(tmp_path):
+    original = _with_source_hand_part_intent(_clip())
+    before = deepcopy(original["native_reference"]["source_hand_part_intent"])
+    C.save_clip(tmp_path / "intent.npz", original)
+    loaded = C.load_clip(tmp_path / "intent.npz")
+    cropped = _crop(loaded, 1)
+    intent = cropped["native_reference"]["source_hand_part_intent"]
+    np.testing.assert_array_equal(intent["capture_time_ns"], before["capture_time_ns"])
+    np.testing.assert_array_equal(intent["query_time_ns"], before["query_time_ns"][1:])
+    packed = _pack(tmp_path, cropped)
+    library = _reader(packed)
+    actual = library.native_source_hand_part_intent
+    assert library.hand_sides == ("right", "left")
+    assert library.native_object_part_body_names == ("lid", "base")
+    assert actual["known"].dtype == torch.bool
+    assert not actual["known"][0].any()  # An expired cell never fills the gap.
+    assert actual["known"][1].tolist() == [[True, True], [True, False]]
+    assert actual["active"][1].tolist() == [[False, False], [True, False]]
+    for field in ("query_time_ns", "capture_time_ns", "available_time_ns", "valid_until_time_ns",
+                  "source_frame_index", "canonical_frame_index"):
+        assert actual[field].dtype == torch.int64
+    np.testing.assert_array_equal(actual["query_time_ns"], before["query_time_ns"][1:])
+    np.testing.assert_array_equal(actual["source_frame_index"], [100, 120])
+    np.testing.assert_array_equal(actual["available_time_ns"][1], before["available_time_ns"][1])
+    assert library.native_source_hand_part_intent_provenance == [
+        {key: before[key] for key in ("authority", "provenance")}]
+    stored = torch.load(packed, weights_only=False)["motion_native_reference"][0]["source_hand_part_intent"]
+    np.testing.assert_array_equal(stored["active"], before["active"])
+    np.testing.assert_array_equal(original["native_reference"]["source_hand_part_intent"]["query_time_ns"],
+                                  before["query_time_ns"])
+
+
+def test_source_hand_part_intent_missing_clips_and_pairs_remain_unknown(tmp_path):
+    supported = _with_source_hand_part_intent(_clip())
+    native = supported["native_reference"]
+    # A third real part and a partially declared source defeat fixed two-part assumptions.
+    native["object_part_body_names"] += ("handle",)
+    for field in ("object_part_state_w", "object_part_pose_support", "object_part_linear_velocity_support",
+                  "object_part_angular_velocity_support"):
+        native[field] = np.concatenate((native[field], native[field][:, :1]), axis=1)
+    intent = native["source_hand_part_intent"]
+    intent["hand_sides"], intent["part_body_names"] = ("left",), ("base",)
+    for field in ("active", "known"):
+        intent[field] = intent[field][:, :1, :1]
+    absent = deepcopy(supported)
+    del absent["native_reference"]["source_hand_part_intent"]
+    prepared, dataset = tmp_path / "prepared", tmp_path / "dataset"
+    prepared.mkdir()
+    _mesh(dataset)
+    C.save_clip(prepared / "a-supported.npz", supported)
+    C.save_clip(prepared / "b-absent.npz", absent)
+    build(prepared, dataset, 60., SimpleNamespace(vel_sigma=2., contact_threshold=.015))
+    library = _reader(dataset / "motion.pt")
+    actual = library.native_source_hand_part_intent
+    assert actual["known"].shape == (6, 2, 3)
+    assert actual["known"][0, 1, 1] and actual["active"][0, 1, 1]
+    assert actual["known"].sum().item() == 1
+    assert not actual["active"][3:].any() and not actual["known"][3:].any()
+    assert (actual["query_time_ns"][3:] == -1).all()
+    assert library.native_source_hand_part_intent_provenance[1] is None
+
+
+def test_source_hand_part_intent_rejects_false_support_clocks_and_names(tmp_path):
+    del tmp_path
+    for invalid in ("unknown_active", "float_clock", "query_phase", "available_before_capture", "bad_part",
+                    "numeric_mask", "empty_source", "wrong_rows", "duplicate_side"):
+        clip = _with_source_hand_part_intent(_clip())
+        intent = clip["native_reference"]["source_hand_part_intent"]
+        if invalid == "unknown_active":
+            intent["active"][1, 0, 0] = True
+        elif invalid == "float_clock":
+            intent["capture_time_ns"] = intent["capture_time_ns"].astype(np.float64)
+        elif invalid == "query_phase":
+            intent["query_time_ns"][1] += 1
+        elif invalid == "available_before_capture":
+            intent["available_time_ns"][1] = intent["capture_time_ns"][1] - 1
+        elif invalid == "bad_part":
+            intent["part_body_names"] = ("base", "not_in_scene")
+        elif invalid == "numeric_mask":
+            intent["known"] = intent["known"].astype(np.float32)
+        elif invalid == "empty_source":
+            intent["capture_time_ns"] = np.empty(0, np.int64)
+        elif invalid == "wrong_rows":
+            intent["source_frame_index"] = intent["source_frame_index"][:1]
+        else:
+            intent["hand_sides"] = ("left", "left")
+        with TestCase().assertRaisesRegex(ValueError, "source intent|unknown source intent"):
+            C.native_reference(clip)
+
+
+def test_source_hand_part_intent_decision_and_consumed_packet_are_independent(tmp_path):
+    from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
+    from envs.observations.native import NativeMotionTrackingObs
+
+    library = _reader(_pack(tmp_path, _with_source_hand_part_intent(_clip())))
+    command = object.__new__(NativeMotionTrackingCommand)
+    command.motion_lib, command._side_list = library, ["left", "right"]
+    command.motion_ids, command.motion_steps = torch.tensor([0, 0]), torch.tensor([2, 2])
+    command.reference_phase = dict(motion_ids=torch.tensor([0, 0]), motion_steps=torch.tensor([1, 1]))
+    installed = dict(installed_valid=torch.tensor([True, False]), reference_motion_ids=torch.tensor([0, 0]),
+                     reference_motion_steps=torch.tensor([0, 0]))
+    env = command._env = SimpleNamespace(
+        action_manager=SimpleNamespace(_terms={"native": SimpleNamespace(installed_control=installed)}),
+        command_manager=SimpleNamespace(get_term=lambda name: command))
+    decision = command.source_hand_part_intent(command._motion_flat_ids)
+    consumed = command.source_hand_part_intent_facts()
+    assert decision["active"][:, 0, 0].all()  # Declared left/lid at the current decision.
+    assert consumed["reference_motion_steps"].tolist() == [0, 1]
+    assert consumed["execution_valid"].tolist() == [True, False]
+    assert consumed["active"][0, 0, 1] and not consumed["known"][1].any()
+    obs = NativeMotionTrackingObs.native_source_hand_part_intent(env, "motion")
+    assert obs.shape == (2, 8)
+    torch.testing.assert_close(obs[:, :4], decision["active"].flatten(1).float())
+    torch.testing.assert_close(obs[:, 4:], decision["known"].flatten(1).float())
+    library.native_source_hand_part_intent = None
+    assert command.source_hand_part_intent_facts() is None
+    with TestCase().assertRaisesRegex(ValueError, "explicit source carrier"):
+        NativeMotionTrackingObs.native_source_hand_part_intent(env, "motion")
+
+
 if __name__ == "__main__":
     # Match the existing native-contract harness; the author env needs no pytest install.
     import sys
@@ -398,6 +539,10 @@ if __name__ == "__main__":
         test_absent_source_point_modality_remains_unavailable_for_native_and_stock,
         test_source_point_boundary_rejects_unpaired_sides_names_and_nonboolean_rows,
         test_native_reader_rejects_mixed_source_point_modality_presence,
+        test_source_hand_part_intent_crop_pack_preserves_causal_cells_and_exact_clocks,
+        test_source_hand_part_intent_missing_clips_and_pairs_remain_unknown,
+        test_source_hand_part_intent_rejects_false_support_clocks_and_names,
+        test_source_hand_part_intent_decision_and_consumed_packet_are_independent,
     )
     selected = set(sys.argv[1:]) if len(sys.argv) > 1 else {case.__name__ for case in cases}
     for case in cases:

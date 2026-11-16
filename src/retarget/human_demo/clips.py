@@ -158,7 +158,53 @@ def native_reference(clip: dict) -> dict | None:
     velocity_support = array("object_joint_velocity_support", velocity.shape, support=True)
     if np.any(velocity[~velocity_support] != 0):
         raise ValueError("native unknown passive-joint rates require zero values and false support")
+    if "source_hand_part_intent" in reference:
+        reference["source_hand_part_intent"] = source_hand_part_intent(reference)
     return reference
+
+
+def source_hand_part_intent(reference: dict) -> dict:
+    """Validate source intent on its original clock, independently of native queries.
+
+    This is a source's declared geometric/functional intent, never achieved
+    contact or force. Cropping changes query rows, not the original source tape.
+    """
+    value = dict(reference["source_hand_part_intent"])
+    for field, actual in (("hand_sides", reference["root_body_names"]),
+                          ("part_body_names", reference["object_part_body_names"])):
+        names = tuple(value[field])
+        if not names or len(set(names)) != len(names) or not set(names) <= set(actual):
+            raise ValueError(f"source intent {field} must name distinct admitted hands/parts")
+        value[field] = names
+    if not value["authority"] or not value["provenance"]:
+        raise ValueError("source intent requires its own authority and provenance")
+    for field in ("query_time_ns", "capture_time_ns", "available_time_ns", "valid_until_time_ns",
+                  "source_frame_index", "canonical_frame_index"):
+        rows = np.asarray(value[field])
+        if rows.ndim != 1 or not rows.size or rows.dtype != np.int64 or np.any(rows < 0):
+            raise ValueError("source intent clocks/addresses require nonnegative int64 vectors")
+        value[field] = rows
+    query, capture = value["query_time_ns"], value["capture_time_ns"]
+    if (query.shape != reference["time_ns"].shape
+            or not np.array_equal(query - query[0], reference["time_ns"] - reference["time_ns"][0])):
+        raise ValueError("source intent queries must retain the native query grid and original source phase")
+    if (any(value[field].shape != capture.shape for field in (
+            "available_time_ns", "valid_until_time_ns", "source_frame_index", "canonical_frame_index"))
+            or np.any(np.diff(capture) <= 0) or np.any(np.diff(value["available_time_ns"]) < 0)
+            or np.any(value["available_time_ns"] < capture)
+            or np.any(value["valid_until_time_ns"] <= capture)
+            or np.any(np.diff(value["source_frame_index"]) <= 0)
+            or np.any(np.diff(value["canonical_frame_index"]) <= 0)):
+        raise ValueError("source intent clocks/addresses must retain chronological source cells")
+    shape = (len(capture), len(value["hand_sides"]), len(value["part_body_names"]))
+    for field in ("active", "known"):
+        rows = np.asarray(value[field])
+        if rows.shape != shape or rows.dtype.kind != "b":
+            raise ValueError("source intent requires boolean [source row, actual hand, actual part] masks")
+        value[field] = rows
+    if np.any(value["active"] & ~value["known"]):
+        raise ValueError("unknown source intent cannot be active")
+    return value
 
 
 def crop_native_reference(reference: dict, start: int) -> dict:
@@ -171,6 +217,10 @@ def crop_native_reference(reference: dict, start: int) -> dict:
     if "source_point_position_support" in reference:
         result["source_point_position_support"] = {
             side: value[start:] for side, value in reference["source_point_position_support"].items()}
+    if "source_hand_part_intent" in reference:
+        intent = dict(reference["source_hand_part_intent"])
+        intent["query_time_ns"] = intent["query_time_ns"][start:]
+        result["source_hand_part_intent"] = intent
     return result
 
 

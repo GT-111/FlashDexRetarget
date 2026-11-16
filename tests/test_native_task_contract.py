@@ -80,6 +80,7 @@ def _command(*, rigid=False, passive_types=None, hand_types=None):
         object_q[:] = torch.tensor([0.2, 0.1])
     ml = SimpleNamespace(
         native_source_point_position_support=None,
+        native_source_hand_part_intent=None,
         native_time_ns=torch.tensor(
             [1_000_000_000, 1_020_000_000, 1_040_000_000], dtype=torch.int64
         ),

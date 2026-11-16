@@ -160,6 +160,15 @@ def build_native_future_reference(
 
 class NativeMotionTrackingObs(MotionTrackingObs):
     @staticmethod
+    def native_source_hand_part_intent(env, command_name):
+        """Current decision's active values and independent knowledge masks."""
+        command = env.command_manager.get_term(command_name)
+        facts = command.source_hand_part_intent(command._motion_flat_ids)
+        if facts is None:
+            raise ValueError("source hand/part intent observation requires an explicit source carrier")
+        return torch.cat((facts["active"].flatten(1).float(), facts["known"].flatten(1).float()), -1)
+
+    @staticmethod
     @torch.no_grad()
     def native_source_tip_reference_error(env, command_name):
         """Current decision goal: supported source-tip error in actual wrist axes.
