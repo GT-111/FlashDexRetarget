@@ -501,6 +501,7 @@ body-local point. The default application request is unchanged.
 | `logger.wandb.mode` | `online` | `offline` or `disabled` to run without uploading |
 | `logger.wandb.entity` | `null` | wandb entity (`null`: `$WANDB_ENTITY` or your default) |
 | `agent_load_path` / `buffer_load_path` | `null` | checkpoint directory to load networks / replay buffer from |
+| `learning_state_load_path` | `null` | explicit RNG/curriculum/progress source, independent of replay; omitted FULL resume uses `buffer_load_path` |
 | `step_offset` | `0` | env step the run starts from (set on resume) |
 | `logger.wandb.resume` / `resumeid` | `false` / `null` | continue an existing wandb run |
 
@@ -576,6 +577,19 @@ and correlated exploration state. Replay, RNG and curriculum start fresh. Report
 parent optimizer/update age separately from the new run's `step_offset`. Full learning
 restore keeps its existing replay/learning-state owner and resets collection once
 after those owners load.
+
+For a same-layout changed-reward child that retains learned agent state and
+saved learning generators/curriculum but starts fresh replay, select
+`agent_load_path=<parent> buffer_load_path=null learning_state_load_path=<parent>
+step_offset=<saved global env_step>`. The explicit learning-state source is read
+after environment reset and agent loading, invokes the same strict progress/world
+count/curriculum checks, and restores RNG only after collection reset. It does
+not open the old replay or recompute its rewards. Keep new external condition
+steps separate from the retained parent/global counter and Adam histories;
+normal fresh-buffer warmup applies. With `learning_state_load_path=null`, FULL
+resume still reads learning state from `buffer_load_path`, and a legacy
+agent-only warm start retains its existing fresh-generator/curriculum behavior.
+An actor observation extension cannot select this learning-state restore.
 
 For a native source-geometry observation extension, set `actor_input_extension_init_path=<parent checkpoint>` and `actor_input_extension_init_config_path=<published parent resolved config.yaml>` in a new run. Keep `agent_load_path=null`, `buffer_load_path=null`, `step_offset=0` and `runner.ever_state_path=null`. This explicit initializer requires the same named native action/scene and future encoder/query contract, maps saved named actor inputs and shifted future columns, and zeros only the added input columns. It retains the actor's running BN state without an initialization-time renormalization; critic/targets, reward statistics, replay, optimizers and learning progress start fresh. Strict FULL does not admit an observation-layout change. After the new condition writes its own FULL, clear both initialization paths and use the ordinary same-condition FULL resume commands. C0 preservation and new-column learning are owning software-test claims only after their actual qualification; later normalization/optimizer behavior is a new learning condition.
 

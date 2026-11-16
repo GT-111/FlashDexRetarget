@@ -256,7 +256,7 @@ def test_runner_routes_actor_input_extension_without_restoring_training_or_ever_
     receipt = json.loads((child_run / "actor-input-extension.json").read_text())
     assert receipt["actor_only"] and receipt["checkpoint"] == str(checkpoint)
     for key, value in (("agent_load_path", str(checkpoint)), ("buffer_load_path", str(checkpoint)),
-                       ("step_offset", 2), ("ever_state_path", str(checkpoint / "resume_state.json"))):
+                       ("learning_state_load_path", str(checkpoint)), ("step_offset", 2), ("ever_state_path", str(checkpoint / "resume_state.json"))):
         invalid = OmegaConf.create(OmegaConf.to_container(cfg.runner, resolve=True))
         invalid[key] = value
         with pytest.raises(ValueError, match="fresh progress"):
@@ -656,7 +656,7 @@ def _runner(agent, action_space, curriculum, path):
     return runner
 
 
-@pytest.mark.parametrize("resume_mode", ["agent_only", "full"])
+@pytest.mark.parametrize("resume_mode", ["agent_only", "full", "fresh_replay_learning_state"])
 def test_runner_load_restarts_episode_returns_once_without_erasing_learned_state(
     tmp_path, monkeypatch, resume_mode,
 ):
@@ -678,6 +678,8 @@ def test_runner_load_restarts_episode_returns_once_without_erasing_learned_state
     parent_space = gym.spaces.Box(-1, 1, shape=(2, 4), dtype=np.float32)
     parent_space.seed(21)
     parent = _runner(original, parent_space, original_curriculum, tmp_path / "first")
+    if resume_mode == "fresh_replay_learning_state":
+        parent._nonfinite_steps = 7
     parent._save_learning_state(checkpoint, 100)
     saved_learning = torch.load(checkpoint / LEARNING_STATE_FILE, weights_only=False)
 
@@ -720,7 +722,18 @@ def test_runner_load_restarts_episode_returns_once_without_erasing_learned_state
         **asdict(fresh._cfg)})
     config.runner.agent_load_path = str(checkpoint)
     config.runner.buffer_load_path = str(checkpoint) if resume_mode == "full" else None
-    config.runner.step_offset = 100 if resume_mode == "full" else 0
+    config.runner.learning_state_load_path = str(checkpoint) if resume_mode == "fresh_replay_learning_state" else None
+    config.runner.step_offset = 0 if resume_mode == "agent_only" else 100
+    loaded_payloads = []
+    real_torch_load = torch.load
+
+    def observed_load(path, *args, **kwargs):
+        loaded_payloads.append(Path(path).name)
+        if resume_mode == "fresh_replay_learning_state" and Path(path).name == "replay_buffer.pt":
+            pytest.fail("fresh-replay learning-state restore must not open old rewards")
+        return real_torch_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", observed_load)
     torch.manual_seed(312)
     new_torch_rng = torch.get_rng_state().clone()
     runner = OffPolicyRunner(SimpleNamespace(unwrapped=physical), config.runner, config.eval,
@@ -738,10 +751,20 @@ def test_runner_load_restarts_episode_returns_once_without_erasing_learned_state
     assert fresh._alg._last_obs is fresh._alg._last_actions is fresh._alg._cached_noise is None
     assert fresh._alg._noise_repeat_n == 1 and fresh._alg._noise_repeat_count == 0
     assert not fresh._alg.replay_buffer._n_step_transitions
-    if resume_mode == "full":
+    if resume_mode != "agent_only":
         assert fresh_curriculum.state_dict() == saved_learning["curriculum"]
-        torch.testing.assert_close(torch.get_rng_state(), saved_learning["rng"]["torch_cpu"], rtol=0, atol=0)
-        assert fresh._alg.replay_buffer._num_in_buffer == original._alg.replay_buffer._num_in_buffer
+        _tree_equal(capture_rng_state(flat.action_space), saved_learning["rng"])
+        assert runner._step_offset == 100 and runner._nonfinite_steps == saved_learning["nonfinite_steps"]
+        assert LEARNING_STATE_FILE in loaded_payloads
+        if resume_mode == "full":
+            assert fresh._alg.replay_buffer._num_in_buffer == original._alg.replay_buffer._num_in_buffer
+            assert "replay_buffer.pt" in loaded_payloads
+        else:
+            assert fresh._alg.replay_buffer._num_in_buffer == 0
+            assert "replay_buffer.pt" not in loaded_payloads and runner._nonfinite_steps == 7
+            receipt = json.loads((tmp_path / "child/learning-restore.json").read_text())
+            assert receipt["checkpoint"] == str(checkpoint) and receipt["env_step"] == 100
+            assert receipt["curriculum_restored"]
     else:
         assert fresh_curriculum.state_dict() == new_curriculum_state
         torch.testing.assert_close(torch.get_rng_state(), new_torch_rng, rtol=0, atol=0)

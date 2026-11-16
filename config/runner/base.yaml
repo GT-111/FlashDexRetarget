@@ -17,6 +17,8 @@ logging_per_interaction_step: ${eval:'max(1, int(${num_interaction_steps} / 1000
 run_dir: "logs/${algorithm}/${now:%Y-%m-%d_%H-%M-%S}_${logger.wandb.run_name}"
 agent_load_path: null
 buffer_load_path: null
+# Restore RNG/curriculum/progress independently when a changed-reward child needs fresh replay.
+learning_state_load_path: null
 # One-time native actor initialization for added named observations, not FULL resume.
 actor_input_extension_init_path: null
 actor_input_extension_init_config_path: null
@@ -35,6 +37,7 @@ runner:
   run_dir: ${run_dir}
   agent_load_path: ${agent_load_path}
   buffer_load_path: ${buffer_load_path}
+  learning_state_load_path: ${learning_state_load_path}
   actor_input_extension_init_path: ${actor_input_extension_init_path}
   actor_input_extension_init_config_path: ${actor_input_extension_init_config_path}
   save_replay_buffer: ${save_replay_buffer}

@@ -44,12 +44,14 @@ class OffPolicyRunner:
         self._device = str(runner_cfg.device)
         self._n_envs = int(runner_cfg.num_train_envs)
         self._step_offset = int(runner_cfg.get("step_offset", 0))  # env steps done before a resume
+        learning_state_path = runner_cfg.get("learning_state_load_path")
         actor_init = runner_cfg.get("actor_input_extension_init_path")
         actor_init_config = runner_cfg.get("actor_input_extension_init_config_path")
         if (actor_init is None) != (actor_init_config is None):
             raise ValueError("actor input extension requires both checkpoint and parent resolved-config paths")
         if actor_init is not None and (
             runner_cfg.agent_load_path is not None or runner_cfg.buffer_load_path is not None
+            or learning_state_path is not None
             or self._step_offset != 0 or runner_cfg.get("ever_state_path") is not None
         ):
             raise ValueError("actor input extension requires fresh progress and cannot be combined with resume paths")
@@ -108,7 +110,7 @@ class OffPolicyRunner:
             (self._save_path_base / "actor-input-extension.json").write_text(json.dumps(authority, indent=2) + "\n")
         if runner_cfg.agent_load_path is not None:
             self._agent.load(str((_BASE_DIR / runner_cfg.agent_load_path).resolve()))
-            if runner_cfg.buffer_load_path is None:
+            if runner_cfg.buffer_load_path is None and learning_state_path is None:
                 # Warm initialization starts new episodes, not the saved return/noise carry.
                 self._agent.reset_collection()
         if runner_cfg.buffer_load_path is not None:
@@ -128,8 +130,12 @@ class OffPolicyRunner:
             except Exception as exc:  # noqa: BLE001 - a missing curve must not stop training
                 print(f"[eval] ever-success state not restored from {ever_src}: {exc!r}", flush=True)
 
-        if runner_cfg.buffer_load_path is not None:
-            self._restore_learning_state((_BASE_DIR / runner_cfg.buffer_load_path).resolve())
+        # Default FULL resume still takes learning state from the replay source.
+        # An explicit source also supports fresh replay under changed rewards.
+        if learning_state_path is None:
+            learning_state_path = runner_cfg.buffer_load_path
+        if learning_state_path is not None:
+            self._restore_learning_state((_BASE_DIR / learning_state_path).resolve())
 
     # ─── training loop ───────────────────────────────────────────────────────────
 
