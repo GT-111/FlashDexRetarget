@@ -581,8 +581,11 @@ class FlashSACAgent(Agent):
                 or (self._side_action_ids and (self._head_names != head_names
                                              or self._side_action_ids != expected_ids))):
             raise ValueError("actor input extension action columns disagree with the named native scene")
-        parent_obs = {key: value for key, value in parent["obs"].items() if key != "obs_dict"}
-        current_obs = {key: value for key, value in current["obs"].items() if key != "obs_dict"}
+        term_settings = ("obs_params", "obs_scales", "noise_scales")
+        parent_obs = {key: value for key, value in parent["obs"].items()
+                      if key not in ("obs_dict", *term_settings)}
+        current_obs = {key: value for key, value in current["obs"].items()
+                       if key not in ("obs_dict", *term_settings)}
         if parent_obs != current_obs:
             raise ValueError("actor input extension requires unchanged observation transforms and future queries")
         with open(os.path.join(path, "obs_layout.json")) as stream:
@@ -605,6 +608,17 @@ class FlashSACAgent(Agent):
                 raise ValueError(f"actor input extension cannot remove or resize named feature {key}")
             start, _ = new_columns[key]
             indices.extend(range(start, start + width))
+        added_names = {name for _group, name in new_columns.keys() - old_columns.keys()}
+        for setting in term_settings:
+            previous = {name: value for name, value in parent["obs"].get(setting, {}).items()
+                        if name not in added_names}
+            selected = {name: value for name, value in current["obs"].get(setting, {}).items()
+                        if name not in added_names}
+            if previous != selected:
+                raise ValueError(
+                    "actor input extension requires unchanged existing observation transforms "
+                    f"and future queries: {setting}"
+                )
 
         loaded = torch.load(os.path.join(path, CHECKPOINT_FILE), map_location="cpu", mmap=True, weights_only=True)
         prior, target = loaded["actor_state_dict"], self._alg.actor.state_dict()

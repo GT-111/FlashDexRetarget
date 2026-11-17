@@ -649,6 +649,15 @@ An actor observation extension cannot select this learning-state restore.
 
 For native actor-only warm initialization, set `actor_input_extension_init_path=<parent checkpoint>` and `actor_input_extension_init_config_path=<published parent resolved config.yaml>` in a new run. The named input layout may stay the same or add flat features; existing named features cannot be removed or resized. Keep `agent_load_path=null`, `buffer_load_path=null`, `step_offset=0` and `runner.ever_state_path=null`. This explicit initializer requires the same named native action/scene and future encoder/query contract, maps saved named actor inputs and shifted future columns, and zeros only the added input columns. It retains the actor's running BN state without an initialization-time renormalization; critic/targets, reward statistics, replay, optimizers and learning progress start fresh. Strict FULL does not admit an observation-layout change. After the new condition writes its own FULL, clear both initialization paths and use the ordinary same-condition FULL resume commands. C0 preservation and new-column learning are owning software-test claims only after their actual qualification; later normalization/optimizer behavior is a new learning condition.
 
+New named flat inputs may define their own `obs_params`, `obs_scales` and
+`noise_scales`. Every other observation setting, retained input transform and
+encoded-window query must remain unchanged; unrelated map entries are not
+admitted as new inputs. A surface-context child must explicitly retain its
+parent's selected wrist-control carry term. The new input normalization starts
+with weight1, bias0, running mean0 and variance1, while mapped parent columns
+retain their actual values. This initializes the actor function; it does not
+restore a physical episode, curriculum, exploration carry or replay history.
+
 The explicit actor initializer resolves both robot and action scene bindings through `NativeSceneCfg` before comparing their physical meaning. It can read an archived parent's single `object` as one real entry in `objects`; the live child and ordinary runtime/FULL configuration remain collection-only. The scene path, ordered hands, actuators, object roots and parts, root-control law, every other action setting and existing tensor/layout checks must still match. This does not permit adding a hand/object, changing mechanics, remapping unknown action coordinates, or resuming old replay under a changed assistance condition. The initialization receipt records the resolved named scene and whether that archived parent representation was used.
 
 Physical worlds and episodes start fresh. Per-world return carry, correlated exploration noise and
