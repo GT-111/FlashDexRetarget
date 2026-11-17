@@ -337,6 +337,7 @@ class FlashSACAgent(Agent):
 
         self._encoded_layout = [[str(n), int(d)] for n, d in (env_info.get("encoded_obs_dims") or [])]
         self._obs_terms = [list(t) for t in (env_info.get("obs_terms") or [])]
+        self._native_surface_metadata = env_info.get("native_part_surface_metadata", [])
         head_names = self._reward_head_names(cfg, env_info)
         side_action_ids = self._side_action_ids(cfg, env_info, head_names)
         self._head_names, self._side_action_ids = head_names, side_action_ids
@@ -377,6 +378,10 @@ class FlashSACAgent(Agent):
             compactor = build_obs_compactor(env, command_name, resolve_device_type(agent_cfg.device_type))
             env.set_aux_provider(compactor.aux_from_command)
             env_info = {**env_info, "obs_compactor": compactor}
+        surface_terms = {"native_part_point_cloud_wrist", "native_next_part_point_cloud_delta_wrist"}
+        if any(name in surface_terms for _group, name, _width in env_info.get("obs_terms", ())):
+            command = env.unwrapped.command_manager.get_term(command_name)
+            env_info = {**env_info, "native_part_surface_metadata": command.part_surface_geometry_metadata()}
         return cls(env.single_observation_space, env.single_action_space, env_info, agent_cfg)
 
     @staticmethod
@@ -658,7 +663,8 @@ class FlashSACAgent(Agent):
         os.makedirs(path, exist_ok=True)
         torch.save(self._alg.save(), os.path.join(path, CHECKPOINT_FILE))
         with open(os.path.join(path, "obs_layout.json"), "w") as f:
-            json.dump({"encoded_obs_dims": self._encoded_layout, "obs_terms": self._obs_terms}, f)
+            json.dump({"encoded_obs_dims": self._encoded_layout, "obs_terms": self._obs_terms,
+                       "native_part_surface_metadata": self._native_surface_metadata}, f)
         print(f"\033[32m[FlashSAC]\033[0m Successfully saved checkpoint {self._alg.update_step} at {path}.")
 
     def load(self, path: str) -> None:

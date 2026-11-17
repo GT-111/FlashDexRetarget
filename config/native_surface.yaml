@@ -1,0 +1,55 @@
+# Configurable native surface context; assistance remains an independent choice.
+defaults:
+  - native
+  - _self_
+
+native_surface:
+  n_points: 128
+  n_obj_verts: 2048
+
+obs:
+  obs_dict:
+    actor_obs: &surface_observations
+      - robot_wrist_pose_w
+      - robot_wrist_lin_vel_w
+      - robot_wrist_ang_vel_w
+      - robot_joint_pos
+      - robot_joint_vel
+      - robot_tip_trans_wrist
+      - robot_tip_lin_vel_wrist
+      - native_installed_command_error
+      - native_command_reference_error
+      - native_root_reference_error
+      - native_object_parts_wrist
+      - native_reference_parts_wrist
+      - native_object_joint_state
+      - native_object_joint_reference_error
+      - native_reference_support
+      - native_tip_part_distances
+      - native_tip_part_normals_wrist
+      - native_part_point_cloud_wrist
+      - native_next_part_point_cloud_delta_wrist
+    critic_obs: *surface_observations
+  obs_params:
+    native_part_point_cloud_wrist:
+      n_points: ${native_surface.n_points}
+      n_obj_verts: ${native_surface.n_obj_verts}
+    native_next_part_point_cloud_delta_wrist:
+      n_points: ${native_surface.n_points}
+      n_obj_verts: ${native_surface.n_obj_verts}
+
+rewards:
+  shared_terms: [native_object_part_pose, native_part_surface_displacement, native_object_articulation, termination_penalty]
+  reward_weights:
+    native_object_part_pose: 0.0  # Explicitly replace the pose objective in this recipe.
+    native_part_surface_displacement: 1.0
+  reward_params:
+    native_part_surface_displacement:
+      scale: 10.0
+      n_points: ${native_surface.n_points}
+      n_obj_verts: ${native_surface.n_obj_verts}
+      topk: 3
+      topk_frac: 1.0
+      deadband: 0.0
+      norm_radius: 0.058
+      part_reduce: mean

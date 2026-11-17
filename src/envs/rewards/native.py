@@ -5,11 +5,11 @@ from __future__ import annotations
 import math
 
 import torch
-from mjlab.utils.lab_api.math import quat_error_magnitude
+from mjlab.utils.lab_api.math import matrix_from_quat, quat_error_magnitude
 
 from .._common import action_term
 from . import _SIDES
-from .motion_tracking import MotionTrackingRewards
+from .motion_tracking import MotionTrackingRewards, _worst_k_mean
 
 
 def _supported_mean(value, support):
@@ -42,6 +42,35 @@ def _source_intent_mean(value, required, metadata, side):
 
 
 class NativeMotionTrackingRewards(MotionTrackingRewards):
+    @staticmethod
+    def native_part_surface_displacement(
+        env, command_name, scale, n_points=128, n_obj_verts=2048,
+        topk=0, topk_frac=1.0, deadband=0.0, norm_radius=0.0, part_reduce="mean",
+    ):
+        """Shared supported surface displacement; radius scales only rotation leverage."""
+        if (not all(math.isfinite(value) for value in (scale, topk_frac, deadband, norm_radius))
+                or scale <= 0 or not 0 < topk_frac <= 1 or topk < 0 or deadband < 0 or norm_radius < 0
+                or part_reduce not in ("mean", "worst")):
+            raise ValueError("native surface reward requires finite scales, valid pooling and mean/worst part reduction")
+        command = env.command_manager.get_term(command_name)
+        installed = action_term(env).installed_control
+        reference = command.part_surface_reference(
+            motion_ids=installed["reference_motion_ids"], motion_steps=installed["reference_motion_steps"])
+        current, target = command.sim_object_part_state_w, reference["state"].clone()
+        target[..., :3] += env.scene.env_origins[:, None]
+        points = command.part_surface_points(n_points, n_obj_verts)
+        if norm_radius > 0:
+            points = points * (norm_radius / points.norm(dim=-1).amax(-1).clamp_min(1e-6))[:, None, None]
+        delta_rotation = matrix_from_quat(target[..., 3:7]) - matrix_from_quat(current[..., 3:7])
+        displacement = (target[..., :3] - current[..., :3])[..., None, :] + torch.einsum(
+            "bpij,pnj->bpni", delta_rotation, points)
+        error = (_worst_k_mean(displacement.norm(dim=-1), topk, topk_frac) - deadband).clamp_min(0.)
+        support = reference["pose_support"] & installed["installed_valid"][:, None]
+        value = torch.exp(-scale * error)
+        if part_reduce == "mean":
+            return _supported_mean(value, support)
+        return torch.where(support.any(-1), torch.where(support, value, 1.).amin(-1), 0.)
+
     @staticmethod
     def native_source_hand_part_proximity(env, command_name, distance_scale_m, side=None):
         """Source-intended surface approach; SDF proximity is never solved contact."""
