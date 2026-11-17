@@ -545,14 +545,11 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         # Use the real command lifecycle without the stock rigid contact accumulator.
         return CommandTerm.reset(self, env_ids)
 
-    def _update_metrics(self):
+    def _update_metrics(self, env_ids=None):
         from mjlab.utils.lab_api.math import quat_error_magnitude
 
         # This override bypasses common metrics, including its pre-advance phase.
-        self.reference_phase = {
-            "motion_ids": self.motion_ids.clone(),
-            "motion_steps": self.motion_steps.clone(),
-        }
+        self._record_reference_phase(env_ids)
         ml, ids = self.motion_lib, self._motion_flat_ids
         ref = self.ref_native_root_state_w
         root_p = (ref[..., :3] - self.robot_wrist_trans_w).norm(dim=-1)
@@ -572,13 +569,13 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         command_linear = self.command_joint_columns_by_unit["m"]
         part_p = (part_ref[..., :3] - parts[..., :3]).norm(dim=-1)
         part_support = ml.native_object_part_pose_support[ids]
-        self.metrics["native_root_position_error_m"] = (
+        self._set_metric("native_root_position_error_m", (
             torch.where(pose_support, root_p, 0.0).sum(-1) / pose_support.sum(-1).clamp_min(1)
-        )
-        self.metrics["native_part_position_error_m"] = (
+        ), env_ids)
+        self._set_metric("native_part_position_error_m", (
             torch.where(part_support, part_p, 0.0).sum(-1) / part_support.sum(-1).clamp_min(1)
-        )
-        self.native_step_metrics = {
+        ), env_ids)
+        step_metrics = {
             "reference_time_ns": ml.native_time_ns[ids],
             "root_position_error_m": root_p,
             "root_rotation_error_rad": root_r,
@@ -597,6 +594,11 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             "command_position_error_m": command_error[:, command_linear],
             "command_linear_position_support": command_ref["position_support"][:, command_linear],
         }
+        if env_ids is None or not hasattr(self, "native_step_metrics"):
+            self.native_step_metrics = step_metrics
+        else:
+            for name, value in step_metrics.items():
+                self.native_step_metrics[name][env_ids] = value[env_ids]
 
     def _resample_command(self, env_ids):
         ml = self.motion_lib

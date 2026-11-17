@@ -276,18 +276,28 @@ class MotionTrackingCommand(MotionTrackingCommandBase):
 
     # ══ Step ═══════════════════════════════════════════════════════════════════════
 
-    def _update_command(self) -> None:
-        self.motion_steps += 1
+    def refresh(self, env_ids: torch.Tensor) -> None:
+        self._update_metrics(env_ids=env_ids)
+        self._advance_reference(env_ids)
+
+    def _advance_reference(self, env_ids: torch.Tensor | None = None) -> None:
+        rows = slice(None) if env_ids is None else env_ids
+        self.motion_steps[rows] += 1
 
         if self._eval_mode:
-            max_frames = self.motion_lib._motion_num_frames[self.motion_ids]
-            self.motion_steps.clamp_(max=max_frames - 1)
+            max_frames = self.motion_lib._motion_num_frames[self.motion_ids[rows]]
+            self.motion_steps[rows] = self.motion_steps[rows].clamp(max=max_frames - 1)
         else:
             wrap_ids = torch.where(
-                self.motion_steps >= self.motion_lib._motion_num_frames[self.motion_ids]
+                self.motion_steps[rows] >= self.motion_lib._motion_num_frames[self.motion_ids[rows]]
             )[0]
+            if env_ids is not None:
+                wrap_ids = env_ids[wrap_ids]
             if wrap_ids.numel() > 0:
                 self._resample_command(wrap_ids)
+
+    def _update_command(self) -> None:
+        self._advance_reference()
 
         # Ground-resting parked objects are left to the actual physics engine.
         if self.has_objects and self.multi_object and not self._park_inactive_on_ground:

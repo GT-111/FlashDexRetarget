@@ -23,7 +23,6 @@ from mjlab.managers.reward_manager import RewardManager, RewardTermCfg
 from mjlab.managers.termination_manager import TerminationManager, TerminationTermCfg
 from mjlab.utils.spaces import Box, Dict as DictSpace
 
-
 if TYPE_CHECKING:
     from envs.actions.native import NativeActionControlContext
     from envs.commands.motion_tracking.native import NativeCommandControlContext
@@ -244,12 +243,24 @@ class ManagerBasedRlEnv:
             env_ids = torch.arange(self.num_envs, dtype=torch.int64, device=self.device)
         if seed is not None:
             self.seed(seed)
+        full_reset = env_ids.numel() == self.num_envs
+        previous_observations = None
+        if not full_reset:
+            previous_observations = self.obs_buf or self.observation_manager.compute()
         self._reset_idx(env_ids)
         self.scene.write_data_to_sim()
         self.sim.forward()
-        self.command_manager.compute(dt=0.0)
+        if full_reset:
+            self.command_manager.compute(dt=0.0)
+        else:
+            self.command_manager.refresh(env_ids)
         self.sim.sense()
-        self.obs_buf = self.observation_manager.compute(update_history=True)
+        if full_reset:
+            self.obs_buf = self.observation_manager.compute(update_history=True)
+        else:
+            self.obs_buf = self.observation_manager.refresh(
+                env_ids, previous_observations=previous_observations
+            )
         return self.obs_buf, self.extras
 
     def step(self, action: torch.Tensor):

@@ -251,6 +251,8 @@ def test_explicit_parking_preserves_selected_worlds_and_repark_recipe(ground):
     )
 
     class ParkedObjects(MultiObjectMixin, ObjectPropertiesMixin):
+        _advance_reference = MotionTrackingCommand._advance_reference
+
         def __init__(self):
             self._env = SimpleNamespace(scene=scene, num_envs=3)
             self.device = "cpu"

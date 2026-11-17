@@ -187,6 +187,13 @@ solver times retain their own fields and reset origin, independently of the
 original source clock and nominal control elapsed time. Unmeasured reset contact
 samples stay unsupported. The
 author's Isaac net-force/SDF observation views retain their own meaning.
+
+Public partial reset refreshes the selected environments' source phase,
+observation history, delay and episode bias. Unselected environments keep their
+source and physical clocks, controller state and observation history; reset
+returns a new observation packet. Full reset initializes phase zero, and each
+ordinary global step advances every environment once, including autoreset rows.
+
 Named installed mass, COM and body-frame inertia feed the shared root and
 object-control owners. Isaac gravity uses its real scene-global API; native
 MjWarp/Newton currently admit constant constructor gravity only. See
