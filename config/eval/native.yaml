@@ -1,6 +1,9 @@
 # @package _global_
 
 eval:
+  # Null loads the configured learner checkpoint. An explicit Policy _target_
+  # selects an analytic evaluator and must not be paired with --checkpoint.
+  policy: null
   interval: 20_000_000
   num_per_motion: 1
   save_success_data: true

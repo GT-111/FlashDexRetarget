@@ -107,7 +107,7 @@ def export_current_attempts(
         "schema": "frozen_current_policy_attempts_v1", "evaluation_id": evaluation_id,
         "selection": "all_current_attempts; independent of first_success_ever archive",
         "env_step": int(env_step), "frozen_authority": frozen_authority,
-        "authority_scope": "explicit caller-declared loaded checkpoint/source; exporter does not infer or verify loader history",
+        "authority_scope": "explicit caller-declared acting method/source, including analytic methods; exporter does not infer or verify loader history",
         "motion_file": motion_file, "selected_motion_count": len(motions),
         "configured_replicas_per_motion": int(num_per_motion),
         "evaluation_report": os.path.relpath(evaluation_report, out_dir),

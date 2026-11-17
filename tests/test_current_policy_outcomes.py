@@ -184,7 +184,7 @@ def test_normal_runner_eval_persists_all_current_attempts_and_real_support(tmp_p
     assert sensor["raw_sum_sensor_force_N"] == [[10.0, 0.0], [10.0, 0.0]]
     assert sensor["max_miss_streak_steps"] == [[0.0, 0.0], [0.0, 2.0]]
     assert not report["callback_metadata"][contact]["sensor_measurement_authority"]["pair_force_supported"]
-    assert "UNQUALIFIED" in report["physical_task_or_BOX_success"]
+    assert "UNQUALIFIED" in report["physical_task_success"]
     assert (runner._success_dir / "manifest.json").read_text() == old_archive
     # Periodic and final evaluation can share an env_step; keep both actual sweeps.
     OffPolicyRunner._run_eval(runner, 4096)
@@ -253,7 +253,7 @@ def test_native_current_rows_preserve_missing_support_empty_hinges_and_failure(t
     assert len(joint_names) == (0 if rigid else 2)
     assert len(result["attempts"][0]["masses"]["joint_position_error_rad"]) == len(joint_names)
     assert "no contact/task" in report["callback_metadata"][key]["meaning"]
-    assert "UNQUALIFIED" in report["physical_task_or_BOX_success"]
+    assert "UNQUALIFIED" in report["physical_task_success"]
 
 
 class _RecordedEvaluationEnv(_EvaluationEnv):
@@ -344,7 +344,7 @@ def test_frozen_eval_without_selected_recorder_retains_actual_unavailable_attemp
 
 def test_frozen_recording_requires_authority_before_any_rollout(tmp_path):
     env, agent = _EvaluationEnv(), _Agent()
-    with pytest.raises(ValueError, match="checkpoint and source_revision"):
+    with pytest.raises(ValueError, match="acting method and source_revision"):
         evaluate(agent, env, _config(), "cpu", outcome_dir=tmp_path, recording_dir=tmp_path / "records")
     assert agent.calls == env.exit_count == 0
 
@@ -363,3 +363,49 @@ def test_unmasked_cpu_recorder_identity_survives_restore_train_mutation():
     env.exit_eval()  # Restoring TRAIN changes the same CPU motion_ids in place.
     assert state["motion_ids"].tolist() == [1, 0, 1, 0]
     assert recorder.rollout_arrays([state], 0)["motion_id"] == 1
+
+
+@pytest.mark.parametrize("failed_stage", ("policy", "callback", "reduction"))
+def test_analytic_frozen_failure_preserves_actual_prefix_and_unexecuted_attempts(tmp_path, monkeypatch, failed_stage):
+    import importlib
+
+    module = importlib.import_module("evaluation.evaluate")
+    env, cfg, agent = _RecordedEvaluationEnv(), _config(), _Agent()
+    cfg.callbacks.append({"_target_": "evaluation.callbacks.rollout_record.RolloutRecord"})
+    agent.acting_authority = dict(kind="analytic", method_id="fixture-reference-follower", has_learned_parameters=False,
+                                 checkpoint=None, deterministic=True)
+    if failed_stage == "policy":
+        act = agent.act
+        def failing_act(obs, deterministic):
+            result = act(obs, deterministic)
+            if agent.calls == 2:
+                raise RuntimeError("fixture acting failure")
+            return result
+        agent.act = failing_act
+    elif failed_stage == "callback":
+        from evaluation.callbacks.tracking_performance import TrackingPerformance
+        def failing_step(self, env):
+            raise RuntimeError("fixture scoring failure after physical return")
+        monkeypatch.setattr(TrackingPerformance, "on_step", failing_step)
+    else:
+        monkeypatch.setattr(module, "reduce_metrics", lambda *_: (_ for _ in ()).throw(RuntimeError("fixture reduction failure")))
+    with pytest.raises(RuntimeError, match="fixture"):
+        evaluate(agent, env, cfg, "cpu", outcome_dir=tmp_path, recording_dir=tmp_path / "records",
+                 frozen_authority=dict(source_revision="fixture-source", policy=agent.acting_authority))
+    report = json.loads(next(tmp_path.glob("current-policy-*.json")).read_text())
+    manifest_path = tmp_path / report["factual_recording_manifest"]
+    manifest = json.loads(manifest_path.read_text())
+    assert report["policy_authority"]["kind"] == "analytic" and report["policy_authority"]["checkpoint"] is None
+    assert report["evaluation_error"]["stage"] == ("metric_reduction" if failed_stage == "reduction" else "rollout")
+    assert "UNKNOWN" in report["evaluation_error"]["scoring"]
+    assert all(not row["callbacks"] for row in report["motions"])
+    actual = [row for motion in manifest["motions"] for row in motion["attempts"] if row["execution"] == "executed"]
+    assert len(actual) == (6 if failed_stage == "reduction" else 4)
+    assert manifest["motions"][2]["attempts"][0]["execution"] == "not_evaluated"
+    for row in actual:
+        assert row["recording"]["status"] == "recorded"
+        with np.load(manifest_path.parent / row["recording"]["rollout"], allow_pickle=False) as arrays:
+            assert len(arrays["joint_pos"]) >= 1
+            if failed_stage != "reduction":
+                assert len(arrays["joint_pos"]) == 1
+    assert env.exit_count == 1

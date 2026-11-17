@@ -19,6 +19,18 @@ from agents import Policy
 from evaluation.callbacks.success_export import export_current_attempts, export_success
 
 
+def validate_recording_authority(authority):
+    """Require a real learned checkpoint or explicit parameterless method identity."""
+    if not authority or not authority.get("source_revision"):
+        raise ValueError("frozen recording requires explicit acting method and source_revision authority")
+    if authority.get("checkpoint"):
+        return
+    policy = authority.get("policy", {})
+    if (policy.get("kind") != "analytic" or policy.get("has_learned_parameters") is not False
+            or not policy.get("method_id") or policy.get("checkpoint") is not None):
+        raise ValueError("analytic recording requires a named parameterless policy without a checkpoint")
+
+
 def evaluate(
     agent: Policy,
     eval_env: RslRlVecEnvWrapper,
@@ -36,8 +48,7 @@ def evaluate(
     states into metrics."""
     raw_eval = eval_env.unwrapped
     if recording_dir is not None:
-        if not frozen_authority or not all(frozen_authority.get(key) for key in ("checkpoint", "source_revision")):
-            raise ValueError("frozen recording requires explicit loaded checkpoint and source_revision authority")
+        validate_recording_authority(frozen_authority)
     # Keep capture only for a selected success archive or explicit frozen export.
     save_success = bool(eval_cfg.get("save_success_data", True))
     callbacks = [
@@ -46,17 +57,37 @@ def evaluate(
     ]
 
     attempt_rows = [] if recording_dir is not None else None
-    states = _rollout(agent, eval_env, callbacks, device, attempt_rows=attempt_rows)
-
-    metrics = reduce_metrics(callbacks, states)
-    metrics.update(tracking_success_metrics(
-        raw_eval, eval_cfg, callbacks, states, ever_state,
-        success_dir if save_success else None, env_step,
-    ))
-    write_current_policy_outcomes(agent, raw_eval, eval_cfg, callbacks, states, metrics,
-                                  outcome_dir=outcome_dir, env_step=env_step,
-                                  recording_dir=recording_dir, frozen_authority=frozen_authority,
-                                  attempt_rows=attempt_rows)
+    states = {id(cb): [] for cb in callbacks if hasattr(cb, "reduce_state")}
+    stage = "rollout"
+    try:
+        _rollout(agent, eval_env, callbacks, device, attempt_rows=attempt_rows, states=states)
+        stage = "metric_reduction"
+        metrics = reduce_metrics(callbacks, states)
+        metrics.update(tracking_success_metrics(
+            raw_eval, eval_cfg, callbacks, states, ever_state,
+            success_dir if save_success else None, env_step,
+        ))
+        stage = "outcome_export"
+        write_current_policy_outcomes(agent, raw_eval, eval_cfg, callbacks, states, metrics,
+                                      outcome_dir=outcome_dir, env_step=env_step,
+                                      recording_dir=recording_dir, frozen_authority=frozen_authority,
+                                      attempt_rows=attempt_rows)
+    except BaseException as exc:
+        if recording_dir is not None:
+            # A failed forward or scorer does not erase already recorded facts.
+            # Do not reduce partial metric callbacks into successful outcomes.
+            recorders = [cb for cb in callbacks if hasattr(cb, "rollout_arrays")]
+            try:
+                write_current_policy_outcomes(
+                    agent, raw_eval, eval_cfg, recorders, states, {}, outcome_dir=outcome_dir,
+                    env_step=env_step, recording_dir=recording_dir, frozen_authority=frozen_authority,
+                    attempt_rows=attempt_rows,
+                    evaluation_error={"stage": stage, "exception": f"{type(exc).__name__}: {exc}",
+                                      "scoring": "UNKNOWN; factual prefixes do not establish task success"},
+                )
+            except BaseException:
+                traceback.print_exc()  # Keep the original failure as the raised exception.
+        raise
     return {f"eval/{k}": float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
 
 
@@ -82,6 +113,7 @@ def write_current_policy_outcomes(
     agent, raw_eval, eval_cfg, callbacks, states, metrics, *, outcome_dir: Path, env_step: int,
     recording_dir: Path | None = None, frozen_authority: dict[str, Any] | None = None,
     attempt_rows: list[dict[str, int]] | None = None,
+    evaluation_error: dict[str, Any] | None = None,
 ) -> Path:
     """Persist every current attempt separately from first/ever-success selection."""
     library = raw_eval.command_manager.get_term(eval_cfg.command_name).motion_lib
@@ -128,10 +160,10 @@ def write_current_policy_outcomes(
     recorded_at = datetime.now(timezone.utc)
     report = {
         "selection": "current_policy_all_attempts; independent of first_success_ever archive",
-        "policy_authority": {"kind": "current_in_memory_agent", "deterministic": True,
+        "policy_authority": getattr(agent, "acting_authority", {"kind": "current_in_memory_agent", "deterministic": True,
                              "agent_class": f"{type(agent).__module__}.{type(agent).__qualname__}",
                              "training_env_step": int(env_step),
-                             "checkpoint_mapping": "Normal post-evaluation FULL/operation receipt; no checkpoint is inferred here"},
+                             "checkpoint_mapping": "Normal post-evaluation FULL/operation receipt; no checkpoint is inferred here"}),
         "recorded_UTC": recorded_at.isoformat(),
         "motion_file": getattr(library, "motion_file", None),
         "selected_motion_count": len(motions), "configured_replicas_per_motion": int(eval_cfg.num_per_motion),
@@ -139,8 +171,10 @@ def write_current_policy_outcomes(
         "callback_metadata": callback_metadata, "motions": motions,
         "ordinary_aggregate_metrics": _json_value(metrics),
         "aggregate_note": "Original aggregate reduction/fallback and SR thresholds remain unchanged; attempt denominators are explicit",
-        "physical_task_or_BOX_success": "UNQUALIFIED by generic tracking or SDF/contact association metrics",
+        "physical_task_success": "UNQUALIFIED by generic tracking or SDF/contact association metrics; consume the declared downstream task contract",
     }
+    if evaluation_error is not None:
+        report["evaluation_error"] = evaluation_error
     outcome_dir = Path(outcome_dir)
     outcome_dir.mkdir(parents=True, exist_ok=True)
     destination = outcome_dir / f"current-policy-{int(env_step):012d}-{recorded_at:%Y%m%dT%H%M%S%fZ}.json"
@@ -184,6 +218,7 @@ def write_current_policy_outcomes(
 def _rollout(
     agent: Policy, eval_env: RslRlVecEnvWrapper, callbacks: list, device: str,
     *, attempt_rows: list[dict[str, int]] | None = None,
+    states: dict[int, list] | None = None,
 ) -> dict[int, list]:
     """Reset + deterministic inference over every eval batch;
     returns each metric callback's per-batch states, keyed by id(callback)."""
@@ -191,36 +226,43 @@ def _rollout(
     setup_cb = next(cb for cb in callbacks if hasattr(cb, "set_batch"))
     metric_cbs = [cb for cb in callbacks if hasattr(cb, "reduce_state")]
     eval_k, num_motions = raw_eval.eval_k, raw_eval.eval_num_motions
-    states: dict[int, list] = {id(cb): [] for cb in metric_cbs}
-    with torch.no_grad():
-        for b in range(raw_eval.eval_num_batches):
-            setup_cb.set_batch(b, eval_k, num_motions)
-            for cb in callbacks:
-                if hasattr(cb, "on_eval_setup"):
-                    cb.on_eval_setup(raw_eval)
-            obs, _ = eval_env.reset()
-            for cb in callbacks:
-                cb.on_start(raw_eval)
-            enc_keys = sorted(key for key in obs.keys() if key not in ("actor", "critic"))
-            n_steps = max(1, max((int(getattr(cb, "rollout_steps", 0)) for cb in callbacks), default=1))
-            active_mask = setup_cb.active_mask
-            if attempt_rows is not None:
-                command = raw_eval.command_manager.get_term(setup_cb.command_name)
-                selected = (torch.arange(raw_eval.num_envs, device=raw_eval.device) if active_mask is None
-                            else torch.nonzero(active_mask, as_tuple=False).flatten())
-                motion_ids = command.motion_ids[selected].detach().cpu().tolist()
-                for env_index, motion_id in zip(selected.detach().cpu().tolist(), motion_ids, strict=True):
-                    attempt_rows.append({"evaluation_row": len(attempt_rows), "batch_index": b,
-                                         "env_index": int(env_index), "motion_id": int(motion_id)})
-            for _ in range(n_steps):
-                actions = agent.act(_flat_actor_obs(obs, enc_keys), deterministic=True)
-                obs, _, _, _ = eval_env.step(torch.as_tensor(np.asarray(actions), device=device))
+    states = {id(cb): [] for cb in metric_cbs} if states is None else states
+    try:
+        with torch.no_grad():
+            for b in range(raw_eval.eval_num_batches):
+                setup_cb.set_batch(b, eval_k, num_motions)
                 for cb in callbacks:
-                    cb.on_step(raw_eval)
-            for cb in metric_cbs:
-                states[id(cb)].append(cb.collect_state(active_mask))
-    if hasattr(eval_env, "exit_eval"):
-        eval_env.exit_eval()
+                    if hasattr(cb, "on_eval_setup"):
+                        cb.on_eval_setup(raw_eval)
+                obs, _ = eval_env.reset()
+                for cb in callbacks:
+                    cb.on_start(raw_eval)
+                enc_keys = sorted(key for key in obs.keys() if key not in ("actor", "critic"))
+                n_steps = max(1, max((int(getattr(cb, "rollout_steps", 0)) for cb in callbacks), default=1))
+                active_mask = setup_cb.active_mask
+                if attempt_rows is not None:
+                    command = raw_eval.command_manager.get_term(setup_cb.command_name)
+                    selected = (torch.arange(raw_eval.num_envs, device=raw_eval.device) if active_mask is None
+                                else torch.nonzero(active_mask, as_tuple=False).flatten())
+                    motion_ids = command.motion_ids[selected].detach().cpu().tolist()
+                    for env_index, motion_id in zip(selected.detach().cpu().tolist(), motion_ids, strict=True):
+                        attempt_rows.append({"evaluation_row": len(attempt_rows), "batch_index": b,
+                                             "env_index": int(env_index), "motion_id": int(motion_id)})
+                completed = False
+                try:
+                    for _ in range(n_steps):
+                        actions = agent.act(_flat_actor_obs(obs, enc_keys), deterministic=True)
+                        obs, _, _, _ = eval_env.step(torch.as_tensor(np.asarray(actions), device=device))
+                        for cb in sorted(callbacks, key=lambda item: not hasattr(item, "rollout_arrays")):
+                            cb.on_step(raw_eval)
+                    completed = True
+                finally:
+                    for cb in sorted(metric_cbs, key=lambda item: not hasattr(item, "rollout_arrays")):
+                        if completed or hasattr(cb, "rollout_arrays"):
+                            states[id(cb)].append(cb.collect_state(active_mask))
+    finally:
+        if hasattr(eval_env, "exit_eval"):
+            eval_env.exit_eval()
     return states
 
 

@@ -160,6 +160,7 @@ def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_
     from dexforge_tracking.envs.physics import NativeSceneSpec
 
     layout, _mapping, model = _mechanics(tmp_path)
+    model.opt.timestep = .005
     backend = MagicMock(spec=NewtonDeviceBackend)
     backend.model = model
     state = SimpleNamespace(qpos=torch.tensor(np.tile(model.qpos0, (2, 1)), dtype=torch.float32),
@@ -214,6 +215,85 @@ def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_
     np.testing.assert_array_equal(requested[1], [part])
     qpos, qvel = plant.state()
     assert qpos is state.qpos and qvel is state.qvel
+
+
+@pytest.mark.parametrize("dt", (.005, 1 / 240))
+def test_newton_execution_clock_tracks_accepted_calls_partial_reset_and_restore(tmp_path, dt):
+    _layout, _mapping, model = _mechanics(tmp_path)
+    model.opt.timestep = dt
+    plant = object.__new__(NewtonPlant)
+    plant._init_buffers(model, 2, "cpu", {"left/base": ([1], [2])})
+    plant.identity = {"backend": "newton", "fixture": "public backend protocol, not physical qualification"}
+    plant.effort = torch.zeros(2, model.nv)
+    plant._state = SimpleNamespace(qpos=torch.tensor(np.tile(model.qpos0, (2, 1)), dtype=torch.float32),
+                                   qvel=torch.zeros(2, model.nv))
+    plant._world_ids, plant._body_ids = torch.arange(2), torch.arange(1, model.nbody)
+    raw_clock = torch.tensor([125., 7.], dtype=torch.float32)
+    facts = dict(normal_force_n=torch.ones(2), force_bearing_contact_present=torch.ones(2, dtype=torch.bool),
+                 force_bearing_distance_max_m=torch.full((2,), .001))
+    calls = []
+    def advance(control, *, nsteps):
+        calls.append(plant.execution_clock()["steps"].clone())
+        assert nsteps == 1
+        raw_clock.add_(dt)
+        return SimpleNamespace(public_state=plant._state, applied_joint_effort=torch.zeros(2, model.nv))
+    def set_state(rows, *, qpos, qvel):
+        plant._state.qpos[rows], plant._state.qvel[rows] = qpos, qvel
+        raw_clock[rows] = 0
+        return plant._state
+    def restore(state, *, source_rows):
+        raw_clock.copy_(state)
+        return plant._state
+    plant.backend = SimpleNamespace(model=model, get_physics_time_torch=lambda: raw_clock.clone(),
+        set_body_wrench_w_torch=lambda *args, **kwargs: None, step_torch=advance,
+        get_body_pair_contact_facts=lambda *args: facts, set_state_torch=set_state,
+        get_default_qpos=lambda: model.qpos0.copy(), capture_full_physics_state=lambda: raw_clock.clone(),
+        restore_full_physics_state_torch=restore)
+    plant._bind_execution_clock(dt)
+    plant.configure_control_interval(4)
+    plant.contact_interval.begin()
+    for _ in range(4):
+        plant.advance()
+    plant.contact_interval.finish()
+    assert plant.execution_clock()["steps"].tolist() == [4, 4]
+    assert len(calls) == 4 and calls[0].tolist() == [0, 0]
+    interval = plant.contact_interval.facts()
+    assert interval["execution_interval_complete"].all()
+    torch.testing.assert_close(interval["execution_sample_begin_step"], torch.arange(4).expand(2, -1))
+    metadata = plant.execution_clock()["metadata"]
+    assert metadata["schema"] == "accepted_newton_fixed_step_clock_v1"
+    assert metadata["configured_native_timestep_verified"] is True
+    assert "configured_device_cast_verified" not in metadata
+    snapshot = plant.snapshot()
+    plant.advance()
+    plant.restore(snapshot)
+    assert plant.execution_clock()["steps"].tolist() == [4, 4]
+    torch.testing.assert_close(raw_clock, snapshot.physics[0])
+    assert not plant.contact_interval.facts()["execution_interval_complete"].any()
+    plant.forward()
+    plant.set_state(torch.tensor([1]), plant._state.qpos[1:].clone(), plant._state.qvel[1:].clone())
+    assert plant.execution_clock()["steps"].tolist() == [4, 4]
+    plant.reset(torch.tensor([1]))
+    assert plant.execution_clock()["steps"].tolist() == [4, 0]
+    assert raw_clock[0] == snapshot.physics[0][0]
+    plant.contact_interval.begin()
+    for _ in range(4):
+        plant.record_contact_substep()
+    plant.contact_interval.finish()
+    assert not plant.contact_interval.facts()["execution_interval_complete"].any()
+    def failed_step(*args, **kwargs):
+        raise RuntimeError("fixture solver did not return")
+    plant.backend.step_torch = failed_step
+    with pytest.raises(RuntimeError, match="did not return"):
+        plant.advance()
+    assert plant.execution_clock()["steps"].tolist() == [4, 0]
+
+
+def test_newton_execution_clock_rejects_a_different_installed_native_timestep():
+    plant = object.__new__(NewtonPlant)
+    plant.backend = SimpleNamespace(model=SimpleNamespace(opt=SimpleNamespace(timestep=.002)))
+    with pytest.raises(ValueError, match="installed fixed native timestep"):
+        plant._bind_execution_clock(.005)
 
 
 @pytest.mark.parametrize("dt", (.005, 1 / 240))

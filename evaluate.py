@@ -1,4 +1,4 @@
-"""Evaluate one frozen checkpoint through the ordinary environment and callbacks."""
+"""Evaluate a frozen checkpoint or configured analytic Policy with ordinary callbacks."""
 
 from __future__ import annotations
 
@@ -26,9 +26,12 @@ def run(args: argparse.Namespace) -> None:
     config_dir = (Path(__file__).resolve().parent / args.config_path).resolve()
     with hydra.initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         cfg = hydra.compose(config_name=args.config_name, overrides=args.overrides)
-    checkpoint = Path(args.checkpoint).expanduser().resolve()
-    resume = json.loads((checkpoint / "resume_state.json").read_text())
-    env_step = int(resume["env_step"])
+    policy_cfg = cfg.eval.get("policy")
+    if (args.checkpoint is None) == (policy_cfg is None):
+        raise ValueError("select exactly one --checkpoint or configured eval.policy")
+    checkpoint = None if args.checkpoint is None else Path(args.checkpoint).expanduser().resolve()
+    resume = None if checkpoint is None else json.loads((checkpoint / "resume_state.json").read_text())
+    env_step = 0 if resume is None else int(resume["env_step"])
     run_dir = Path(cfg.run_dir).expanduser().resolve()
     cfg.run_dir = str(run_dir)
     OmegaConf.resolve(cfg)
@@ -38,8 +41,8 @@ def run(args: argparse.Namespace) -> None:
     OmegaConf.save(cfg, str(run_dir / "config.yaml"))
     authority = {
         "status": "PREPARED_NOT_EVALUATED",
-        "checkpoint": str(checkpoint),
-        "training_env_step": env_step,
+        "checkpoint": None if checkpoint is None else str(checkpoint),
+        "training_env_step": None if resume is None else env_step,
         "resume_state": resume,
         "executable_source": str(Path(__file__).resolve()),
         "executable_source_revision": source_revision,
@@ -69,32 +72,37 @@ def run(args: argparse.Namespace) -> None:
             train_env, eval_env = create_envs(cfg, device=cfg.device)
             cleanup.callback(eval_env.close)
             cleanup.callback(train_env.close)
-            train_command = train_env.unwrapped.command_manager.get_term(cfg.eval.command_name)
-            heads_cfg = cfg.runner.agent.get("reward_heads", None)
-            flat = FlatObsVecEnv.from_env(
-                train_env.unwrapped, command=train_command,
-                share_obs=bool(cfg.runner.share_actor_critic_obs),
-                reward_heads=OmegaConf.to_container(heads_cfg, resolve=True) if heads_cfg is not None else None,
-            )
-            # This is the ordinary setup reset that supplies the agent's actual
-            # layout/head/action metadata, not an extra scored attempt.
-            _, env_info = flat.reset()
-            policy = load_policy(cfg.runner.agent, flat, env_info, cfg.eval.command_name, str(checkpoint))
-            OmegaConf.save(cfg, str(run_dir / "config.yaml"))
             raw_eval = eval_env.unwrapped
             command = raw_eval.command_manager.get_term(cfg.eval.command_name)
-            authority["policy"] = policy.checkpoint_authority
+            if policy_cfg is None:
+                train_command = train_env.unwrapped.command_manager.get_term(cfg.eval.command_name)
+                heads_cfg = cfg.runner.agent.get("reward_heads", None)
+                flat = FlatObsVecEnv.from_env(
+                    train_env.unwrapped, command=train_command,
+                    share_obs=bool(cfg.runner.share_actor_critic_obs),
+                    reward_heads=OmegaConf.to_container(heads_cfg, resolve=True) if heads_cfg is not None else None,
+                )
+                # Ordinary loader setup, not an additional scored attempt.
+                _, env_info = flat.reset()
+                policy = load_policy(cfg.runner.agent, flat, env_info, cfg.eval.command_name, str(checkpoint))
+                authority["policy"] = policy.checkpoint_authority
+                authority["layout"] = {
+                    "flat_observation_shape": list(flat.single_observation_space.shape),
+                    "action_shape": list(flat.single_action_space.shape),
+                    "env_info": {name: env_info.get(name) for name in (
+                        "actor_observation_size", "encoded_obs_dims", "obs_terms", "reward_heads", "action_sides")},
+                }
+            else:
+                policy = hydra.utils.instantiate(policy_cfg, env=raw_eval)
+                authority["policy"] = policy.acting_authority
+                authority["layout"] = {"action_shape": list(raw_eval.action_space.shape),
+                                       "observation_consumption": "configured analytic Policy; no learned observation encoder"}
+            OmegaConf.save(cfg, str(run_dir / "config.yaml"))
             authority["configured_disable_object_pin"] = bool(cfg.eval.env.disable_object_pin)
             authority["pin_before_eval"] = bool(command.cfg.object.pin_objects)
             eval_env.enter_eval()
             authority["pin_during_eval"] = bool(command.cfg.object.pin_objects)
             authority["shared_eval_wrench_clear"] = "Ordinary enter_eval called its existing object-wrench clear; this is a submitted clear, not force measurement."
-            authority["layout"] = {
-                "flat_observation_shape": list(flat.single_observation_space.shape),
-                "action_shape": list(flat.single_action_space.shape),
-                "env_info": {name: env_info.get(name) for name in (
-                    "actor_observation_size", "encoded_obs_dims", "obs_terms", "reward_heads", "action_sides")},
-            }
             authority["evaluation_plan"] = {
                 "worlds": int(raw_eval.num_envs),
                 "motion_count": int(raw_eval.eval_num_motions),
@@ -113,8 +121,8 @@ def run(args: argparse.Namespace) -> None:
                 outcome_dir=run_dir / "evaluation",
                 recording_dir=recording_dir,
                 frozen_authority=(None if recording_dir is None else {
-                    "checkpoint": str(checkpoint), "source_revision": source_revision,
-                    "training_env_step": env_step, "policy": policy.checkpoint_authority,
+                    "checkpoint": None if checkpoint is None else str(checkpoint), "source_revision": source_revision,
+                    "training_env_step": None if resume is None else env_step, "policy": authority["policy"],
                 }),
             )
             print(f"[evaluation] training_env_step={env_step} {metrics}", flush=True)
@@ -141,7 +149,7 @@ def run(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev=False)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", help="Frozen learned policy; omit when eval.policy selects an analytic Policy")
     parser.add_argument("--recording_dir", help="Retain every attempt with the configured rollout recorder")
     parser.add_argument("--config_path", default="config")
     parser.add_argument("--config_name", default="flashdexretarget")

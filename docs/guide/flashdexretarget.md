@@ -325,12 +325,14 @@ current manager control interval, with solver begin/end clocks, independent
 recording/measurement/clock support and named hand-subtree × object-part
 addresses. These discrete solved samples do not certify continuous force.
 
-Direct MjWarp also exposes `physics_execution_clock()`: int64 counts of accepted
-backend advances and the configured/device timestep witness. The constructor
-checks the installed fixed timestep against its actual device cast. Only an
+Direct MjWarp and Newton expose `physics_execution_clock()`: int64 counts of
+accepted backend advances. MjWarp checks the installed fixed timestep against
+its actual device cast; Newton checks the public compiled native timestep used
+by its owning backend and declares its own `accepted_newton_fixed_step_clock_v1`
+schema without claiming MjWarp's device-cast witness. Only an
 actual advance increments the count; forward and authored state installation do
 not. Selected reset clears only selected counts, and same-plant snapshot/restore
-retains them. Newton and Isaac leave this clock unavailable.
+retains them. Isaac leaves this clock unavailable.
 
 The recorder preserves `native_execution_steps` and matching per-substep count
 boundaries beside unchanged `native_physics_time_s` and raw contact clocks.
@@ -829,6 +831,31 @@ batch/world addresses and per-motion replica indices join the scalar report to
 the NPZ's embedded attempt identity. Planned but unexecuted slots and unavailable
 recorders retain reasons without invented arrays. This selected-library roster
 does not replace an external task family's original planned population.
+
+### Evaluate an analytic native reference follower
+
+Select `eval=native_reference` and omit `--checkpoint` to use the configured
+`evaluation.policies.NativeReferenceFollower` through this same entry and
+callbacks. Supply the normal native scene, source carrier, recording binding and
+task configuration. The follower reads `command_reference()` at the actual next
+control endpoint, maps named independent fingers through their real command
+bounds and inverse action affine, and requests zero FREE-root correction. Normal
+projection, unsupported-command hold and reference pose/rate installation remain
+with the existing native action owner. Its finger filter must be disabled and
+the absolute finger path selected. No actor, critic, replay or optimizer is built.
+
+The explicit acting authority has `kind="analytic"`, a configured method ID,
+`has_learned_parameters=false` and `checkpoint=null`. Direct callers pass that
+policy authority and actual `source_revision` in `frozen_authority`; no fake
+checkpoint path is required. Selecting both an analytic policy and checkpoint
+is an error. Analytic reference following measures execution feasibility and
+tracking; it is not a learned-policy or successful-interaction claim.
+
+When an acting or scoring failure interrupts a recorded evaluation, already
+completed attempts and the current recorded prefix are exported before the
+original exception is raised. Their report records the failure stage and UNKNOWN
+scoring, while unexecuted planned slots retain their normal reasons and denominator.
+No partial metric callback is promoted to successful task evidence.
 
 Native source phases, exact source clocks, physical clocks, raw interval contacts
 and their support retain the recorder's arrays and dtypes. First-success archives
