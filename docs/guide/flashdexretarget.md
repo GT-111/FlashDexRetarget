@@ -664,7 +664,7 @@ snapshot. The new run writes `learning-restored.pt` and `learning-restore.json` 
 its actual restored RNG and curriculum state can be compared with the full checkpoint. Old replay
 files lacking the current fragment and learning state are not full learning resumes.
 
-The native task uses the same compact replay implementation. Only its future
+The native task uses the same compact replay implementation. Its future
 reference span is dropped; its factual base observations stay stored. The shared
 native future builder reconstructs that span from scene-local wrist p/WXYZ,
 WORLD linear/angular velocity, complete named hand Q/Qvel, object-joint Q/Qvel,
@@ -679,6 +679,57 @@ command columns, clipped reconstruction inputs or zero source scales cannot
 recover the factual input and are rejected. Q/Qvel must observe the command's
 actual robot entity; a different entity with matching scalar names cannot supply
 its physical facts.
+
+Select `--config_name native_surface` for optional named-part surface context.
+This recipe extends both actor and critic with `native_part_point_cloud_wrist`
+and `native_next_part_point_cloud_delta_wrist`. Point and candidate-pool counts
+come from `native_surface.n_points` and `native_surface.n_obj_verts` (defaults
+128 and 2048). Each configured real part supplies its existing `mesh_path` and
+body-from-mesh transform. Sampling uses the shared deterministic area-uniform
+surface pool and farthest-point selection once per configured count/pool/device;
+every consumer uses the same cached body-local samples. No hand-associated
+object slots, mesh recentering, or observation size normalization are introduced.
+
+Each surface observation orders XYZ by actual hand side, configured entity/part,
+then sample, and appends independent hand/part support masks. For `H` hands,
+`P` parts and `N` samples its width is `H*P*(3*N+1)`. The live cloud uses the
+physical wrist frame. The displacement observation subtracts the live cloud from
+the next supported reference cloud in that same frame; next queries retain the
+native int64 clock and unavailable tails have zero values with false support.
+Actual rigid roots and passive articulated parts keep their normal body poses.
+The shared surface reward instead reads the **consumed installed reference**.
+It computes `dt + (R_reference - R_live)*p`, averages the largest configured
+point displacements per part, applies the deadband, then returns
+`exp(-scale*error)`. Only this reward optionally rescales each part's local
+rotational lever arms to `norm_radius`; translation and both observations stay
+in physical metres. `part_reduce: mean` uses the independently supported part
+population; `worst` selects its lowest supported part reward. No support yields
+zero reward mass. The example explicitly sets `native_object_part_pose` to zero
+and selects one shared surface term at weight 1, scale 10, worst 3 points,
+zero deadband and radius 0.058 m. Assistance remains a separate configuration.
+Per-part pooling and normalization are a declared extension of the original
+rigid-object mechanism, not established cross-object generalization.
+
+The existing replay compactor drops both surface spans and rebuilds them from
+stored `native_object_parts_wrist`, scene-local wrist p/WXYZ, the exact stored
+motion ID/step, immutable source masks and the same cached geometry. It decodes
+the stored per-hand feature-major chart `[all positions, all rotation6D, all
+linear rates, all angular rates]`. It does not consult live worlds or store an
+extra dense next cloud. A bilateral singleton with 128 samples therefore avoids
+1536 XYZ values per replay row, plus the two surface terms' four support values;
+its factual part/wrist state remains stored. The same lossless-source rules and
+separate FP16 qualification below apply.
+
+`obs_layout.json` records the selected static surface geometry even when replay
+compaction is disabled. `NativeRolloutRecord` exports
+`native_part_surface_metadata_json` once per tape: actual entity/part/body
+addresses, body-from-mesh transforms, ordered sampled body-local points and
+count/pool/frame conventions. It does not duplicate clouds per step. The changed
+actor/critic input graph needs a genuinely fresh condition or the explicit named
+actor input extension initializer above; strict FULL requires its unchanged
+layout. Contact wrench/location observations are separate from these surface
+features. Software or replay parity alone does not establish successful physical
+interaction or full parity with the original training method.
 
 With FP32 storage, retained factual columns must preserve their original bits.
 Integer addresses, source support, unavailable queries and int64-clock semantics

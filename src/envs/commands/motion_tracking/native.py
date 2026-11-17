@@ -169,6 +169,23 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             if times.dtype != torch.int64 or bool(((times - times[0] - expected).abs() > 1).any()):
                 raise ValueError("native prepared reference cadence differs from the actual control clock")
 
+    def part_surface_points(self, n_points, n_obj_verts):
+        from envs.object_points import native_part_surface_points
+
+        return native_part_surface_points(self, self.device, n_points, n_obj_verts)
+
+    def part_surface_geometry_metadata(self):
+        from envs.object_points import native_part_surface_metadata
+
+        return native_part_surface_metadata(self)
+
+    def part_surface_reference(self, *, offset=0, motion_ids=None, motion_steps=None):
+        from envs.object_points import native_part_reference
+
+        return native_part_reference(self.motion_lib,
+            self.motion_ids if motion_ids is None else motion_ids,
+            self.motion_steps if motion_steps is None else motion_steps, offset=offset)
+
     def _init_site_ids(self, cfg):
         if set(self._side_list) != {hand.side for hand in self.native_layout.hands}:
             raise ValueError("native reference sides differ from the configured physical hands")

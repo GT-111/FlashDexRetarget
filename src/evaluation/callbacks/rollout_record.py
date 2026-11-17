@@ -431,6 +431,9 @@ class NativeRolloutRecord(RolloutRecord):
 
     def collect_state(self, active_mask=None):
         state = super().collect_state(active_mask)
+        surface_metadata = getattr(self.cmd, "part_surface_geometry_metadata", None)
+        surface_metadata = None if surface_metadata is None else surface_metadata()
+        state["native_part_surface_metadata_json"] = None if not surface_metadata else json.dumps(surface_metadata)
         state["source_tip_geometry_metadata_json"] = self.source_tip_geometry_metadata_json
         state["source_hand_part_intent_metadata_json"] = self.source_hand_part_intent_metadata_json
         select = slice(None) if active_mask is None else active_mask.cpu()
@@ -502,6 +505,8 @@ class NativeRolloutRecord(RolloutRecord):
                     native_binding_json=np.asarray(json.dumps(binding)),
                     prepared_name=np.asarray(name),
                 )
+                if state.get("native_part_surface_metadata_json") is not None:
+                    result["native_part_surface_metadata_json"] = np.asarray(state["native_part_surface_metadata_json"])
                 if state["source_hand_part_intent_metadata_json"] is not None:
                     result["source_hand_part_intent_metadata_json"] = np.asarray(state["source_hand_part_intent_metadata_json"])
                     for field in _SOURCE_HAND_PART_INTENT_ARRAYS:

@@ -107,6 +107,8 @@ class ObsCompactor:
             "robot_joint_vel",
             "native_object_joint_state",
         ),),
+        "native_part_point_cloud_wrist": (("native_object_parts_wrist",),),
+        "native_next_part_point_cloud_delta_wrist": (("native_object_parts_wrist", "robot_wrist_pose_w"),),
         # narrowed to what the listed components read by _recon_alternatives
         "ref_future_traj_wrist": ((
             "robot_wrist_pose_w",
@@ -184,6 +186,15 @@ class ObsCompactor:
                 self._src[s] = (cols.to(self._device), scale)
         self._recon_scale = [None if sp.scale is None else sp.scale.to(self._device) for sp in self._recon]
         self._native_joint_columns: dict[str, torch.Tensor] = {}
+        for span in self._recon:
+            if span.name not in ("native_part_point_cloud_wrist", "native_next_part_point_cloud_delta_wrist"):
+                continue
+            for source in self._recon_srcs[span.name]:
+                if by_name[source].clip is not None:
+                    raise ValueError(f"native surface replay cannot recover clipped {source} values")
+                scale = by_name[source].scale
+                if scale is not None and bool((scale == 0).any()):
+                    raise ValueError(f"native surface replay cannot recover zero-scaled {source} values")
         if any(sp.name == "native_future_reference" for sp in self._recon):
             for source in self.RECON_SOURCES["native_future_reference"][0]:
                 if by_name[source].clip is not None:
@@ -210,6 +221,8 @@ class ObsCompactor:
             "ref_future_mano_wrist_tips_traj_rel_wrist": self._build_future_mano_wrist_tips_traj_rel,
             "ref_future_traj_wrist": self._build_future_traj_rel,
             "native_future_reference": self._build_native_future_reference,
+            "native_part_point_cloud_wrist": self._build_native_part_point_cloud,
+            "native_next_part_point_cloud_delta_wrist": self._build_native_next_part_point_cloud_delta,
         }
         names = [f"{sp.name}[{sp.end - sp.start}]" for sp in self._recon]
         print(f"[obs_compact] full {self._full_dim} -> compact {self._compact_dim} (+{AUX_DIM} int aux); rebuilt: {names}")
@@ -323,6 +336,20 @@ class ObsCompactor:
 
     def _offsets(self, n_future: int, max_future_steps: int) -> torch.Tensor:
         return torch.linspace(1.0, float(max_future_steps), n_future, device=self._device).round().long()
+
+    def _build_native_part_point_cloud(self, compact, mid, step, n_points=128, n_obj_verts=2048):
+        from envs.observations.native import build_native_part_point_cloud
+
+        return build_native_part_point_cloud(self._get(compact, "native_object_parts_wrist"),
+            self._cmd.part_surface_points(n_points, n_obj_verts))
+
+    def _build_native_next_part_point_cloud_delta(self, compact, mid, step, n_points=128, n_obj_verts=2048):
+        from envs.observations.native import build_native_next_part_point_cloud_delta
+
+        return build_native_next_part_point_cloud_delta(self._cmd.motion_lib, mid, step,
+            wrist_pose=self._get(compact, "robot_wrist_pose_w").reshape(compact.shape[0], len(self._sides), 7),
+            relative_part_state=self._get(compact, "native_object_parts_wrist"),
+            points_body=self._cmd.part_surface_points(n_points, n_obj_verts))
 
     def _build_native_future_reference(self, compact, mid, step, n_future, stride):
         from envs.observations.native import build_native_future_reference

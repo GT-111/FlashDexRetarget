@@ -12,6 +12,7 @@ from mjlab.utils.lab_api.math import (
 )
 
 from .._common import action_term
+from ..object_points import native_part_reference, native_part_surface_cloud, pack_native_part_surface
 from .motion_tracking import MotionTrackingObs
 
 
@@ -57,6 +58,25 @@ def _parts_in_wrist(command, states, support=None):
         command.robot_wrist_ang_vel_w,
         support,
     )
+
+
+def build_native_part_point_cloud(relative_part_state, points_body):
+    return pack_native_part_surface(*native_part_surface_cloud(relative_part_state, points_body))
+
+
+def build_native_next_part_point_cloud_delta(
+    motion_lib, motion_ids, motion_steps, *, wrist_pose, relative_part_state, points_body,
+):
+    """Same static samples and exact next source query in live and replay paths."""
+    reference = native_part_reference(motion_lib, motion_ids, motion_steps, offset=1)
+    zero_rate = wrist_pose.new_zeros(*wrist_pose.shape[:-1], 3)
+    pose_support = reference["pose_support"]
+    relative_reference = _parts_relative_to_wrist(reference["state"], wrist_pose, zero_rate, zero_rate,
+        (pose_support, pose_support, pose_support, pose_support))
+    actual, actual_support = native_part_surface_cloud(relative_part_state, points_body)
+    target, target_support = native_part_surface_cloud(relative_reference, points_body)
+    support = actual_support & target_support & pose_support[:, None]
+    return pack_native_part_surface(target - actual, support)
 
 
 def build_native_future_reference(
@@ -159,6 +179,24 @@ def build_native_future_reference(
 
 
 class NativeMotionTrackingObs(MotionTrackingObs):
+    @staticmethod
+    def native_part_point_cloud_wrist(env, command_name, n_points=128, n_obj_verts=2048):
+        """Physical-size samples in each actual wrist, with independent part masks."""
+        command = env.command_manager.get_term(command_name)
+        points = command.part_surface_points(n_points, n_obj_verts)
+        return build_native_part_point_cloud(_parts_in_wrist(command, command.sim_object_part_state_w), points)
+
+    @staticmethod
+    def native_next_part_point_cloud_delta_wrist(env, command_name, n_points=128, n_obj_verts=2048):
+        """Supported next-reference minus live samples; unavailable tails stay missing."""
+        command = env.command_manager.get_term(command_name)
+        return build_native_next_part_point_cloud_delta(
+            command.motion_lib, command.motion_ids, command.motion_steps,
+            wrist_pose=torch.cat((command.robot_wrist_trans_w - env.scene.env_origins[:, None],
+                                  command.robot_wrist_quat_w), -1),
+            relative_part_state=_parts_in_wrist(command, command.sim_object_part_state_w),
+            points_body=command.part_surface_points(n_points, n_obj_verts))
+
     @staticmethod
     def native_wrist_control_state(env):
         """Prior processed wrist coordinates and pending reset, independent of source support."""
