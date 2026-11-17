@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from envs.actions.native import NativeResidualAction, NativeResidualActionCfg
@@ -653,10 +654,13 @@ def test_native_isaac_contacts_resolve_named_rigid_descendants_before_reset(monk
     ]
 
 
-def test_actual_native_action_derives_dimensions_and_records_accepted_supported_targets(
-    tmp_path,
+def _native_action_case(
+    tmp_path, *, wrist_target_twist="source_only", dt=.02, cutoff_hz=None,
+    hand_sides=("left", "right"),
 ):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     layout, mapping = _scene(tmp_path)
+    mapping["hands"] = [hand for hand in mapping["hands"] if hand["side"] in hand_sides]
     meta = load_robot_mjcf_meta(layout.scene_xml_path)
     names = ["left_joint", "left_mimic", "right_joint", "right_other"]
     accepted = []
@@ -714,7 +718,7 @@ def test_actual_native_action_derives_dimensions_and_records_accepted_supported_
     env = SimpleNamespace(
         num_envs=2,
         device="cpu",
-        step_dt=0.02,
+        step_dt=dt,
         scene=Scene(robot=entity),
         command_manager=SimpleNamespace(get_term=lambda name: command),
         close=lambda: None,
@@ -727,9 +731,18 @@ def test_actual_native_action_derives_dimensions_and_records_accepted_supported_
             translation_residual_m=0.1,
             rotation_residual_rad=np.pi / 2,
             clip={".*": (-1.0, 1.0)},
+            wrist_target_twist=wrist_target_twist,
+            cutoff_hz={} if cutoff_hz is None else cutoff_hz,
         ),
         env,
     )
+    return env, action, command, accepted
+
+
+def test_actual_native_action_derives_dimensions_and_records_accepted_supported_targets(
+    tmp_path,
+):
+    env, action, _command, accepted = _native_action_case(tmp_path)
     assert action.action_dim == 2 * 6 + 3
     from envs.vec_env import FlatObsVecEnv
 
@@ -790,6 +803,182 @@ def test_actual_native_action_derives_dimensions_and_records_accepted_supported_
     json.dumps(recipe)  # A recorder can retain the actual accepted action recipe.
     action.reset(torch.tensor([0]))
     np.testing.assert_array_equal(record["installed_valid"], [False, True])
+
+
+def test_native_wrist_source_only_keeps_source_rates_through_filter_updates(tmp_path):
+    from scipy.spatial.transform import Rotation
+
+    _env, action, _command, _accepted = _native_action_case(
+        tmp_path, cutoff_hz={"wrist_trans": 5., "wrist_rot": 5.}
+    )
+    for coordinate in (0., .8, -.6):
+        action.process_actions(torch.full_like(action.raw_action, coordinate))
+        action.apply_actions()
+        record = action.installed_control
+        correction = action._processed_actions[:, action._rotation_slice].reshape(-1, 3)
+        matrices = Rotation.from_rotvec(
+            correction.numpy() * action.cfg.rotation_residual_rad
+        ).as_matrix()
+        expected = matrices[:, :, 0].reshape(action.num_envs, len(action.hand_sides), 3)
+        np.testing.assert_allclose(record["root_state_w"][..., 7:10], 0., atol=1e-6)
+        np.testing.assert_allclose(record["root_state_w"][..., 10:13], expected, atol=1e-6)
+        assert not action._correction_interval_valid.any()
+        assert not action._correction_twist.any()
+    assert record["action_recipe"]["wrist_target_twist"] == "source_only"
+    assert record["action_recipe"]["control_period_s"] == .02
+
+
+def test_native_wrist_feedforward_preserves_zero_and_static_world_corrections(tmp_path):
+    from scipy.spatial.transform import Rotation
+
+    _env, original, old_command, _accepted = _native_action_case(tmp_path / "source")
+    _env, candidate, command, _accepted = _native_action_case(
+        tmp_path / "candidate", wrist_target_twist="filtered_correction_feedforward"
+    )
+    reference = Rotation.from_rotvec([.2, -.1, .35]).as_quat()[[3, 0, 1, 2]]
+    for owner in (old_command, command):
+        for root in owner.motion_lib.native_root_state_w.values():
+            root[:, 3:7] = torch.tensor(reference, dtype=root.dtype)
+    for coordinate in (0., .3):
+        for action in (original, candidate):
+            action.reset()
+        raw = torch.full_like(original.raw_action, coordinate)
+        for _ in range(2):
+            for action in (original, candidate):
+                action.process_actions(raw)
+                action.apply_actions()
+            torch.testing.assert_close(candidate.installed_control["root_state_w"],
+                                       original.installed_control["root_state_w"], atol=1e-6, rtol=0)
+            torch.testing.assert_close(candidate.installed_control["finger_target_rad"],
+                                       original.installed_control["finger_target_rad"], atol=0, rtol=0)
+            torch.testing.assert_close(candidate._correction_twist,
+                                       torch.zeros_like(candidate._correction_twist), atol=1e-6, rtol=0)
+    # A nonfirst static packet has zero increment and retains a usable Jacobian.
+    differentiable = raw.detach().requires_grad_(True)
+    candidate.process_actions(differentiable)
+    gradient, = torch.autograd.grad(candidate._correction_twist[0, 0, 3:].sum(), differentiable)
+    assert torch.isfinite(gradient).all()
+    assert gradient[:, candidate._rotation_slice].abs().sum() > 0
+    _env, zero, _command, _accepted = _native_action_case(
+        tmp_path / "zero-jacobian", wrist_target_twist="filtered_correction_feedforward"
+    )
+    zero.reset()
+    zero.process_actions(torch.zeros_like(zero.raw_action))
+    differentiable_zero = torch.zeros_like(zero.raw_action, requires_grad=True)
+    zero.process_actions(differentiable_zero)
+    zero_gradient, = torch.autograd.grad(zero._correction_twist[0, 0, 3:].sum(), differentiable_zero)
+    assert torch.isfinite(zero_gradient).all()
+    expected_gradient = torch.zeros_like(zero_gradient)
+    begin = zero._rotation_slice.start
+    expected_gradient[0, begin:begin + 3] = zero.cfg.rotation_residual_rad / zero._control_dt
+    torch.testing.assert_close(zero_gradient, expected_gradient, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("dt,hand_sides", ((.02, ("left", "right")), (.04, ("right",))),
+                         ids=("bilateral20ms", "unilateral40ms"))
+def test_native_wrist_feedforward_uses_filtered_world_increment_and_control_dt(
+    tmp_path, dt, hand_sides,
+):
+    from scipy.spatial.transform import Rotation
+
+    _env, action, _command, _accepted = _native_action_case(
+        tmp_path, wrist_target_twist="filtered_correction_feedforward", dt=dt,
+        cutoff_hz={"wrist_trans": 5., "wrist_rot": 5.}, hand_sides=hand_sides,
+    )
+    first = torch.linspace(-.4, .4, action.action_dim).repeat(action.num_envs, 1)
+    requested = torch.linspace(2.4, -2.4, action.action_dim).repeat(action.num_envs, 1)
+    action.process_actions(first)
+    previous = action._processed_actions.clone()
+    assert not action._correction_interval_valid.any()
+    action.process_actions(requested)
+    expected_filter = previous + action._alpha * (requested.clamp(-1., 1.) - previous)
+    torch.testing.assert_close(action._processed_actions, expected_filter)
+    action.apply_actions()
+    current = action._processed_actions
+    previous_r = previous[:, action._rotation_slice].reshape(-1, 3).numpy()
+    current_r = current[:, action._rotation_slice].reshape(-1, 3).numpy()
+    old_rotation = Rotation.from_rotvec(previous_r * action.cfg.rotation_residual_rad).as_matrix()
+    new_rotation = Rotation.from_rotvec(current_r * action.cfg.rotation_residual_rad).as_matrix()
+    relative = new_rotation @ old_rotation.transpose(0, 2, 1)
+    angular_correction = Rotation.from_matrix(relative).as_rotvec() / dt
+    shape = (action.num_envs, len(hand_sides), 3)
+    expected_linear = ((current[:, action._translation_slice] - previous[:, action._translation_slice])
+                       * action.cfg.translation_residual_m / dt).reshape(shape)
+    expected_angular = (angular_correction + new_rotation[:, :, 0]).reshape(shape)
+    record = action.installed_control
+    np.testing.assert_allclose(record["root_state_w"][..., 7:10], expected_linear, atol=2e-6)
+    np.testing.assert_allclose(record["root_state_w"][..., 10:13], expected_angular, atol=2e-5)
+    assert not record["root_linear_velocity_support"].any()  # The source component is absent.
+    assert record["root_angular_velocity_support"].all()
+    assert action._correction_interval_valid.all()
+    assert record["action_recipe"]["root_rate_support"] == "independent_source_component_support"
+
+
+def test_native_wrist_feedforward_reset_and_source_gaps_keep_independent_carry(tmp_path):
+    _env, action, command, accepted = _native_action_case(
+        tmp_path, wrist_target_twist="filtered_correction_feedforward"
+    )
+    for value in command.motion_lib.native_root_angular_velocity_support.values():
+        value.zero_()
+    action.process_actions(torch.zeros_like(action.raw_action))
+    action.apply_actions()
+    command.motion_lib.native_root_pose_support["left"][0] = False
+    for coordinate in (.2, .4):
+        action.process_actions(torch.full_like(action.raw_action, coordinate))
+        action.apply_actions()
+        assert action._correction_interval_valid.all()
+        assert action.wrist_control_state["filtered_coordinates"][0].any()
+        assert not accepted[-2][1][0]  # Root effort authority remains absent.
+        torch.testing.assert_close(action.installed_control["root_state_w"][0, 0, 7:13],
+                                   torch.zeros(6), atol=0, rtol=0)
+    command.motion_lib.native_root_pose_support["left"][0] = True
+    action.process_actions(torch.full_like(action.raw_action, .6))
+    action.apply_actions()
+    # Reentry compares adjacent controller packets, not the last supported pose.
+    torch.testing.assert_close(action.installed_control["root_state_w"][0, 0, 7:10],
+                               torch.ones(3), atol=1e-6, rtol=0)
+    assert not action.installed_control["root_linear_velocity_support"].any()
+    assert not action.installed_control["root_angular_velocity_support"].any()
+    action.reset(torch.tensor([0]))
+    assert action.wrist_control_state["filter_pending"].tolist() == [True, False]
+    assert not action.wrist_control_state["filtered_coordinates"][0].any()
+    assert not action._correction_interval_valid[0]
+    action.process_actions(torch.full_like(action.raw_action, .8))
+    action.apply_actions()
+    assert action._correction_interval_valid.tolist() == [False, True]
+    torch.testing.assert_close(action._correction_twist[0], torch.zeros_like(action._correction_twist[0]),
+                               atol=0, rtol=0)
+    assert action._correction_twist[1].abs().sum() > 0
+
+
+def test_native_wrist_feedforward_holds_one_increment_and_tracks_held_raw_ema(tmp_path):
+    _env, action, _command, accepted = _native_action_case(
+        tmp_path, wrist_target_twist="filtered_correction_feedforward",
+        cutoff_hz={"wrist_trans": 5., "wrist_rot": 5.},
+    )
+    action.process_actions(torch.zeros_like(action.raw_action))
+    raw = torch.full_like(action.raw_action, .8)
+    action.process_actions(raw)
+    first = action.capture_control_context()
+    for _ in range(4):
+        action.apply_actions()
+    for substep in range(1, 4):
+        for hand in range(len(action.hand_sides)):
+            torch.testing.assert_close(accepted[substep * len(action.hand_sides) + hand][0],
+                                       accepted[hand][0], atol=0, rtol=0)
+    torch.testing.assert_close(action._correction_twist, first.correction_twist, atol=0, rtol=0)
+    action.process_actions(raw)
+    assert not torch.equal(action._filter_state, first.filter_state)
+    expected = ((action._filter_state[:, action._translation_slice]
+                 - first.filter_state[:, action._translation_slice])
+                * action.cfg.translation_residual_m / action._control_dt)
+    torch.testing.assert_close(action._correction_twist[..., :3].flatten(1), expected)
+    assert action._correction_twist.abs().sum() > 0
+
+
+def test_native_wrist_target_twist_rejects_unknown_convention(tmp_path):
+    with pytest.raises(ValueError, match="target-twist convention"):
+        _native_action_case(tmp_path, wrist_target_twist="unknown")
 
 
 def test_native_free_root_wrench_is_root_only_and_recomputed_from_current_body_state(

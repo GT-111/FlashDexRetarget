@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from typing import Literal
 
 import torch
 from mjlab.managers.action_manager import ActionTerm, ActionTermCfg
 from mjlab.utils.lab_api.math import (
     quat_apply,
+    quat_box_minus,
     quat_box_plus,
     quat_inv,
     quat_mul,
@@ -30,6 +32,9 @@ class NativeResidualActionCfg(ActionTermCfg):
     action_scale: float = 1.0
     action_offset: float = 0.0
     cutoff_hz: dict[str, float | None] = field(default_factory=dict)
+    wrist_target_twist: Literal[
+        "source_only", "filtered_correction_feedforward"
+    ] = "source_only"
 
     def build(self, env) -> NativeResidualAction:
         return NativeResidualAction(self, env)
@@ -41,6 +46,8 @@ class NativeActionControlContext:
     processed_actions: torch.Tensor
     filter_state: torch.Tensor
     filter_pending: torch.Tensor
+    correction_twist: torch.Tensor
+    correction_interval_valid: torch.Tensor
     finger_target: torch.Tensor
     finger_source_support: torch.Tensor
     root_target: torch.Tensor
@@ -66,6 +73,10 @@ class NativeResidualAction(ActionTerm):
 
     def __init__(self, cfg: NativeResidualActionCfg, env):
         super().__init__(cfg, env)
+        if cfg.wrist_target_twist not in (
+            "source_only", "filtered_correction_feedforward"
+        ):
+            raise ValueError("unsupported native wrist target-twist convention")
         self.layout = NativeSceneCfg.from_mapping(cfg.native_scene)
         self.hand_sides = tuple(h.side for h in self.layout.hands)
         self.hand_body_names = tuple(h.root_body_name for h in self.layout.hands)
@@ -107,9 +118,14 @@ class NativeResidualAction(ActionTerm):
         self._filter_pending = torch.ones(
             self.num_envs, dtype=torch.bool, device=self.device
         )
+        self._control_dt = float(env.step_dt)
+        self._correction_twist = torch.zeros(
+            self.num_envs, roots, 6, device=self.device
+        )
+        self._correction_interval_valid = torch.zeros_like(self._filter_pending)
         self._alpha = torch.cat(
             [
-                torch.full((size,), ema_alpha(cfg.cutoff_hz.get(group), env.step_dt))
+                torch.full((size,), ema_alpha(cfg.cutoff_hz.get(group), self._control_dt))
                 for group, size in (
                     ("wrist_trans", 3 * roots),
                     ("wrist_rot", 3 * roots),
@@ -167,11 +183,15 @@ class NativeResidualAction(ActionTerm):
             "translation_residual_per_axis_m": cfg.translation_residual_m,
             "rotation_residual_per_axis_rad": cfg.rotation_residual_rad,
             "rotation_convention": "world_left_rotvec",
+            "wrist_target_twist": cfg.wrist_target_twist,
+            "root_rate_support": "independent_source_component_support",
+            "correction_rate": None if cfg.wrist_target_twist == "source_only"
+            else "adjacent_filtered_world_increment_first_packet_zero",
             "finger_residual_rad": cfg.finger_residual_rad,
             "finger_effective_limits_rad": limits.cpu().tolist(),
             "cutoff_hz": dict(cfg.cutoff_hz),
             "filter_alpha": self._alpha.cpu().tolist(),
-            "control_period_s": float(env.step_dt),
+            "control_period_s": self._control_dt,
             "condition": "external_native_producer_not_main_tracker_numeric_parity",
             "backend": getattr(env.scene, "backend_identity", None),
         }
@@ -250,10 +270,42 @@ class NativeResidualAction(ActionTerm):
         processed = actions * self.cfg.action_scale + self.cfg.action_offset
         if self._clip is not None:
             processed = processed.clamp(self._clip[:, 0], self._clip[:, 1])
-        self._filter_state[self._filter_pending] = processed[self._filter_pending]
+        pending = self._filter_pending.clone()
+        if self.cfg.wrist_target_twist == "filtered_correction_feedforward":
+            previous_translation = self._filter_state[:, self._translation_slice].clone()
+            previous_rotation = self._filter_state[:, self._rotation_slice].clone()
+            self._correction_interval_valid[:] = ~pending
+        self._filter_state[pending] = processed[pending]
         self._filter_state.lerp_(processed, self._alpha)
         self._filter_pending[:] = False
         self._processed_actions[:] = self._filter_state
+        if self.cfg.wrist_target_twist == "filtered_correction_feedforward":
+            translation = self._filter_state[:, self._translation_slice]
+            self._correction_twist[..., :3] = (
+                (translation - previous_translation).reshape(self.num_envs, -1, 3)
+                * self.cfg.translation_residual_m / self._control_dt
+            )
+            previous_rotation = previous_rotation.reshape(self.num_envs, -1, 3)
+            rotation = self._filter_state[:, self._rotation_slice].reshape(
+                self.num_envs, -1, 3
+            )
+            identity = rotation.new_zeros((*rotation.shape[:-1], 4))
+            identity[..., 0] = 1.0
+            previous = quat_box_plus(
+                identity, previous_rotation * self.cfg.rotation_residual_rad
+            )
+            current = quat_box_plus(identity, rotation * self.cfg.rotation_residual_rad)
+            rate = quat_box_minus(current, previous) / self._control_dt
+            # Cancel static roundoff without discarding the rate's local Jacobian.
+            self._correction_twist[..., 3:] = torch.where(
+                (rotation != previous_rotation).any(-1, keepdim=True),
+                rate,
+                rate - rate.detach(),
+            )
+            # A reset seeds the filter; obsolete bytes never define a velocity.
+            self._correction_twist.masked_fill_(
+                ~self._correction_interval_valid[:, None, None], 0.0
+            )
 
     def apply_actions(self) -> None:
         command = self._env.command_manager.get_term(self.cfg.command_name)
@@ -307,6 +359,11 @@ class NativeResidualAction(ActionTerm):
                 quat_mul(target[:, 3:7], quat_inv(reference_quat)), target[:, 10:13]
             )
             target[:, 10:13] = torch.where(angular_support[:, None], angular, 0.0)
+            if self.cfg.wrist_target_twist == "filtered_correction_feedforward":
+                correction_support = pose_support & self._correction_interval_valid
+                target[:, 7:13] += torch.where(
+                    correction_support[:, None], self._correction_twist[:, i], 0.0
+                )
             self._root_target[:, i] = target
             self._root_support[:, i] = pose_support
             self._linear_support[:, i] = linear_support
@@ -321,4 +378,6 @@ class NativeResidualAction(ActionTerm):
         rows = slice(None) if env_ids is None else env_ids
         self._raw_actions[rows] = 0.0
         self._filter_pending[rows] = True
+        self._correction_twist[rows] = 0.0
+        self._correction_interval_valid[rows] = False
         self._installed_valid[rows] = False

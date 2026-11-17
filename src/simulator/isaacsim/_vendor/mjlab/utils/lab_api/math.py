@@ -502,8 +502,11 @@ def axis_angle_from_quat(quat: torch.Tensor, eps: float = 1.0e-6) -> torch.Tenso
     half_angle = torch.atan2(mag, quat[..., 0])
     angle = 2.0 * half_angle
     # check whether to apply Taylor approximation
+    large = angle.abs() > eps
+    # Both branches must have finite derivatives, including an exact identity.
+    safe_angle = torch.where(large, angle, torch.ones_like(angle))
     sin_half_angles_over_angles = torch.where(
-        angle.abs() > eps, torch.sin(half_angle) / angle, 0.5 - angle * angle / 48
+        large, torch.sin(half_angle) / safe_angle, 0.5 - angle * angle / 48
     )
     return quat[..., 1:4] / sin_half_angles_over_angles.unsqueeze(-1)
 
@@ -621,8 +624,15 @@ def quat_box_plus(q: torch.Tensor, delta: torch.Tensor, eps: float = 1.0e-6) -> 
     Reference:
         https://github.com/ANYbotics/kindr/blob/master/doc/cheatsheet/cheatsheet_latest.pdf
     """
-    delta_norm = torch.clamp_min(torch.linalg.norm(delta, dim=-1, keepdim=True), min=eps)
-    delta_quat = quat_from_angle_axis(delta_norm.squeeze(-1), delta / delta_norm)  # exp(dq)
+    delta_norm = torch.linalg.norm(delta, dim=-1, keepdim=True)
+    large = delta_norm > eps
+    safe_norm = torch.where(large, delta_norm, torch.ones_like(delta_norm))
+    half_angle = delta_norm * 0.5
+    sin_half_over_angle = torch.where(
+        large, torch.sin(half_angle) / safe_norm, 0.5 - delta_norm.square() / 48
+    )
+    # Exp(delta) remains differentiable at zero; a normalized zero axis does not.
+    delta_quat = normalize(torch.cat((torch.cos(half_angle), delta * sin_half_over_angle), dim=-1))
     new_quat = quat_mul(delta_quat, q)  # Apply perturbation
     return quat_unique(new_quat)
 
