@@ -64,11 +64,11 @@ def _input_extension_config(agent, info, run_dir, overrides=()):
                "rotation_damping": 1., "force_limit_n": None, "torque_limit_nm": None}
     scene = {
         "scene_xml_path": "authored-fixture-not-read.xml",
-        "hands": [{"side": side, "entity_name": "robot", "root_body_name": f"{side}_wrist",
+        "hands": [{"side": side, "entity_name": f"{side}_hand", "root_body_name": f"{side}_wrist",
                    "root_joint_name": f"{side}_free", "command_actuator_names": [f"{side}_finger"],
                    "root_control": dict(control)} for side in ("right", "left")],
-        "object": {"entity_name": "box", "root_body_name": "box_base", "root_joint_name": "box_free",
-                   "parts": [{"name": "base", "body_name": "box_base", "mesh_path": "not-read.obj"}]},
+        "objects": [{"entity_name": "fixture_object", "root_body_name": "object_base", "root_joint_name": "object_free",
+                     "parts": [{"name": "base", "body_name": "object_base", "mesh_path": "not-read.obj"}]}],
     }
     payload["robot"]["native_scene"] = scene
     payload["actions"] = {
@@ -160,6 +160,72 @@ def test_actor_input_extension_preserves_equal_named_layout_with_fresh_learning_
             invalid.initialize_actor_input_extension(
                 str(checkpoint), str(parent_run / "config.yaml"), str(invalid_run / "config.yaml"),
             )
+
+
+def _archive_single_object_scene(config):
+    """Write the actual archived parent schema; never used for the live child."""
+    payload = OmegaConf.to_container(config, resolve=True)
+    for scene in (payload["robot"]["native_scene"], payload["actions"]["native_scene"]):
+        scene["object"] = scene.pop("objects")[0]
+    return OmegaConf.create(payload)
+
+
+def test_actor_input_extension_preserves_archived_singleton_actor_in_collection_scene(tmp_path):
+    parent, info = _input_extension_agent()
+    checkpoint, parent_run = tmp_path / "parent-checkpoint", tmp_path / "parent-run"
+    parent.save(str(checkpoint))
+    old_config = _archive_single_object_scene(_input_extension_config(parent, info, parent_run))
+    OmegaConf.save(old_config, parent_run / "config.yaml", resolve=True)
+    child, new_info = _input_extension_agent()
+    child_run = tmp_path / "child-run"
+    _input_extension_config(child, new_info, child_run)
+    fresh = deepcopy(child._alg.save())
+
+    authority = child.initialize_actor_input_extension(
+        str(checkpoint), str(parent_run / "config.yaml"), str(child_run / "config.yaml"),
+    )
+    after = child._alg.save()
+    _tree_equal(after["actor_state_dict"], parent._alg.actor.state_dict())
+    for key in fresh.keys() - {"actor_state_dict"}:
+        _tree_equal(after[key], fresh[key])
+    observations = torch.linspace(-.9, 1.1, 5 * parent._layout.full_dim).reshape(5, -1)
+    torch.testing.assert_close(torch.from_numpy(child.act(observations, deterministic=True)),
+                               torch.from_numpy(parent.act(observations, deterministic=True)), rtol=0, atol=0)
+    assert authority["native_scene_validation"]["archived_singleton_parent"]
+    assert authority["native_scene_validation"]["object_entities"] == ["fixture_object"]
+    assert authority["added_flat_terms"] == []
+    assert not child._alg.replay_buffer._num_in_buffer
+    assert not child._alg.actor_optimizer.state and not child._alg.critic_optimizer.state
+
+
+@pytest.mark.parametrize("mismatch", ["root_law", "actuator", "part", "object_count", "action", "parent_action"])
+def test_actor_input_extension_rejects_changed_native_semantics_before_model_read(tmp_path, monkeypatch, mismatch):
+    parent, info = _input_extension_agent()
+    parent_run, child_run = tmp_path / "parent-run", tmp_path / "child-run"
+    old = _archive_single_object_scene(_input_extension_config(parent, info, parent_run))
+    child, current_info = _input_extension_agent()
+    current = OmegaConf.to_container(_input_extension_config(child, current_info, child_run), resolve=True)
+    if mismatch == "root_law":
+        current["robot"]["native_scene"]["hands"][0]["root_control"]["position_stiffness"] = 2.
+    elif mismatch == "actuator":
+        current["robot"]["native_scene"]["hands"][0]["command_actuator_names"][0] = "different_actuator"
+    elif mismatch == "part":
+        current["robot"]["native_scene"]["objects"][0]["parts"][0]["body_name"] = "different_part"
+    elif mismatch == "object_count":
+        current["robot"]["native_scene"]["objects"].append({
+            "entity_name": "second_object", "root_body_name": "second_base", "root_joint_name": "second_free",
+            "parts": [{"name": "base", "body_name": "second_base", "mesh_path": "another.obj"}],
+        })
+    elif mismatch == "action":
+        current["actions"]["translation_residual_m"] = .2
+    else:
+        old.actions.native_scene.object.parts[0].body_name = "different_parent_action_part"
+    OmegaConf.save(old, parent_run / "config.yaml", resolve=True)
+    OmegaConf.save(OmegaConf.create(current), child_run / "config.yaml", resolve=True)
+    monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: pytest.fail("native semantics must be checked before model read"))
+    with pytest.raises(ValueError, match="native action/scene contract"):
+        child.initialize_actor_input_extension(str(tmp_path / "not-opened-checkpoint"),
+            str(parent_run / "config.yaml"), str(child_run / "config.yaml"))
 
 
 @pytest.mark.parametrize("encoded", [False, True])

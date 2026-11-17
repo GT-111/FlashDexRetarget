@@ -545,16 +545,31 @@ class FlashSACAgent(Agent):
                     or current["runner"]["agent"]["reward_heads"][key]
                     != (self._cfg.reward_heads or {}).get(key, False)):
                 raise ValueError(f"actor input extension requires unchanged reward-head ownership: {key}")
-        scene = parent["robot"]["native_scene"]
-        if (not scene or scene != current["robot"]["native_scene"]
-                or parent["actions"] != current["actions"]
-                or parent["actions"].get("native_scene") != scene):
+        from envs.scene.native import NativeSceneCfg
+
+        def parent_scene(config: dict) -> NativeSceneCfg:
+            # Archived actors used one real object under "object". Only this
+            # explicit initializer reads that archive form; runtime and FULL
+            # still require the current collection configuration.
+            config = dict(config)
+            if "objects" not in config and "object" in config:
+                config["objects"] = [config.pop("object")]
+            return NativeSceneCfg.from_mapping(config)
+
+        scene = parent_scene(parent["robot"]["native_scene"])
+        current_scene = NativeSceneCfg.from_mapping(current["robot"]["native_scene"])
+        old_action = {key: value for key, value in parent["actions"].items() if key != "native_scene"}
+        new_action = {key: value for key, value in current["actions"].items() if key != "native_scene"}
+        if (scene != current_scene
+                or parent_scene(parent["actions"]["native_scene"]) != scene
+                or NativeSceneCfg.from_mapping(current["actions"]["native_scene"]) != current_scene
+                or old_action != new_action):
             raise ValueError("actor input extension requires the unchanged named native action/scene contract")
         # NativeResidualAction groups translations, rotations, then named finger
         # actuators; MotionLibrary orders admitted source sides right then left.
-        sides = [hand["side"] for hand in scene["hands"]]
+        sides = [hand.side for hand in scene.hands]
         owners = ([side for side in sides for _ in "xyz"] * 2
-                  + [hand["side"] for hand in scene["hands"] for _ in hand["command_actuator_names"]])
+                  + [hand.side for hand in scene.hands for _ in hand.command_actuator_names])
         head_names = [side for side in ("right", "left") if side in sides]
         expected_ids = [[i for i, owner in enumerate(owners) if owner == side] for side in head_names]
         if (len(owners) != self._action_bias.numel()
@@ -626,6 +641,15 @@ class FlashSACAgent(Agent):
             "added_flat_terms": [list(key) for key in new_columns if key not in old_columns],
             "encoded_obs_dims": self._encoded_layout,
             "actor_only": True, "renormalized_at_initialization": False,
+            "native_scene_validation": {
+                "owner": "envs.scene.native.NativeSceneCfg",
+                "archived_singleton_parent": "objects" not in parent["robot"]["native_scene"],
+                "scene_xml_path": scene.scene_xml_path,
+                "hand_sides": sides,
+                "command_actuator_names": [name for hand in scene.hands for name in hand.command_actuator_names],
+                "object_entities": [obj.entity_name for obj in scene.objects],
+                "part_body_names": [part.body_name for _, part in scene.part_bindings],
+            },
             "fresh_owners": ["critic_and_targets", "temperature", "optimizers_and_schedulers",
                              "reward_normalizer", "replay", "collection", "progress"],
         }
