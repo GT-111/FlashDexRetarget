@@ -607,6 +607,17 @@ means stay unchanged. The logger computes no additional metrics; gradient norms
 are not returned by the current FlashSAC update and are therefore not a logged
 series.
 
+The off-policy runner also reports `time/collect_host_wall_s`,
+`time/sac_update_host_wall_s` and `time/sac_update_calls_per_collection` through
+that same meter and logging cadence. They are means per collected iteration
+since the last log, including zero update time/calls during replay warmup.
+Collection includes acting, environment stepping and replay ingestion; updates
+include sampling, optimization and returned metrics. These are host-call wall
+durations with any natural transfer or metric-read waits, not solver-only or
+CUDA kernel timings. Update calls do not establish applied optimizer visits.
+The metrics add no CUDA synchronization. The optional `FDR_ITER_TIMING_FILE`
+CSV retains its existing synchronized combined-iteration timing behavior.
+
 `python train.py --overrides commands.motion_file=<pt> --overrides <key>=<value> ...` runs the same
 config without the launcher (XHAND; `--gui` opens the viewport).
 

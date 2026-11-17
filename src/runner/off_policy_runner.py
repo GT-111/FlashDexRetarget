@@ -161,18 +161,30 @@ class OffPolicyRunner:
                     torch.cuda.synchronize()
                     iter_t0 = time.perf_counter()
 
+                collect_host_t0 = time.perf_counter()
                 self._collect(step, meter)
+                collect_host_wall_s = time.perf_counter() - collect_host_t0
                 ready = agent.ready()
+                update_host_wall_s = 0.0
+                update_calls = 0
                 if ready:
+                    update_host_t0 = time.perf_counter()
                     update_budget += self._updates_per_step
                     while update_budget >= 1:
                         train_info = agent.update()
                         meter.update(train_info)
                         update_budget -= 1
+                        update_calls += 1
+                    update_host_wall_s = time.perf_counter() - update_host_t0
                     if timing_f:
                         torch.cuda.synchronize()
                         timing_f.write(f"{step},{env_step},{time.perf_counter() - iter_t0:.6f},1\n")
                         timing_f.flush()
+                meter.update({
+                    "time/collect_host_wall_s": collect_host_wall_s,
+                    "time/sac_update_host_wall_s": update_host_wall_s,
+                    "time/sac_update_calls_per_collection": update_calls,
+                })
 
                 # A request survives compiler signal changes and buffer warmup.
                 # Finish this collection/update transaction before saving FULL.

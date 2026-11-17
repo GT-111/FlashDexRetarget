@@ -806,6 +806,61 @@ def test_shared_env_runner_reset_does_not_count_old_physical_episode_as_complete
     assert curriculum._epoch_steps == global_state["epoch_steps"] + 1
 
 
+def test_runner_host_phase_metrics_preserve_warmup_update_budget_and_log_order(monkeypatch):
+    import runner.off_policy_runner as runner_module
+
+    clock, collected, events, logged = [0.], [0], [], []
+    update_durations = iter((6., 8., 10.))
+
+    def collect(step, _meter):
+        collected[0] = step
+        events.append(("collect", step))
+        clock[0] += step
+
+    def update():
+        events.append(("update", collected[0]))
+        clock[0] += next(update_durations)
+        return {"critic/loss": 1.}
+
+    def stop_requested(env_step):
+        events.append(("stop", env_step))
+        return False
+
+    def log(metrics, step):
+        events.append(("log", step))
+        logged.append((step, metrics))
+
+    monkeypatch.delenv("FDR_ITER_TIMING_FILE", raising=False)
+    monkeypatch.setattr(runner_module, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(runner_module.tqdm, "tqdm", lambda values, **_kwargs: values)
+    monkeypatch.setattr(runner_module, "log_metrics", log)
+    monkeypatch.setattr(runner_module.torch.cuda, "synchronize",
+                        lambda: pytest.fail("ordinary host metrics must not synchronize CUDA"))
+    runner = OffPolicyRunner.__new__(OffPolicyRunner)
+    runner._agent = SimpleNamespace(ready=lambda: collected[0] >= 3, update=update)
+    runner._n_envs, runner._step_offset, runner._updates_per_step = 2, 100, 1.5
+    runner._log_every, runner._eval_stride, runner._save_stride = 2, 0, 0
+    runner._start_clock = lambda: events.append(("start",))
+    runner._collect, runner._stop_if_requested = collect, stop_requested
+    runner._cost_metrics = lambda step: {"time/env_step": float(step)}
+    runner._eval_supported = lambda: False
+    runner._finish = lambda: events.append(("finish",))
+
+    runner.learn(4)
+
+    assert logged == [(108, {
+        "critic/loss": 1., "time/collect_host_wall_s": 2.5,
+        "time/sac_update_host_wall_s": 6., "time/sac_update_calls_per_collection": .75,
+        "time/env_step": 108.,
+    })]
+    assert events == [
+        ("start",), ("collect", 1), ("stop", 102), ("collect", 2), ("stop", 104),
+        ("collect", 3), ("update", 3), ("stop", 106), ("stop", 106),
+        ("collect", 4), ("update", 4), ("update", 4), ("stop", 108),
+        ("log", 108), ("stop", 108), ("stop", 108), ("finish",),
+    ]
+
+
 def _agent():
     OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / "config"),
