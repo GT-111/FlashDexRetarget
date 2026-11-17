@@ -25,7 +25,8 @@ def _case(widths):
     width = len(action.finger_joint_names)
     action._lower = torch.arange(width).float() * -.1 - .4
     action._upper = torch.arange(width).float() * .2 + .6
-    action.cfg = SimpleNamespace(action_scale=2., action_offset=.3, finger_residual_rad=None, cutoff_hz={"finger": None})
+    action.cfg = SimpleNamespace(action_scale=2., action_offset=.3, finger_residual_rad=None,
+                                 cutoff_hz={"finger": None}, wrist_target_twist="source_only")
     action._raw_actions = torch.zeros(2, action.action_dim)
     action._processed_actions = torch.zeros_like(action._raw_actions)
     action._filter_state = torch.zeros_like(action._raw_actions)

@@ -390,6 +390,34 @@ unavailable. Derived target-force evidence does not replace original
 ARCTIC/OakInk source-contact support. Source roles, missing spans, phase
 durations and full-horizon outcomes retain their separate source/task authority.
 
+### Native wrist target twists
+
+`actions.wrist_target_twist` selects the velocity convention for the existing
+WORLD-left wrist correction. The default `source_only` retains supported source
+linear velocity and transports supported source angular velocity by the current
+correction. Pose targets, action filtering, finger commands and root gains are
+unchanged.
+
+`filtered_correction_feedforward` also adds the change of the filtered translation
+and the WORLD rotation increment between consecutive filtered corrections, divided
+by the actual control period. The first packet after a reset contributes zero
+correction velocity. The estimate is computed once per control and held through
+its physics substeps; a held raw action can still move the EMA. Missing source
+pose admits no correction effort, while filter carry continues independently.
+Source linear/angular support remains the support of the source component, not
+an assertion that the correction velocity was measured. Recorded `root_state_w`
+contains the actual total target twist and `action_recipe` identifies its mode.
+An exactly static correction contributes exactly zero rate while retaining its
+local derivative. The vendored manager quaternion exp/log use their small-angle formulas
+at zero without evaluating an undefined division in an unused branch.
+
+This is a sampled feedforward convention, not the instantaneous derivative of a
+zero-order-held target. Finite rotations do not generally commute. It does not
+change the control law or establish physical tracking improvement. Keep the mode
+in the resolved condition; changing it is not an unchanged FULL continuation.
+Typed action contexts include the held correction twist and reset validity.
+Ordinary learner FULL restore retains its existing fresh-physical-episode reset.
+
 ### Initial native control contexts
 
 `ManagerBasedRlEnv.capture_initial_control_context()` captures a committed

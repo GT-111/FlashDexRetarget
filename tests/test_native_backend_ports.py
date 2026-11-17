@@ -742,7 +742,7 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
 
 # Control-context cases use real native/manager owners with a synthetic plant.
 # They do not certify an SDK/GPU replay or integrate a physical MuJoCo scene.
-def _initial_control_case(tmp_path):
+def _initial_control_case(tmp_path, *, wrist_target_twist="source_only"):
     from mjlab.managers.action_manager import ActionManager
     from mjlab.managers.command_manager import CommandManager
     from mjlab.managers.event_manager import EventManager, EventTermCfg
@@ -847,6 +847,7 @@ def _initial_control_case(tmp_path):
     env.action_manager = ActionManager({"native": NativeResidualActionCfg(
         entity_name="robot", command_name="tracking", native_scene=mapping,
         translation_residual_m=.1, rotation_residual_rad=1.,
+        wrist_target_twist=wrist_target_twist,
         cutoff_hz={"wrist_trans": 5., "wrist_rot": 5.}, clip={".*": (-1., 1.)},
     )}, env)
     env.event_manager = EventManager({"reset": EventTermCfg(func=lambda env, env_ids: None, mode="reset")}, env)
@@ -959,6 +960,53 @@ def test_native_initial_control_context_repeats_real_manager_lpf_phase_and_rng(t
     _assert_control_values_equal(repeated, first)
     assert env.common_step_counter == 2 and env._sim_step_counter == 8
     assert env.sim.plant.advance_calls == 16  # only the two ordinary 2×4-step arms
+
+
+def test_native_wrist_target_twist_repeats_real_manager_substeps_and_context(tmp_path, monkeypatch):
+    env, _command = _initial_control_case(
+        tmp_path, wrist_target_twist="filtered_correction_feedforward"
+    )
+    action = env.action_manager.get_term("native")
+    installed = {side: [] for side in action.hand_sides}
+    for side in action.hand_sides:
+        hand = action._entity.hands[side]
+        original = hand.apply_root_pose_target
+
+        def record(target, support, control, *, side=side, original=original):
+            installed[side].append(target.clone())
+            return original(target, support, control)
+
+        monkeypatch.setattr(hand, "apply_root_pose_target", record)
+    initial = env.capture_initial_control_context()
+    first_action = torch.zeros_like(action.raw_action)
+    second_action = torch.linspace(-.6, .6, action.action_dim).repeat(env.num_envs, 1)
+
+    def run():
+        for values in installed.values():
+            values.clear()
+        env.step(first_action)
+        assert not action._correction_interval_valid.any()
+        env.step(second_action)
+        assert action._correction_interval_valid.all()
+        assert action._correction_twist.abs().sum() > 0
+        for values in installed.values():
+            assert len(values) == 2 * env.cfg.decimation
+            for begin in (0, env.cfg.decimation):
+                for offset in range(1, env.cfg.decimation):
+                    torch.testing.assert_close(values[begin + offset], values[begin], atol=0, rtol=0)
+        return ({side: torch.stack(values) for side, values in installed.items()},
+                action.capture_control_context(), env.scene.capture_control_context())
+
+    first = run()
+    held = action.capture_control_context()
+    action.process_actions(-second_action)
+    action.restore_control_context(held)
+    _assert_control_values_equal(action.capture_control_context(), held)
+    env.restore_initial_control_context(initial)
+    assert not action._correction_interval_valid.any()
+    assert not action._correction_twist.any()
+    repeated = run()
+    _assert_control_values_equal(repeated, first)
 
 
 def test_native_initial_control_context_refuses_unowned_history_and_backend(tmp_path):
