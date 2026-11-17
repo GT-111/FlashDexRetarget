@@ -27,7 +27,7 @@ from envs.curriculum.assist import XfrcAssistCurriculum
 from runner.off_policy_runner import LEARNING_STATE_FILE, OffPolicyRunner
 
 
-def _input_extension_agent(*, added=False, encoded=True, wrong_sides=False):
+def _input_extension_agent(*, added=False, encoded=True, wrong_sides=False, extra_terms=()):
     """Tiny real native-shaped actor; no asset, reference, or physical constructor."""
     base = _agent()
     cfg = base._cfg
@@ -40,6 +40,7 @@ def _input_extension_agent(*, added=False, encoded=True, wrong_sides=False):
     flat = ([["actor", "robot_joint_vel", 3], ["actor", "native_source_tip_reference_error", 4],
              ["actor", "robot_joint_pos", 3]] if added else
             [["actor", "robot_joint_pos", 3], ["actor", "robot_joint_vel", 3]])
+    flat.extend(["actor", name, width] for name, width in extra_terms)
     windows = [["future_traj", 40]] if encoded else []
     info = {
         "actor_observation_size": (sum(term[2] for term in flat),),
@@ -310,6 +311,102 @@ def test_actor_input_extension_preserves_named_actor_and_learns_new_columns(tmp_
         # Zero input weights give zero first VJP to the new input BN affine.
         assert not bool(tower.embedder.norm.weight.grad[3:7].any())
         assert not bool(tower.embedder.norm.bias.grad[3:7].any())
+
+
+def test_actor_input_extension_admits_added_term_configuration_and_preserves_carry(tmp_path):
+    carry = (("native_wrist_control_state", 13),)
+    parent, old_info = _input_extension_agent(extra_terms=carry)
+    with torch.no_grad():
+        for tower in parent._alg.actor.sides:
+            norm = tower.embedder.norm
+            norm.weight.copy_(torch.linspace(.6, 1.3, norm.weight.numel()))
+            norm.bias.copy_(torch.linspace(-.2, .15, norm.bias.numel()))
+            norm.running_mean.copy_(torch.linspace(-.3, .4, norm.running_mean.numel()))
+            norm.running_var.copy_(torch.linspace(.5, 1.5, norm.running_var.numel()))
+    checkpoint, parent_run = tmp_path / "parent-checkpoint", tmp_path / "parent-run"
+    parent.save(str(checkpoint))
+    parent_config = _input_extension_config(parent, old_info, parent_run)
+    points, parts = 1, len(parent_config.robot.native_scene.objects[0].parts)
+    hands = len(parent_config.robot.native_scene.hands)
+    surface_width = hands * parts * (3 * points + 1)
+    surface = (("native_part_point_cloud_wrist", surface_width),
+               ("native_next_part_point_cloud_delta_wrist", surface_width))
+    child, new_info = _input_extension_agent(extra_terms=(*carry, *surface))
+    child_run = tmp_path / "child-run"
+    child_config = _input_extension_config(child, new_info, child_run)
+    for name, _width in surface:
+        child_config.obs.obs_params[name] = {"n_points": points, "n_obj_verts": 4}
+        child_config.obs.obs_scales[name] = 1.0
+        child_config.obs.noise_scales[name] = 0.0
+    OmegaConf.save(child_config, child_run / "config.yaml", resolve=True)
+    fresh = deepcopy(child._alg.save())
+
+    authority = child.initialize_actor_input_extension(
+        str(checkpoint), str(parent_run / "config.yaml"), str(child_run / "config.yaml"),
+    )
+    for key in fresh.keys() - {"actor_state_dict"}:
+        _tree_equal(child._alg.save()[key], fresh[key])
+    assert authority["added_flat_terms"] == [["actor", name] for name, _width in surface]
+    assert ["actor", "native_wrist_control_state"] in authority["retained_flat_terms"]
+    old_flat = sum(width for group, _name, width in old_info["obs_terms"] if group == "actor")
+    new_flat = sum(width for group, _name, width in new_info["obs_terms"] if group == "actor")
+    old = torch.linspace(-.9, 1.1, 5 * parent._layout.full_dim).reshape(5, -1)
+    added = torch.linspace(-2., 3., 5 * (new_flat - old_flat)).reshape(5, -1)
+    new = torch.cat((old[:, :old_flat], added, old[:, old_flat:]), -1)
+    for actual, expected in zip(child._alg.actor.get_mean_and_std(new, training=False),
+                                parent._alg.actor.get_mean_and_std(old, training=False), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    for index, tower in enumerate(child._alg.actor.sides):
+        before = parent._alg.actor.sides[index]
+        future_width = before.traj_encoder.latent_dim
+        mapped = list(range(old_flat)) + list(range(new_flat, new_flat + future_width))
+        for field, initial in (("weight", 1), ("bias", 0), ("running_mean", 0), ("running_var", 1)):
+            actual, expected = getattr(tower.embedder.norm, field), getattr(before.embedder.norm, field)
+            torch.testing.assert_close(actual[mapped], expected, rtol=0, atol=0)
+            torch.testing.assert_close(actual[old_flat:new_flat],
+                torch.full_like(actual[old_flat:new_flat], initial), rtol=0, atol=0)
+        assert not bool(tower.embedder.w.w.weight[:, old_flat:new_flat].any())
+        _tree_equal(tower.traj_encoder.state_dict(), before.traj_encoder.state_dict())
+    _feed_input_extension_agent(child)
+    metrics = child.update()
+    assert "actor/loss" in metrics and all(np.isfinite(value) for value in metrics.values())
+    for tower in child._alg.actor.sides:
+        assert bool(tower.embedder.w.w.weight.grad[:, old_flat:new_flat].abs().sum() > 0)
+        assert bool(tower.embedder.w.w.weight[:, old_flat:new_flat].abs().sum() > 0)
+
+
+@pytest.mark.parametrize("mismatch", ["retained_params", "encoded_params", "retained_scale",
+                                     "retained_noise", "unselected_params", "global"])
+def test_actor_input_extension_rejects_changed_old_semantics_with_added_term_params(
+    tmp_path, monkeypatch, mismatch,
+):
+    parent, old_info = _input_extension_agent()
+    checkpoint, parent_run, child_run = (
+        tmp_path / name for name in ("parent-checkpoint", "parent-run", "child-run")
+    )
+    parent.save(str(checkpoint))
+    _input_extension_config(parent, old_info, parent_run)
+    child, new_info = _input_extension_agent(extra_terms=(("native_part_point_cloud_wrist", 8),))
+    config = _input_extension_config(child, new_info, child_run)
+    config.obs.obs_params.native_part_point_cloud_wrist = {"n_points": 1, "n_obj_verts": 4}
+    if mismatch == "retained_params":
+        config.obs.obs_params.robot_joint_pos = {"asset_cfg": {"name": "different_robot"}}
+    elif mismatch == "encoded_params":
+        config.obs.obs_params.native_future_reference.stride = 2
+    elif mismatch == "retained_scale":
+        config.obs.obs_scales.robot_joint_pos = .5
+    elif mismatch == "retained_noise":
+        config.obs.noise_scales.robot_joint_pos = .1
+    elif mismatch == "unselected_params":
+        config.obs.obs_params.not_an_added_input = {"n_points": 1}
+    else:
+        config.obs.actor_enable_corruption = True
+    OmegaConf.save(config, child_run / "config.yaml", resolve=True)
+    monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs:
+                        pytest.fail("old semantics must be checked before actor read"))
+    with pytest.raises(ValueError, match="observation transforms and future queries"):
+        child.initialize_actor_input_extension(str(checkpoint), str(parent_run / "config.yaml"),
+                                               str(child_run / "config.yaml"))
 
 
 @pytest.mark.parametrize("mismatch", ["missing_names", "future_encoder", "future_query", "native_action", "side_scatter"])
