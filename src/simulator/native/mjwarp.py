@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 
 import numpy as np
@@ -121,15 +122,53 @@ class MjWarpPlant(NativePlant):
             self._ctrl.copy_(self.control)
             self._xfrc_applied.copy_(self.external_body_wrench_w)
             self._mjw.step(self._model, self._data)
+            self._check_overflow()
             self._execution_steps.add_(1)
             self.effort.copy_(self._solved_effort)
-            torch._assert_async((self._wp.to_torch(self._data.overflow) == 0).all(), "MJWarp contact/constraint capacity exceeded")
             # A subsequent forward refreshes endpoint geometry; retain the actual solve first.
             self._read_solved_contacts()
             self.contact_sample_time_s.copy_(sample_time)
             self.contact_sample_execution_step.copy_(sample_step)
             self.forward()
             self.record_contact_substep()
+
+    def _check_overflow(self):
+        # The native step is not graph-captured. Check on its owning stream
+        # before accepting it; a device assert would destroy the error operands.
+        overflow = self._wp.to_torch(self._data.overflow)
+        if not bool(overflow.any()):
+            return
+        raw_bits = overflow.detach().cpu().tolist()
+        flags = tuple(self._mjw.OverflowType)
+        known_bits = 0
+        for flag in flags:
+            known_bits |= int(flag)
+        interval = self.contact_interval
+        witness = {
+            "schema": "mjwarp_overflow_v1",
+            "raw_bits": raw_bits,
+            "affected_worlds": [world for world, bits in enumerate(raw_bits) if bits],
+            "world_flags": [
+                {"world": world, "raw_bits": bits,
+                 "flags": [flag.name for flag in flags if bits & int(flag)],
+                 "unknown_bits": bits & ~known_bits}
+                for world, bits in enumerate(raw_bits) if bits
+            ],
+            "accepted_steps_before_attempt": self._execution_steps.detach().cpu().tolist(),
+            "attempted_execution_steps": (self._execution_steps + 1).detach().cpu().tolist(),
+            "control_interval": None if interval is None else {
+                "active": interval._active, "accepted_substeps": interval._count,
+                "attempted_substep": interval._count + 1 if interval._active else None,
+                "configured_substeps": interval.num_substeps,
+            },
+            "configured_capacities": {name: self.identity[name] for name in ("nconmax", "njmax")},
+            "resolved_capacities": {name: int(getattr(self._data, name)) for name in
+                                    ("naconmax", "naccdmax", "njmax", "njmax_nnz", "nvmax")},
+            "counts": {name: self._wp.to_torch(getattr(self._data, name)).detach().cpu().tolist()
+                       for name in ("nacon", "ncollision", "nefc", "solver_niter")},
+            "failed_attempt_accepted": False,
+        }
+        raise RuntimeError("MJWarp overflow: " + json.dumps(witness))
 
     def _read_solved_contacts(self):
         self._mjw.contact_force(self._model, self._data, self._contact_ids, False, self._contact_forces)

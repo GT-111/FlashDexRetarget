@@ -334,6 +334,16 @@ actual advance increments the count; forward and authored state installation do
 not. Selected reset clears only selected counts, and same-plant snapshot/restore
 retains them. Isaac leaves this clock unavailable.
 
+Direct MjWarp synchronously checks the SDK's per-world `OverflowType` bits after
+each solver step, before accepting the advance or publishing solved contacts.
+A nonzero bit raises an ordinary `RuntimeError` with a JSON witness containing
+raw bits, SDK flag names, affected worlds, attempted substeps, configured and
+resolved capacities, and actual contact/constraint/solver counts. EPA and solver
+iteration flags are not mislabeled as exhausted contact capacity. The failed
+attempt may have changed raw solver state/time; it is not rolled back or added
+to the accepted clock, and its control interval remains incomplete. Preserve
+the failure before selecting a physics change; no bit is ignored or retried.
+
 The recorder preserves `native_execution_steps` and matching per-substep count
 boundaries beside unchanged `native_physics_time_s` and raw contact clocks.
 Consumers may form a configured schedule by rounding count differences times

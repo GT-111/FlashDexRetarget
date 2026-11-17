@@ -396,6 +396,120 @@ def test_mjwarp_execution_clock_rejects_an_actual_device_timestep_mismatch():
         plant._bind_execution_clock(.005)
 
 
+def _mjwarp_overflow_fixture(overflow_rows):
+    """Run actual advance/error owners with the SDK's public flag enum only."""
+    from mujoco_warp import OverflowType
+
+    plant = object.__new__(MjWarpPlant)
+    model = SimpleNamespace(nu=1, nv=1, nbody=2, opt=SimpleNamespace(gravity=(0., 0., -9.81)))
+    plant._init_buffers(model, 3, "cpu", {"hand/part": ([0], [1])})
+    plant._scope = nullcontext
+    plant._wp = SimpleNamespace(to_torch=lambda value: value)
+    plant._model = SimpleNamespace(opt=SimpleNamespace(timestep=torch.tensor([.005], dtype=torch.float32)))
+    plant.identity = {"backend": "mjwarp", "nconmax": 512, "njmax": 2048}
+    plant._bind_execution_clock(.005)
+    plant._data = SimpleNamespace(
+        time=torch.zeros(3), overflow=torch.zeros(3, dtype=torch.int32),
+        naconmax=1536, naccdmax=1536, njmax=2048, njmax_nnz=8192, nvmax=6,
+        nacon=torch.tensor([3]), ncollision=torch.tensor([4]),
+        nefc=torch.tensor([2, 3, 5]), solver_niter=torch.tensor([1, 3, 5]),
+    )
+    plant._ctrl = torch.zeros_like(plant.control)
+    plant._xfrc_applied = torch.zeros_like(plant.external_body_wrench_w)
+    plant._solved_effort, plant.effort = torch.full((3, 1), 9.), torch.full((3, 1), 2.)
+    pending = iter(overflow_rows)
+    events = []
+
+    def step(_model, data):
+        events.append("step")
+        data.time.add_(.005)
+        data.overflow.copy_(torch.tensor(next(pending), dtype=torch.int32))
+
+    def contacts():
+        events.append("contacts")
+        plant.contact_support[:] = True
+        plant.contact_facts["hand/part"]["normal_force_n"][:] = 2.
+        plant.contact_facts["hand/part"]["force_bearing_contact_present"][:] = True
+        plant.contact_facts["hand/part"]["force_bearing_distance_max_m"][:] = .001
+
+    plant._mjw = SimpleNamespace(step=step, OverflowType=OverflowType)
+    plant._read_solved_contacts = contacts
+    plant.forward = lambda: events.append("forward")
+    return plant, events
+
+
+@pytest.mark.parametrize("flag_names", [
+    ("EPA_HORIZON",), ("NEFC",), ("NARROWPHASE",),
+    ("EPA_HORIZON", "NEFC", "ITERATIONS", "LS_ITERATIONS"),
+], ids=["epa", "constraint", "contact", "mixed"])
+def test_mjwarp_overflow_preserves_sdk_flags_and_unaccepted_step(flag_names):
+    from mujoco_warp import OverflowType
+
+    bits = sum(int(OverflowType[name]) for name in flag_names)
+    plant, events = _mjwarp_overflow_fixture([[0, bits, 0]])
+    plant._execution_steps.copy_(torch.tensor([4, 8, 12]))
+    if "NEFC" in flag_names:
+        plant._data.nefc[1] = 2049
+    plant.configure_control_interval(2)
+    # A direct call outside a manager interval must discard the prior tape.
+    plant.contact_interval.sample_recorded[:] = True
+    plant.contact_interval.interval_complete[:] = True
+    with patch.object(torch, "_assert_async", side_effect=AssertionError("must not poison CUDA")) as destructive:
+        with pytest.raises(RuntimeError, match="MJWarp overflow: ") as failure:
+            plant.advance()
+    destructive.assert_not_called()
+    witness = json.loads(str(failure.value).split("MJWarp overflow: ", 1)[1])
+    assert witness["raw_bits"] == [0, bits, 0] and witness["affected_worlds"] == [1]
+    assert witness["world_flags"] == [dict(world=1, raw_bits=bits,
+        flags=[flag.name for flag in OverflowType if bits & int(flag)], unknown_bits=0)]
+    assert witness["accepted_steps_before_attempt"] == [4, 8, 12]
+    assert witness["attempted_execution_steps"] == [5, 9, 13]
+    assert witness["control_interval"] == dict(active=False, accepted_substeps=0,
+        attempted_substep=None, configured_substeps=2)
+    assert witness["configured_capacities"] == dict(nconmax=512, njmax=2048)
+    assert witness["resolved_capacities"] == dict(naconmax=1536, naccdmax=1536,
+        njmax=2048, njmax_nnz=8192, nvmax=6)
+    assert witness["counts"] == dict(nacon=[3], ncollision=[4],
+        nefc=[2, 2049 if "NEFC" in flag_names else 3, 5], solver_niter=[1, 3, 5])
+    assert witness["failed_attempt_accepted"] is False
+    assert plant._execution_steps.tolist() == [4, 8, 12] and events == ["step"]
+    assert torch.equal(plant.effort, torch.full((3, 1), 2.))
+    assert not plant.contact_support.any()
+    assert torch.isnan(plant.contact_sample_time_s).all()
+    assert plant.contact_sample_execution_step.tolist() == [-1, -1, -1]
+    assert not plant.contact_interval.sample_recorded.any()
+    assert not plant.contact_interval.interval_complete.any()
+    # The retained ordinary exception no longer depends on mutable SDK flags.
+    plant._data.overflow.zero_()
+    assert json.loads(str(failure.value).split("MJWarp overflow: ", 1)[1]) == witness
+
+
+def test_mjwarp_overflow_preserves_only_the_accepted_manager_prefix():
+    from mujoco_warp import OverflowType
+
+    bits = int(OverflowType.EPA_HORIZON)
+    plant, events = _mjwarp_overflow_fixture([[0, 0, 0], [bits, 0, bits]])
+    plant.configure_control_interval(3)
+    sim = NativeSim(plant)
+    sim.begin_control_step()
+    sim.step()
+    with pytest.raises(RuntimeError, match="MJWarp overflow: ") as failure:
+        sim.step()
+    witness = json.loads(str(failure.value).split("MJWarp overflow: ", 1)[1])
+    assert witness["affected_worlds"] == [0, 2]
+    assert witness["control_interval"] == dict(active=True, accepted_substeps=1,
+        attempted_substep=2, configured_substeps=3)
+    assert plant._execution_steps.tolist() == [1, 1, 1]
+    assert events == ["step", "contacts", "forward", "step"]
+    assert plant.contact_sample_execution_step.tolist() == [0, 0, 0]
+    tape = plant.contact_interval.facts()
+    assert tape["sample_recorded"].tolist() == [[True, False, False]] * 3
+    assert not tape["interval_complete"].any()
+    assert not tape["execution_interval_complete"].any()
+    # The solver attempted the second step; no invented rollback or accepted count.
+    torch.testing.assert_close(plant.physics_time(), torch.full((3,), .01))
+
+
 class _ProtocolPlant(NativePlant):
     """Synthetic state owner for reset/installation contracts, never a physical result."""
 
