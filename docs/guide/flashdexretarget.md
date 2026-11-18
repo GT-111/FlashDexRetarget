@@ -967,7 +967,11 @@ scoring, while unexecuted planned slots retain their normal reasons and denomina
 No partial metric callback is promoted to successful task evidence.
 
 Native source phases, exact source clocks, physical clocks, raw interval contacts
-and their support retain the recorder's arrays and dtypes. First-success archives
+and their support retain the recorder's arrays and dtypes. When the underlying
+`NewtonPlant` exposes post-solve `mjw_data.xfrc_applied` readback, `NativeRolloutRecord`
+also exports `applied_object_wrench_{force_w,torque_w,measurement_support}` and
+`evaluate.py` reports `MEASURED_ZERO_POST_SOLVE` (or `MEASURED_NONZERO_POST_SOLVE`)
+in `evaluation-entry.json`. First-success archives
 keep their existing selection meaning and share the NPZ serializer. Ordinary
 training omits `recording_dir` and continues to write scalar attempt reports
 without automatically storing every rollout.

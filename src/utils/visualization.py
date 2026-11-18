@@ -68,22 +68,39 @@ def infer_robot(pt_path):
 
 def find_robots(root, robot):
     if (root / "motion.pt").exists():
+        nat = root / "native-reference.json"
+        if nat.exists():
+            name = robot or json.loads(nat.read_text())["target"]["embodiment_id"]
+            return {name: root / "motion.pt"}
         name = robot or (root.name if robot_xml(root.name).exists() else infer_robot(root / "motion.pt"))
         return {name: root / "motion.pt"}
+    # Also support <hand>/dataset-{all,train}/motion.pt native pool layouts
+    nat_pts = sorted(root.glob("*/dataset-all/motion.pt")) or sorted(root.glob("*/dataset-train/motion.pt"))
+    if nat_pts:
+        return {
+            p.parents[1].name: p
+            for p in nat_pts
+            if (p.parent / "native-reference.json").exists() and robot in ("", p.parents[1].name)
+        }
     pts = sorted(root.glob("*/motion.pt"), key=lambda p: (p.parent.name != "xhand", p.parent.name))
     return {p.parent.name: p for p in pts
-            if robot_xml(p.parent.name).exists() and robot in ("", p.parent.name)}
+            if ((p.parent / "native-reference.json").exists() or robot_xml(p.parent.name).exists())
+            and robot in ("", p.parent.name)}
 
 
 def find_archives(paths):
     out = []
     for p in (Path(x).resolve() for x in paths):
         hit = [c for c in (p, p / "success") if (c / "manifest.json").exists()]
+        # Also discover NativeRolloutRecord directories (recordings/current-policy-*/[rollouts/]*.npz)
+        if not hit and p.is_dir():
+            rec_dirs = sorted({f.parent for f in p.rglob("m*-a*.npz")})
+            hit.extend(rec_dirs)
         if not hit and p.is_dir():
             hit = [c for d in sorted(p.iterdir()) if d.is_dir()
                    for c in (d, d / "success") if (c / "manifest.json").exists()]
         if not hit:
-            print(f"[viewer] no manifest.json in {p}", flush=True)
+            print(f"[viewer] no manifest.json or recordings in {p}", flush=True)
         out += hit
     return out
 
@@ -204,12 +221,328 @@ def dataset_of(name, info):
     return "other"
 
 
+def run_native_viewer(args, sets):
+    """Viser viewer + --check validator for all 6 native FREE-wrist hands and multi-part objects."""
+    class NativeRobot:
+        def __init__(self, name, pt_path):
+            self.name, self.dir = name, Path(pt_path).parent
+            self.pt = torch.load(pt_path, map_location="cpu", weights_only=False)
+            self.nat_ref = json.loads((self.dir / "native-reference.json").read_text())
+            scene_cfg = self.nat_ref["native_scene"]
+            self.model = mujoco.MjModel.from_xml_path(str(scene_cfg["scene_xml_path"]))
+            self.data = mujoco.MjData(self.model)
+            self.hand_free_qadr = {
+                h["side"]: int(self.model.joint(h["root_joint_name"]).qposadr[0])
+                for h in scene_cfg["hands"]
+            }
+            self.obj_body_ids = set()
+            for obj in scene_cfg["objects"]:
+                root_id = self.model.body(obj["root_body_name"]).id
+                self.obj_body_ids.add(int(root_id))
+                for bid in range(root_id + 1, self.model.nbody):
+                    if int(self.model.body_parentid[bid]) in self.obj_body_ids:
+                        self.obj_body_ids.add(bid)
+            self.names = [
+                str(x).rsplit("#", 1)[-1] for x in self.pt["motion_filename"]
+            ]
+            self.nframes = np.asarray(self.pt["motion_num_frames"]).astype(int)
+            self.refs = self.pt["motion_native_reference"]
+            self.trees = {}
+
+        def add_tree(self, server, key, tint=None, opacity=None):
+            m, frames = self.model, {}
+            for g in range(m.ngeom):
+                gname = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
+                b = int(m.geom_bodyid[g])
+                if (
+                    b == 0
+                    or b in self.obj_body_ids
+                    or m.geom_rgba[g, 3] <= 0
+                    or gname.startswith("collision_")
+                    or m.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH
+                ):
+                    continue
+                mat = m.geom_matid[g]
+                col = (
+                    m.mat_rgba[mat]
+                    if mat >= 0 and np.allclose(m.geom_rgba[g], [0.5, 0.5, 0.5, 1])
+                    else m.geom_rgba[g]
+                )
+                if tint is not None:
+                    col = 0.35 * np.asarray(col[:3]) + 0.65 * np.asarray(tint)
+                if b not in frames:
+                    frames[b] = server.scene.add_frame(f"/{key}_{self.name}/b{b}", show_axes=False)
+                d = m.geom_dataid[g]
+                v0, nv = m.mesh_vertadr[d], m.mesh_vertnum[d]
+                f0, nf = m.mesh_faceadr[d], m.mesh_facenum[d]
+                server.scene.add_mesh_simple(
+                    f"/{key}_{self.name}/b{b}/g{g}",
+                    m.mesh_vert[v0 : v0 + nv].copy(),
+                    m.mesh_face[f0 : f0 + nf].copy(),
+                    color=rgb255(col),
+                    opacity=opacity,
+                    position=m.geom_pos[g].copy(),
+                    wxyz=m.geom_quat[g].copy(),
+                )
+            self.trees[key] = frames
+
+        def pose_from_ref(self, key, m_idx, t_idx):
+            nr = self.refs[m_idx]
+            ti = min(int(t_idx), len(nr["joint_pos"]) - 1)
+            self.data.qpos[:] = self.model.qpos0
+            for side, qadr in self.hand_free_qadr.items():
+                if side in nr["root_state_w"]:
+                    self.data.qpos[qadr : qadr + 7] = np.asarray(nr["root_state_w"][side][ti, :7])
+            for j_idx, jname in enumerate(nr["joint_names"]):
+                jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, str(jname))
+                if jid >= 0:
+                    self.data.qpos[self.model.jnt_qposadr[jid]] = float(nr["joint_pos"][ti, j_idx])
+            mujoco.mj_kinematics(self.model, self.data)
+            for b, h in self.trees[key].items():
+                h.position = self.data.xpos[b].copy()
+                h.wxyz = self.data.xquat[b].copy()
+
+        def pose_from_rollout(self, key, ro, t_idx):
+            ti = min(int(t_idx), len(ro["joint_pos"]) - 1)
+            self.data.qpos[:] = self.model.qpos0
+            for s_idx, side in enumerate(ro["hand_sides"]):
+                if side in self.hand_free_qadr:
+                    qadr = self.hand_free_qadr[side]
+                    self.data.qpos[qadr : qadr + 7] = ro["hand_pose"][ti, s_idx, :7]
+            for j_idx, jname in enumerate(ro["joint_names"]):
+                jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, str(jname))
+                if jid >= 0:
+                    self.data.qpos[self.model.jnt_qposadr[jid]] = float(ro["joint_pos"][ti, j_idx])
+            mujoco.mj_kinematics(self.model, self.data)
+            for b, h in self.trees[key].items():
+                h.position = self.data.xpos[b].copy()
+                h.wxyz = self.data.xquat[b].copy()
+
+        def show_tree(self, key, on):
+            for h in self.trees.get(key, {}).values():
+                h.visible = on
+
+    robots = {r: NativeRobot(r, pt) for r, pt in sets.items()}
+    ref = next(iter(robots.values()))
+    names, nframes = ref.names, ref.nframes
+    alias = {n: i for i, n in enumerate(names)}
+    for i, n in enumerate(names):
+        alias.setdefault(urllib.parse.unquote(n), i)
+
+    # Load object part meshes from native_scene
+    part_meshes = []
+    for obj in ref.nat_ref["native_scene"]["objects"]:
+        for part in obj["parts"]:
+            mp = Path(part["mesh_path"])
+            mesh = trimesh.load(str(mp), force="mesh", process=False, skip_materials=True)
+            part_meshes.append((f"{obj['entity_name']}/{part['name']}", np.asarray(mesh.vertices, np.float32), np.asarray(mesh.faces, np.int32)))
+
+    # Discover native rollouts (either success/manifest.json or current-policy-*/*.npz)
+    archives = {}
+    for a in find_archives(args.saved):
+        clips = {}
+        rob_name = None
+        if (a / "manifest.json").exists():
+            man = json.loads((a / "manifest.json").read_text())
+            npz_list = [(str(e["name"]).rsplit("#", 1)[-1], a / e["rollout"]) for e in man.get("saved", [])]
+            label = a.parent.name if a.name == "success" else a.name
+        else:
+            npz_list = []
+            for p in sorted(a.glob("m*-a*.npz")):
+                d = np.load(p)
+                if "prepared_name" in d:
+                    npz_list.append((str(d["prepared_name"]).rsplit("#", 1)[-1], p))
+            label = f"{a.parents[1].name}/{a.name}" if len(a.parents) >= 2 else a.name
+        for cname, npz_p in npz_list:
+            if cname not in alias or not npz_p.exists():
+                continue
+            d = np.load(npz_p)
+            if "native_hand_pose" not in d:
+                continue
+            if rob_name is None and "native_binding_json" in d:
+                nb = json.loads(str(d["native_binding_json"]))
+                emb = nb.get("producer_identity", {}).get("embodiment_id")
+                if emb in robots:
+                    rob_name = emb
+            if rob_name is None:
+                jset = tuple(str(x) for x in d["joint_names"])
+                rob_name = next((rn for rn, rb in robots.items() if tuple(rb.refs[0]["joint_names"]) == jset), None)
+            clips[alias[cname]] = npz_p
+        if clips and rob_name in robots:
+            key = label if label not in archives else f"{label} ({len(archives)})"
+            archives[key] = {"label": key, "robot": robots[rob_name], "clips": clips}
+            print(f"[viewer] {key}: {len(clips)} native rollouts ({rob_name})", flush=True)
+
+    server = viser.ViserServer(host="0.0.0.0", port=args.port, label=f"FlashDexRetarget Native {Path(args.dataset).name}")
+    server.gui.configure_theme(control_width="large", show_share_button=False)
+    server.scene.set_up_direction("+z")
+    floor = server.scene.add_grid("/floor", width=4.0, height=4.0, cell_size=0.1, section_size=0.5)
+    for r in robots.values():
+        r.add_tree(server, "robot")
+        r.add_tree(server, "ghost", tint=(0.35, 0.6, 1.0), opacity=0.3)
+
+    part_frames = []
+    ghost_part_frames = []
+    for pidx, (pname, v, f) in enumerate(part_meshes):
+        fr = server.scene.add_frame(f"/part_{pidx}", show_axes=False)
+        server.scene.add_mesh_simple(f"/part_{pidx}/m", v, f, color=(204, 158, 97))
+        part_frames.append(fr)
+        gfr = server.scene.add_frame(f"/ghost_part_{pidx}", show_axes=False, visible=False)
+        server.scene.add_mesh_simple(f"/ghost_part_{pidx}/m", v, f, color=(130, 175, 235), opacity=0.32)
+        ghost_part_frames.append(gfr)
+
+    with server.gui.add_folder("Native 6-Hand Clip"):
+        g_robot = server.gui.add_dropdown("hand", list(robots) + (["overlay"] if len(robots) > 1 else []), initial_value=next(iter(robots)))
+        g_run = server.gui.add_dropdown("saved rollout", ["none"] + list(archives), initial_value=next(iter(archives), "none"))
+        g_clip = server.gui.add_dropdown("clip", [f"{i:02d} {n}" for i, n in enumerate(names)], initial_value=f"00 {names[0]}")
+        g_frame = server.gui.add_slider("frame", 0, max(1, int(nframes[0]) - 1), 1, 0)
+        g_play = server.gui.add_checkbox("play", True)
+        g_ghost = server.gui.add_checkbox("reference ghost", True)
+        g_info = server.gui.add_markdown("")
+
+    st = {"m": 0, "t": 0.0, "ro": None, "lock": threading.RLock()}
+
+    def load_ro(m):
+        a = archives.get(g_run.value)
+        if a is None or m not in a["clips"]:
+            return None
+        d = np.load(a["clips"][m])
+        fn = d["hand_part_interval_normal_force_n"].max(axis=1) if "hand_part_interval_normal_force_n" in d else np.zeros((len(d["joint_pos"]), 2))
+        wf = float(np.abs(d["applied_object_wrench_force_w"]).max()) if "applied_object_wrench_force_w" in d else float("nan")
+        return {
+            "robot": a["robot"],
+            "hand_sides": [str(x) for x in d["native_hand_sides"]],
+            "hand_pose": np.asarray(d["native_hand_pose"]),
+            "joint_names": [str(x) for x in d["joint_names"]],
+            "joint_pos": np.asarray(d["joint_pos"]),
+            "part_pose": np.asarray(d["native_object_part_pose"]),
+            "force_n": fn,
+            "max_wrench_n": wf,
+        }
+
+    def show_native(t):
+        m = st["m"]
+        ro = st["ro"]
+        nr = ref.refs[m]
+        tr = min(int(t), int(nframes[m]) - 1)
+        with server.atomic():
+            if ro is None:
+                shown_r = list(robots) if g_robot.value == "overlay" else [g_robot.value]
+                for rn, rb in robots.items():
+                    vis = rn in shown_r
+                    rb.show_tree("robot", vis)
+                    rb.show_tree("ghost", False)
+                    if vis:
+                        rb.pose_from_ref("robot", m, tr)
+                for pidx, fr in enumerate(part_frames):
+                    pstate = nr["object_part_state_w"][tr, min(pidx, nr["object_part_state_w"].shape[1] - 1)]
+                    fr.position = np.asarray(pstate[:3])
+                    fr.wxyz = np.asarray(pstate[3:7])
+                    ghost_part_frames[pidx].visible = False
+            else:
+                rb = ro["robot"]
+                t_ro = min(int(t), len(ro["joint_pos"]) - 1)
+                for rn, r_other in robots.items():
+                    is_sel = rn == rb.name
+                    r_other.show_tree("robot", is_sel)
+                    r_other.show_tree("ghost", is_sel and g_ghost.value)
+                rb.pose_from_rollout("robot", ro, t_ro)
+                if g_ghost.value:
+                    rb.pose_from_ref("ghost", m, tr)
+                for pidx, fr in enumerate(part_frames):
+                    pp = ro["part_pose"][t_ro, min(pidx, ro["part_pose"].shape[1] - 1)]
+                    fr.position = pp[:3]
+                    fr.wxyz = pp[3:7]
+                    pstate = nr["object_part_state_w"][tr, min(pidx, nr["object_part_state_w"].shape[1] - 1)]
+                    ghost_part_frames[pidx].visible = g_ghost.value
+                    ghost_part_frames[pidx].position = np.asarray(pstate[:3])
+                    ghost_part_frames[pidx].wxyz = np.asarray(pstate[3:7])
+
+    def load_clip(m):
+        with st["lock"]:
+            st["m"], st["t"] = int(m), 0.0
+            st["ro"] = load_ro(st["m"])
+            ro = st["ro"]
+            n = int(nframes[m]) if ro is None else max(int(nframes[m]), len(ro["joint_pos"]))
+            g_frame.max = max(1, n - 1)
+            g_frame.value = 0
+            if ro is not None:
+                T = min(len(ro["part_pose"]), int(nframes[m]))
+                ref_p = np.asarray(ref.refs[m]["object_part_state_w"][:T, 0, :3])
+                err_cm = float(np.linalg.norm(ro["part_pose"][:T, 0, :3] - ref_p, axis=-1).mean() * 100.0)
+                f_l, f_r = float(ro["force_n"][:, 0].mean()), float(ro["force_n"][:, 1].mean())
+                g_info.content = (
+                    f"**{names[m]}** ({ro['robot'].name})  \n"
+                    f"obj err: **{err_cm:.2f} cm** · mean force L/R: **{f_l:.2f} / {f_r:.2f} N** · "
+                    f"max xfrc: **{ro['max_wrench_n']:.4f} N**"
+                )
+            else:
+                g_info.content = f"**{names[m]}** · {nframes[m]} frames (kinematic/preloaded-IK reference)"
+            show_native(0)
+
+    @g_clip.on_update
+    def _(e):
+        if e.client is not None:
+            load_clip(int(g_clip.value.split()[0]))
+
+    @g_run.on_update
+    def _(e):
+        if e.client is not None:
+            load_clip(st["m"])
+
+    @g_robot.on_update
+    def _(e):
+        if e.client is not None:
+            show_native(st["t"])
+
+    @g_frame.on_update
+    def _(e):
+        if e.client is not None:
+            with st["lock"]:
+                st["t"] = float(g_frame.value)
+                show_native(st["t"])
+
+    if args.check:
+        g_run.value = "none"
+        g_robot.value = "overlay" if len(robots) > 1 else g_robot.value
+        for m in range(len(names)):
+            load_clip(m)
+            show_native(nframes[m] - 1)
+        print(f"[viewer] native check ok: {len(names)} clips x {list(robots)}", flush=True)
+        for label, a in archives.items():
+            g_run.value = label
+            for m in a["clips"]:
+                load_clip(m)
+                show_native(len(st["ro"]["joint_pos"]) - 1)
+            print(f"[viewer] native rollout check ok: {label}: {len(a['clips'])} rollouts ({a['robot'].name})", flush=True)
+        server.stop()
+        return
+
+    load_clip(0)
+    print(f"[viewer] native 6-hand ready: {len(names)} clips, hands={list(robots)}, runs={len(archives)} -> http://0.0.0.0:{args.port}", flush=True)
+    clock = time.perf_counter()
+    while True:
+        time.sleep(1 / 30)
+        now = time.perf_counter()
+        dt, clock = now - clock, now
+        if not g_play.value:
+            continue
+        with st["lock"]:
+            n = int(g_frame.max) + 1
+            st["t"] = (st["t"] + dt * args.fps) % max(n, 1)
+            show_native(st["t"])
+            g_frame.value = int(st["t"])
+
+
 def main():
     args = parse_args()
     root = Path(args.dataset).resolve()
     sets = find_robots(root, args.robot)
     if not sets:
-        raise SystemExit(f"no motion.pt (with a robot in assets/robot) under {root}")
+        raise SystemExit(f"no motion.pt (with a robot in assets/robot or native-reference.json) under {root}")
+    first_pt = next(iter(sets.values()))
+    if (first_pt.parent / "native-reference.json").exists():
+        return run_native_viewer(args, sets)
     robots = {r: Robot(r, pt) for r, pt in sets.items()}
     ref = next(iter(robots.values()))
     pt, names, starts, nframes = ref.pt, ref.names, ref.starts, ref.nframes

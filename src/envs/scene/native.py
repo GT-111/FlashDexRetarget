@@ -132,8 +132,11 @@ def bind_native_scene_config(cfg, *, constructor_gravity_world_m_per_s2) -> Nati
         parts = layout.part_bindings
         if len({part.body_name for _, part in parts}) != len(parts):
             raise ValueError("native assistance requires one declared reference part per actual body")
-        if obj.perturb.enabled or obj.xfrc.implicit_damping or float(obj.xfrc.contact_scale) != 1.0:
-            raise ValueError("native xfrc supports explicit PD without perturbation, implicit damping or contact scaling")
+        cscale = float(obj.xfrc.contact_scale)
+        if obj.xfrc.implicit_damping or not (0.0 <= cscale <= 1.0):
+            raise ValueError("native xfrc requires contact_scale in [0, 1] without implicit damping")
+        if obj.perturb.enabled and not bool(obj.perturb.get("require_assist_decayed", True)):
+            raise ValueError("native post-decay perturbation requires require_assist_decayed=True")
     gravity = tuple(float(value) for value in constructor_gravity_world_m_per_s2)
     for hand in layout.hands:
         control = hand.root_control

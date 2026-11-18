@@ -26,6 +26,7 @@ class NewtonPlant(NativePlant):
         self.backend.materialize_device()
         self.backend.assert_torch_device_identity(device)
         self._init_buffers(self.backend.model, num_envs, device, contact_pairs)
+        self.has_applied_wrench_readback = hasattr(self.backend, "get_applied_body_wrench_w_torch")
         self._state = self.backend.public_state_torch()
         self._world_ids = torch.arange(num_envs, device=device)
         self._body_ids = torch.arange(1, self.model.nbody, device=device)
@@ -78,6 +79,8 @@ class NewtonPlant(NativePlant):
         self._state = self.backend.set_state_torch(env_ids, qpos=qpos, qvel=qvel)
         self.effort[env_ids] = 0
         self.external_body_wrench_w[env_ids] = 0
+        self.applied_body_wrench_w[env_ids] = 0
+        self.applied_body_wrench_support[env_ids] = False
         self.invalidate_contacts(env_ids)
 
     def advance(self):
@@ -90,6 +93,17 @@ class NewtonPlant(NativePlant):
             torques=self.external_body_wrench_w[:, 1:, 3:],
         )
         result = self.backend.step_torch(self.control, nsteps=1)
+        if getattr(self, "has_applied_wrench_readback", False):
+            try:
+                readback = self.backend.get_applied_body_wrench_w_torch(self._body_ids)
+                if isinstance(readback, tuple) and len(readback) == 3:
+                    f_app, t_app, v_app = readback
+                    self.applied_body_wrench_w[:, 0] = 0
+                    self.applied_body_wrench_w[:, 1:, :3] = f_app
+                    self.applied_body_wrench_w[:, 1:, 3:] = t_app
+                    self.applied_body_wrench_support.copy_(v_app)
+            except NotImplementedError:
+                self.has_applied_wrench_readback = False
         self._execution_steps.add_(1)
         self._state = result.public_state
         if result.applied_joint_effort is None:

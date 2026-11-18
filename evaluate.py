@@ -126,6 +126,35 @@ def run(args: argparse.Namespace) -> None:
                 }),
             )
             print(f"[evaluation] training_env_step={env_step} {metrics}", flush=True)
+            scene_owner = getattr(raw_eval, "scene", None)
+            applied_reader = getattr(scene_owner, "applied_object_wrench_facts", None)
+            applied_last = None if applied_reader is None else applied_reader()
+            if applied_last is not None:
+                # Inspect recorded NPZs when recording_dir is present for full-sweep max, else last post-eval readback
+                max_f = float(applied_last["force_w"].abs().max().item())
+                max_t = float(applied_last["torque_w"].abs().max().item())
+                measured_frames = int(applied_last["measurement_support"].sum().item())
+                if recording_dir is not None:
+                    import numpy as np
+                    for npz_p in Path(recording_dir).rglob("*.npz"):
+                        with np.load(npz_p, allow_pickle=False) as z:
+                            if "applied_object_wrench_force_w" in z and "applied_object_wrench_measurement_support" in z:
+                                sup = z["applied_object_wrench_measurement_support"].astype(bool)
+                                if sup.any():
+                                    max_f = max(max_f, float(np.abs(z["applied_object_wrench_force_w"][sup]).max()))
+                                    max_t = max(max_t, float(np.abs(z["applied_object_wrench_torque_w"][sup]).max()))
+                                    measured_frames += int(sup.sum())
+                authority["wrench_measurement"] = (
+                    "MEASURED_ZERO_POST_SOLVE" if (max_f == 0.0 and max_t == 0.0 and measured_frames > 0)
+                    else "MEASURED_NONZERO_POST_SOLVE" if measured_frames > 0
+                    else "MEASURED_NO_SUPPORTED_STEPS"
+                )
+                authority["applied_object_wrench_summary"] = {
+                    "authority": applied_last["authority"],
+                    "max_abs_force_n": max_f,
+                    "max_abs_torque_nm": max_t,
+                    "measured_endpoint_samples": measured_frames,
+                }
             authority["status"] = "COMPLETED_CURRENT_POLICY_EVALUATION"
             authority["pin_after_eval"] = bool(command.cfg.object.pin_objects)
             authority["success_ever_or_archive_selection"] = "Not loaded or selected; ordinary current-policy outcomes retain all attempted/failed/unscored motions."

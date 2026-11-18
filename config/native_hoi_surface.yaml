@@ -1,0 +1,168 @@
+# High-efficiency, grasp-hardened native HOI FlashSAC recipe across all 6 hands.
+defaults:
+  - native
+  - _self_
+
+native_surface:
+  n_points: 128
+  n_obj_verts: 2048
+
+native_tracking_tolerances:
+  root_position_error_m: 0.12
+  root_rotation_error_rad: 1.05
+  part_position_error_m: 0.05
+  part_rotation_error_rad: 0.95
+  joint_position_error_rad: 0.35
+  joint_position_error_m: null
+  command_position_error_rad: 1.80
+  command_position_error_m: null
+
+# Right-sized compact FP16 replay buffer (~11.8 GiB VRAM) enabling 2-3 co-packed H200 jobs.
+runner:
+  agent:
+    buffer_max_length: 12_000_000
+    buffer_min_length: 65_536
+    compile_mode: "default"
+
+save_checkpoint_per_env_step: 1_000_000
+
+terminations:
+  native_velocity_diverged:
+    params:
+      linear_m_per_s: 100.0
+      angular_rad_per_s: 200.0
+      joint_rad_per_s: 600.0
+      joint_m_per_s: null
+
+eval:
+  interval: 500_000
+  num_per_motion: 1
+  save_success_data: true
+  success_criterion: full
+  stop_when_all_solved: true
+
+commands:
+  object:
+    pin_objects: true
+    pin_mode: xfrc
+    xfrc:
+      omega_rot: 0.0
+      rot_inertia_scale: true
+      vel_feedforward: true
+      contact_scale: 0.5
+      implicit_damping: false
+    perturb:
+      enabled: true
+      force_scale: 1.5
+      torque_scale: 0.03
+      start_prob: 0.04
+      continue_prob: 0.92
+      gate_lag_s: 0.3
+      height_thresh: 0.02
+      require_assist_decayed: true
+
+curriculum:
+  xfrc_curriculum_adaptive:
+    params:
+      kp_init: 60.0
+      kv_init: 4.0
+      force_range: 40.0
+      wait_epochs: 15
+      deque_len: 15
+      num_steps_per_env: 32
+      decay_cooldown_epochs: 6
+      kp_zero_thres: 0.5
+      kp_lower_zero_thres: 1.0
+      rot_stiffness_mult: 96.0
+      kp_floor: 0.0
+      kv_floor: 0.0
+      completion_thres: 0.55
+      dialback_completion_thres: 0.35
+      dialback_min_epochs: 200
+      completion_term: motion_clip_ended
+      seed: ${seed}
+      reward_terms:
+        task: [native_part_surface_displacement, native_object_articulation]
+        imi: [native_root_pose]
+        bc: [native_command_bc]
+      rew_thresholds: {task: 0.38, imi: 0.005, bc: 0.005}
+      upper_ratios: {kp: 0.72, kv: 0.75, fr: 1.0}
+      lower_ratios: {kp: 0.55, kv: 0.60, fr: 1.0}
+      dialback_ratios: {kp: 0.98, kv: 0.98, fr: 0.98}
+
+obs:
+  obs_dict:
+    actor_obs: &hoi_surface_observations
+      - robot_wrist_pose_w
+      - robot_wrist_lin_vel_w
+      - robot_wrist_ang_vel_w
+      - robot_joint_pos
+      - robot_joint_vel
+      - robot_tip_trans_wrist
+      - robot_tip_lin_vel_wrist
+      - native_installed_command_error
+      - native_command_reference_error
+      - native_root_reference_error
+      - native_source_tip_reference_error
+      - native_source_hand_part_intent
+      - native_object_parts_wrist
+      - native_reference_parts_wrist
+      - native_object_joint_state
+      - native_object_joint_reference_error
+      - native_reference_support
+      - native_tip_part_distances
+      - native_tip_part_normals_wrist
+      - native_part_point_cloud_wrist
+      - native_next_part_point_cloud_delta_wrist
+    critic_obs: *hoi_surface_observations
+  obs_params:
+    native_part_point_cloud_wrist:
+      n_points: ${native_surface.n_points}
+      n_obj_verts: ${native_surface.n_obj_verts}
+    native_next_part_point_cloud_delta_wrist:
+      n_points: ${native_surface.n_points}
+      n_obj_verts: ${native_surface.n_obj_verts}
+
+rewards:
+  shared_terms: [native_object_part_pose, native_part_surface_displacement, native_object_articulation, termination_penalty]
+  reward_weights:
+    native_object_part_pose: 0.0
+    native_part_surface_displacement: 1.0
+    native_object_articulation: 0.3
+    native_source_hand_part_contact: 0.5
+    native_source_tip_object_bound: 0.25
+    native_source_tip_position: 0.2
+    native_root_pose: 0.3
+    native_command_bc: 0.2
+    action_penalty: -0.003
+    termination_penalty: -50.0
+  reward_scales:
+    native_command_bc: 500.0
+    native_source_tip_position: 20.0
+  reward_params:
+    native_part_surface_displacement:
+      scale: 10.0
+      n_points: ${native_surface.n_points}
+      n_obj_verts: ${native_surface.n_obj_verts}
+      topk: 3
+      topk_frac: 1.0
+      deadband: 0.0
+      norm_radius: 0.058
+      part_reduce: mean
+    native_source_hand_part_contact:
+      force_scale_n: 1.5
+      separation_bound_m: 0.02
+      require_thumb_opposition: true
+      opposition_distance_m: 0.035
+      non_opposed_scale: 0.15
+    native_source_tip_object_bound:
+      sigma_m: 0.025
+    native_root_pose:
+      position_scale_m: 0.1
+      rotation_scale_rad: 0.3333333333333333
+    native_object_part_pose:
+      position_scale_m: 0.1
+      rotation_scale_rad: 0.3333333333333333
+    native_object_articulation:
+      scale_rad: 0.1
+      scale_m: null

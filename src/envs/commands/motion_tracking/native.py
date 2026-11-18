@@ -745,6 +745,24 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             obj.body_inertial_properties().inertia_com_body_kg_m2[:, body]
             for obj, body in zip(self._part_entities, self._part_body_ids, strict=True)
         ], 1)
+        contact_scale = float(xfrc.contact_scale)
+        if contact_scale < 1.0:
+            contact_facts = getattr(self._env.scene, "hand_part_contact_facts", lambda: None)()
+            if contact_facts is not None and contact_facts["pairs"]:
+                in_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+                for pair in contact_facts["pairs"].values():
+                    in_contact |= (
+                        contact_facts["measurement_support"]
+                        & pair["force_bearing_contact_present"]
+                        & (pair["normal_force_n"] >= 0.5)
+                    )
+                s_rot = torch.where(
+                    in_contact[:, None, None],
+                    torch.full((self.num_envs, 1, 1), contact_scale, device=self.device),
+                    torch.ones((self.num_envs, 1, 1), device=self.device),
+                )
+                kp_rot = kp_rot * s_rot * s_rot
+                kd_rot = kd_rot * s_rot
         force, torque, _ = object_pose_pd_wrench(
             state, reference, inertia,
             kp_pos=gain("_xfrc_kp_pos_env", xfrc.kp.pos),
@@ -754,6 +772,33 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         if self._xfrc_force_range is not None:
             force = force.clamp(-self._xfrc_force_range, self._xfrc_force_range)
             torque = torque.clamp(-self._xfrc_force_range, self._xfrc_force_range)
+        perturb = self.cfg.object.perturb
+        if perturb.enabled and (float(perturb.force_scale) > 0.0 or float(perturb.torque_scale) > 0.0):
+            ctrl = getattr(self, "_xfrc_curr_ctrl", None)
+            decayed = True
+            if perturb.require_assist_decayed and ctrl is not None:
+                decayed = float(ctrl.curr_gains.get("kp", 1.0)) <= float(ctrl.kp_zero_thres)
+            if decayed:
+                if not hasattr(self, "_native_perturb_wrench") or self._native_perturb_wrench.shape[:2] != force.shape[:2]:
+                    self._native_perturb_wrench = torch.zeros(
+                        (*force.shape[:2], 6), dtype=force.dtype, device=self.device
+                    )
+                    self._native_perturb_active = torch.zeros(force.shape[0], dtype=torch.bool, device=self.device)
+                u = torch.rand(self.num_envs, device=self.device)
+                start = (~self._native_perturb_active) & (u < float(perturb.start_prob))
+                keep = self._native_perturb_active & (u < float(perturb.continue_prob))
+                self._native_perturb_active = start | keep
+                if start.any():
+                    n_s = int(start.sum().item())
+                    f_dir = torch.randn((n_s, force.shape[1], 3), device=self.device, dtype=force.dtype)
+                    t_dir = torch.randn((n_s, force.shape[1], 3), device=self.device, dtype=force.dtype)
+                    f_dir = f_dir / f_dir.norm(dim=-1, keepdim=True).clamp_min(1e-6) * float(perturb.force_scale)
+                    t_dir = t_dir / t_dir.norm(dim=-1, keepdim=True).clamp_min(1e-6) * float(perturb.torque_scale)
+                    self._native_perturb_wrench[start] = torch.cat((f_dir, t_dir), dim=-1)
+                self._native_perturb_wrench[~self._native_perturb_active] = 0.0
+                above = state[..., 2:3] > float(perturb.height_thresh)
+                force = force + torch.where(above, self._native_perturb_wrench[..., :3], 0.0)
+                torque = torque + torch.where(above, self._native_perturb_wrench[..., 3:], 0.0)
         self._assist_force_w.copy_(torch.where(support[..., None], force, 0.0).detach())
         self._assist_torque_w.copy_(torch.where(support[..., None], torque, 0.0).detach())
         for entity, obj in self.native_objects.items():

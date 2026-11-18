@@ -107,17 +107,21 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
 
     @staticmethod
     def native_source_hand_part_contact(
-        env, command_name, force_scale_n, separation_bound_m, side=None
+        env, command_name, force_scale_n, separation_bound_m, side=None,
+        require_thumb_opposition=False, opposition_distance_m=0.028, non_opposed_scale=0.15,
     ):
         """Bounded solved-force credit on installed source candidates, not a task score."""
         if (not math.isfinite(force_scale_n) or force_scale_n <= 0
-                or not math.isfinite(separation_bound_m) or separation_bound_m < 0):
+                or not math.isfinite(separation_bound_m) or separation_bound_m < 0
+                or not math.isfinite(opposition_distance_m) or opposition_distance_m <= 0
+                or not math.isfinite(non_opposed_scale) or not 0.0 <= non_opposed_scale <= 1.0):
             raise ValueError("source hand-part contact requires a positive force scale and nonnegative separation bound")
         command = env.command_manager.get_term(command_name)
         intent = command.source_hand_part_intent_facts()
         interval = env.scene.hand_part_contact_interval_facts()
         if intent is None or interval is None:
             return torch.zeros(env.num_envs, device=env.device)
+        geometry = command.source_tip_geometry_facts() if require_thumb_opposition else None
         active = intent["active"] & intent["known"]
         required = active.any(-1) & intent["execution_valid"][:, None]
         # The manager finishes this interval before reward and resets afterwards.
@@ -147,6 +151,28 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
                 eligible = (known & present & (distance <= separation_bound_m)
                             & active[:, hand, part, None])
                 bounded = (torch.where(known, force, 0.0) / force_scale_n).clamp(0.0, 1.0)
+                if require_thumb_opposition and geometry is not None and name in geometry["metadata"]["hand_sides"]:
+                    g_meta = geometry["metadata"]
+                    h_idx = g_meta["hand_sides"].index(name)
+                    b_off, e_off = g_meta["hand_offsets"][h_idx:h_idx + 2]
+                    if body in g_meta["part_body_names"] and e_off > b_off:
+                        p_col = g_meta["part_body_names"].index(body)
+                        p_names = g_meta.get("source_point_names", g_meta.get("point_names", ()))[b_off:e_off]
+                        thumb_cols = [i for i, pn in enumerate(p_names) if "thumb" in pn]
+                        finger_cols = [i for i, pn in enumerate(p_names) if "thumb" not in pn]
+                        if thumb_cols and finger_cols:
+                            d_live = geometry["live_part_distance_m"][:, b_off:e_off, p_col]
+                            sup_live = (
+                                geometry["live_part_query_support"][:, b_off:e_off, p_col]
+                                & geometry["achieved_position_support"][:, b_off:e_off]
+                                & torch.isfinite(d_live)
+                            )
+                            d_valid = torch.where(sup_live, d_live.abs(), float("inf"))
+                            thumb_near = (d_valid[:, thumb_cols].amin(-1) <= opposition_distance_m)
+                            finger_near = (d_valid[:, finger_cols].amin(-1) <= opposition_distance_m)
+                            opposed = thumb_near & finger_near
+                            opp_mult = torch.where(opposed, 1.0, float(non_opposed_scale)).to(bounded.dtype)[:, None]
+                            bounded = bounded * opp_mult
                 credit = torch.maximum(credit, torch.where(eligible, bounded, 0.0))
             values.append((credit * weights.to(credit.dtype)).sum(-1))
         return _source_intent_mean(torch.stack(values, -1), required, intent["metadata"], side)

@@ -27,6 +27,7 @@ class MjWarpPlant(NativePlant):
         model = mujoco.MjModel.from_xml_path(scene_xml_path)
         model.opt.timestep = float(sim_dt)
         self._init_buffers(model, num_envs, device, contact_pairs)
+        self.has_applied_wrench_readback = True
         self.identity = {"backend": "mjwarp", "solver": "direct_mujoco_warp",
                          "contact_generation": "authored_mujoco", "nconmax": nconmax, "njmax": njmax,
                          "scene_xml_path": scene_xml_path, "sim_dt_s": float(sim_dt)}
@@ -100,6 +101,8 @@ class MjWarpPlant(NativePlant):
             self._mjw.reset_data(self._model, self._data, reset=self._reset_mask)
             self.control[env_ids] = 0
             self.external_body_wrench_w[env_ids] = 0
+            self.applied_body_wrench_w[env_ids] = 0
+            self.applied_body_wrench_support[env_ids] = False
             self.effort[env_ids] = 0
             self._execution_steps[env_ids] = 0
             self.invalidate_contacts(env_ids)
@@ -109,6 +112,8 @@ class MjWarpPlant(NativePlant):
             self._qpos[env_ids] = qpos
             self._qvel[env_ids] = qvel
             self.external_body_wrench_w[env_ids] = 0
+            self.applied_body_wrench_w[env_ids] = 0
+            self.applied_body_wrench_support[env_ids] = False
             self._xfrc_applied[env_ids] = 0
             self.effort[env_ids] = 0
             self.invalidate_contacts(env_ids)
@@ -123,6 +128,8 @@ class MjWarpPlant(NativePlant):
             self._xfrc_applied.copy_(self.external_body_wrench_w)
             self._mjw.step(self._model, self._data)
             self._check_overflow()
+            self.applied_body_wrench_w.copy_(self._xfrc_applied)
+            self.applied_body_wrench_support[:] = True
             self._execution_steps.add_(1)
             self.effort.copy_(self._solved_effort)
             # A subsequent forward refreshes endpoint geometry; retain the actual solve first.

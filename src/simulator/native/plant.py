@@ -92,6 +92,9 @@ class NativePlant(ABC):
         # Public native-body order, WORLD force then torque at each body COM.
         # This independent external input never creates an actuator/DOF.
         self.external_body_wrench_w = torch.zeros(self.num_envs, model.nbody, 6, device=device)
+        self.applied_body_wrench_w = torch.zeros(self.num_envs, model.nbody, 6, device=device)
+        self.applied_body_wrench_support = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        self.has_applied_wrench_readback = False
         self.contact_support = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
         self.contact_sample_time_s = torch.full((self.num_envs,), float("nan"), dtype=torch.float64, device=device)
         self.contact_facts = {
@@ -153,6 +156,16 @@ class NativePlant(ABC):
     def execution_clock(self):
         """Accepted fixed-step clock facts, or None when this backend has no port."""
         return None
+
+    def applied_external_body_wrench(self):
+        """Post-solve consumed external body-COM wrench, or None when unsupported."""
+        if not self.has_applied_wrench_readback:
+            return None
+        return dict(
+            wrench_w=self.applied_body_wrench_w,
+            support=self.applied_body_wrench_support,
+            authority="post_solve_mjw_xfrc_applied_WORLD_body_COM_wrench",
+        )
 
     @abstractmethod
     def forward(self):

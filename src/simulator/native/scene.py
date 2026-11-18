@@ -368,3 +368,24 @@ class NativeScene:
             "normal_force_authority": last["normal_force_authority"],
             "distance_authority": last["distance_authority"],
         }
+
+    def applied_object_wrench_facts(self):
+        readback = self.sim.plant.applied_external_body_wrench()
+        if readback is None or not self.native_layout.part_bindings:
+            return None
+        model = self.sim.plant.model
+        body_ids = torch.tensor(
+            [model.body(part.body_name).id for _, part in self.native_layout.part_bindings],
+            device=self.sim.device, dtype=torch.long,
+        )
+        selected = readback["wrench_w"].index_select(1, body_ids)
+        return {
+            "entity_names": tuple(obj.entity_name for obj, _ in self.native_layout.part_bindings),
+            "body_names": tuple(part.body_name for _, part in self.native_layout.part_bindings),
+            "force_w": selected[..., :3],
+            "torque_w": selected[..., 3:],
+            "measurement_support": readback["support"],
+            "authority": readback["authority"],
+            "force_unit": "N",
+            "torque_unit": "N m",
+        }

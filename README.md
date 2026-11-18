@@ -466,10 +466,26 @@ Every option, GPU memory and resuming:
 bash scripts/visualization.sh <output_dataset_path>
 # plus the archived rollouts of training runs (a run dir, its success/ dir, or logs/flashsac for every run)
 bash scripts/visualization.sh <output_dataset_path> logs/flashsac/<run>
+# native 6-hand FREE-wrist pool + recorded rollouts (or headless validation via --check)
+python src/utils/visualization.py --dataset <pool_dir> --saved <run_or_eval_dir> --check
 ```
 
 Open the printed URL (`PORT=8080` by default) in a browser. With a saved run the simulated hands and objects are
 drawn solid over the reference (translucent blue); a run trained on another `motion.pt` is tagged `[other reference]`.
+Native FREE-wrist datasets (`native-reference.json`) automatically render all six dexterous hands (`inspire_rh56f1`,
+`inspire_rh56dftp`, `wuji_hand`, `sharpa_wave`, `unitree_dex3_1`, `wonik_allegro_v5`), multi-part articulated objects,
+object tracking error, bilateral contact forces, and post-solve applied wrench verification (`MEASURED_ZERO_POST_SOLVE`).
+
+### Six-hand grasp-hardened native HOI recipe (`native_hoi_surface`)
+
+`config/native_hoi_surface.yaml` combines `native_part_surface_displacement`, `native_source_tip_reference_error`,
+`native_source_hand_part_intent`, opposing thumb+finger contact credit (`native_source_hand_part_contact` with
+`require_thumb_opposition: true`), contact-gated rotational `xfrc` scaling (`contact_scale: 0.5`), post-decay wrench
+perturbations (`require_assist_decayed: true`), and fast adaptive `xfrc -> 0` decay across all six registered FREE-wrist
+robot configs (`config/envs/robot/{inspire_rh56f1,inspire_rh56dftp,wuji_hand,sharpa_wave_native,unitree_dex3_1,wonik_allegro_v5}_bimanual.yaml`).
+Pairing `envs/simulator@simulator=newton` with CoACD convex hulls capped at `<= 16` hulls and `<= 32` vertices/hull runs
+native `SolverMuJoCo` contacts without `newton-bvh` narrow-phase overhead, while `NativeRolloutRecord` verifies post-solve
+`applied_object_wrench_{force_w,torque_w}` directly from `mjw_data.xfrc_applied`.
 
 ## Project Structure
 

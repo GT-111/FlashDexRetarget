@@ -216,12 +216,13 @@ class OffPolicyRunner:
             if timing_f:
                 timing_f.close()
 
-        final_step = self._step_offset + n_steps * n_envs
+        final_step = env_step if solved_stop else (self._step_offset + n_steps * n_envs)
         # An all-solved stop has just evaluated and exported, so it skips the final sweep.
         if self._eval_supported() and not solved_stop:
             log_metrics({**self._run_eval(final_step), **self._cost_metrics(final_step)}, step=final_step)
         if self._stop_if_requested(final_step):
             return
+        self._final_step = int(final_step)
         self._finish()
 
     # ─── loop stages ─────────────────────────────────────────────────────────────
@@ -399,7 +400,11 @@ class OffPolicyRunner:
         return True
 
     def _finish(self) -> None:
-        self._agent.save(str(self._save_path_base / "final"))
+        final_dir = self._save_path_base / "final"
+        self._agent.save(str(final_dir))
+        final_step = getattr(self, "_final_step", None)
+        if final_step is not None and final_dir.is_dir():
+            self._log_resume_state(final_dir, int(final_step), final_path=final_dir)
         # The buffer only serves a resume; a run that ends normally has nothing to resume.
         if bool(self._cfg.get("delete_replay_buffer_on_finish", False)):
             self._prune_buffers(keep="")

@@ -272,6 +272,24 @@ class NativeRolloutRecord(RolloutRecord):
                 reset="no submitted substep: zero request and false submission support",
             )
         self.backend_metadata = getattr(env.scene, "backend_identity", None)
+        self._applied_object_wrench_reader = getattr(env.scene, "applied_object_wrench_facts", None)
+        self.applied_object_wrench_metadata = None
+        applied_facts = None if self._applied_object_wrench_reader is None else self._applied_object_wrench_reader()
+        if applied_facts is not None:
+            addresses = list(zip(applied_facts["entity_names"], applied_facts["body_names"], strict=True))
+            names = [part["body_name"] for part in self.binding["object_parts"].values()]
+            entities = [part["entity_name"] for part in self.binding["object_parts"].values()]
+            self._applied_wrench_columns = [addresses.index(address)
+                                            for address in zip(entities, names, strict=True)]
+            self.applied_object_wrench_metadata = {
+                "authority": applied_facts["authority"],
+                "force_unit": applied_facts["force_unit"],
+                "torque_unit": applied_facts["torque_unit"],
+                "entity_names": entities,
+                "body_names": names,
+                "sampling": "last solved physics substep post-solve mjw_data.xfrc_applied",
+                "reset": "no solved substep: zero reading and false measurement_support",
+            }
         self._physics_time_reader = getattr(env.scene, "physics_time_s", None)
         self._execution_clock_reader = getattr(env.scene, "physics_execution_clock", None)
         execution = None if self._execution_clock_reader is None else self._execution_clock_reader()
@@ -371,6 +389,14 @@ class NativeRolloutRecord(RolloutRecord):
                 key: facts[key].detach().cpu().clone()
                 for key in ("submission_support", "sample_time_s", "clock_support")
             })
+        if self.applied_object_wrench_metadata is not None:
+            applied = self._applied_object_wrench_reader()
+            if applied is not None:
+                frame["applied_object_wrench"] = {
+                    "force_w": applied["force_w"][:, self._applied_wrench_columns].detach().cpu().clone(),
+                    "torque_w": applied["torque_w"][:, self._applied_wrench_columns].detach().cpu().clone(),
+                    "measurement_support": applied["measurement_support"].detach().cpu().clone(),
+                }
         if self.installed_term is not None:
             control = self.installed_term.installed_control
             frame["installed"] = {field: control[field].detach().to("cpu").clone()
@@ -456,6 +482,10 @@ class NativeRolloutRecord(RolloutRecord):
                 }
             if "object_assist" in frame:
                 selected["object_assist"] = {field: value[select] for field, value in frame["object_assist"].items()}
+            if "applied_object_wrench" in frame:
+                selected["applied_object_wrench"] = {
+                    field: value[select] for field, value in frame["applied_object_wrench"].items()
+                }
             if "installed" in frame:
                 selected["installed"] = {field: value[select] for field, value in frame["installed"].items()}
             if "object_joint_pos" in frame:
@@ -526,6 +556,14 @@ class NativeRolloutRecord(RolloutRecord):
                     for field in frames[0]["object_assist"]:
                         result["object_assist_" + field] = np.stack([
                             frame["object_assist"][field][row].numpy() for frame in frames
+                        ])
+                if self.applied_object_wrench_metadata is not None and "applied_object_wrench" in frames[0]:
+                    result["applied_object_wrench_metadata_json"] = np.asarray(
+                        json.dumps(self.applied_object_wrench_metadata)
+                    )
+                    for field in ("force_w", "torque_w", "measurement_support"):
+                        result["applied_object_wrench_" + field] = np.stack([
+                            frame["applied_object_wrench"][field][row].numpy() for frame in frames
                         ])
                 if self.installed_metadata is not None:
                     result["installed_control_metadata_json"] = np.asarray(json.dumps(self.installed_metadata))
