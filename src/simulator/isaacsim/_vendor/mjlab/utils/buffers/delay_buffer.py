@@ -226,6 +226,12 @@ class DelayBuffer:
     """
     self._buffer.append(data)
 
+  def initialize(self, data: torch.Tensor, batch_ids: torch.Tensor) -> torch.Tensor:
+    """Initialize reset rows while retaining every other row's delay history."""
+    self._buffer.initialize(data, batch_ids)
+    self._update_lags(batch_ids)
+    return self._buffer[self._current_lags][batch_ids]
+
   def compute(self) -> torch.Tensor:
     """Compute delayed observation for current step.
 
@@ -244,7 +250,7 @@ class DelayBuffer:
 
     return self._buffer[valid_lags]
 
-  def _update_lags(self) -> None:
+  def _update_lags(self, batch_ids: torch.Tensor | None = None) -> None:
     """Update current lags according to configured policy."""
     if self.update_period > 0:
       phase_adjusted_count = (self._step_count + self._phase_offsets) % (
@@ -253,9 +259,14 @@ class DelayBuffer:
       should_update = phase_adjusted_count == 0
     else:
       should_update = torch.ones(self.batch_size, dtype=torch.bool, device=self.device)
+    if batch_ids is not None:
+      selected = torch.zeros_like(should_update)
+      selected[batch_ids] = True
+      should_update &= selected
     new_lags = self._sample_lags(should_update)
     self._current_lags = torch.where(should_update, new_lags, self._current_lags)
-    self._step_count += 1
+    rows = slice(None) if batch_ids is None else batch_ids
+    self._step_count[rows] += 1
 
   def _sample_lags(self, mask: torch.Tensor) -> torch.Tensor:
     """Sample new lags for specified environments.

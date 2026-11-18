@@ -214,6 +214,18 @@ class CircularBuffer:
 
     self._num_pushes += 1
 
+  def initialize(self, data: torch.Tensor, batch_ids: torch.Tensor) -> None:
+    """Backfill selected reset rows without moving the shared time pointer."""
+    data = data.to(self._device)
+    if self._buffer is None:
+      self._pointer = 0
+      self._buffer = torch.zeros(
+        (self._max_len, self._batch_size, *data.shape[1:]),
+        dtype=data.dtype, device=self._device,
+      )
+    self._buffer[:, batch_ids] = data
+    self._num_pushes[batch_ids] = 1
+
   def __getitem__(self, key: torch.Tensor | int) -> torch.Tensor:
     """Retrieve lagged frames per batch (LIFO).
 

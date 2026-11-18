@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -42,32 +43,46 @@ def tip_contacts(tips: np.ndarray, pose: np.ndarray, verts: np.ndarray, tree: cK
 def load_clip(path: Path, meshes: C.ObjectMeshes, fps: float, cfg) -> tuple[dict, dict]:
     clip = C.load_clip(path)
     dt, sigma = 1.0 / fps, cfg.vel_sigma
-    qpos = clip["qpos"].astype(np.float32)
+    native = C.native_reference(clip)
+    qpos = (native["joint_pos"] if native is not None else clip["qpos"]).astype(np.float32)
     T = len(qpos)
     if T < 2:
         raise ValueError(f"{path.name}: needs at least 2 frames")
     sides = C.sides(clip)
     if not sides:
         raise ValueError(f"{path.name}: no mano_right_* / mano_left_* arrays")
-    d = {"joint_pos": qpos, "joint_vel": velocity(qpos, dt, sigma)}
+    d = {"joint_pos": qpos, "joint_vel": (
+        native["joint_vel"].astype(np.float32) if native is not None else velocity(qpos, dt, sigma))}
     meta: dict = {"sides": sides, "support": clip.get("support_disks")}
+    if native is not None:
+        meta["native_reference"] = native
+    if "source_lineage_json" in clip:
+        meta["source_lineage"] = json.loads(str(clip["source_lineage_json"]))
+        for name in ("source_query_ordinal", "source_import_elapsed_ns"):
+            if clip[name].shape != (T,):
+                raise ValueError(f"{path.name}: {name} must match the actually cropped reference")
+            d[name] = clip[name].copy()
     tip_cols = [C.MANO_JOINT_NAMES.index(f"{f}_tip") for f in C.FINGERS]
     for s in sides:
         joints = C.joints(clip, s).astype(np.float32)
         wrist_pos = clip[f"mano_{s}_wrist_pos"].astype(np.float32)
         wrist_rot = clip[f"mano_{s}_wrist_rot"].astype(np.float32)
-        pose = C.obj_pose(clip, s)
-        for key, arr in (("mano_joints", joints), ("wrist_pos", wrist_pos), ("wrist_rot", wrist_rot), ("obj_pose", pose)):
+        for key, arr in (("mano_joints", joints), ("wrist_pos", wrist_pos), ("wrist_rot", wrist_rot)):
             if len(arr) != T:
                 raise ValueError(f"{path.name}: {s} {key} has {len(arr)} frames, qpos {T}")
-        obj_id, scale = C.obj_id(clip, s), C.obj_scale(clip, s)
-        mass = float(clip[f"obj_{s}_mass"]) if f"obj_{s}_mass" in clip else 0.0
         d[f"mano_{s}_wrist_pos"] = wrist_pos
         d[f"mano_{s}_wrist_rot"] = wrist_rot
         d[f"mano_{s}_wrist_vel"] = velocity(wrist_pos, dt, sigma)
         d[f"mano_{s}_wrist_angvel"] = angular_velocity(wrist_rot.astype(np.float64), dt, sigma)
         d[f"mano_{s}_joints"] = joints
         d[f"mano_{s}_joints_vel"] = velocity(joints, dt, sigma)
+        if native is not None:
+            continue  # Native objects/parts have independent owners, not hand-side aliases.
+        pose = C.obj_pose(clip, s)
+        if len(pose) != T:
+            raise ValueError(f"{path.name}: {s} obj_pose has {len(pose)} frames, qpos {T}")
+        obj_id, scale = C.obj_id(clip, s), C.obj_scale(clip, s)
+        mass = float(clip[f"obj_{s}_mass"]) if f"obj_{s}_mass" in clip else 0.0
         d[f"obj_{s}_pos"] = pose[:, :3, 3].astype(np.float32)
         d[f"obj_{s}_rotmat"] = pose[:, :3, :3].astype(np.float32)
         d[f"obj_{s}_vel"] = velocity(pose[:, :3, 3], dt, sigma)
@@ -95,29 +110,38 @@ def build(clips: Path, dataset: Path, fps: float, cfg, names: set[str] | None = 
         d, m = load_clip(f, meshes, fps, cfg)
         rows.append(d)
         metas.append(m)
-        print(f"[build] {f.stem}: {len(d['joint_pos'])} frames, objects {[m[s] for s in m['sides']]}", flush=True)
+        objects = (m["native_reference"]["object_root_body_names"] if "native_reference" in m
+                   else [m[s] for s in m["sides"]])
+        print(f"[build] {f.stem}: {len(d['joint_pos'])} frames, objects {objects}", flush=True)
     sides = metas[0]["sides"]
     bad = [f.name for f, m in zip(files, metas) if m["sides"] != sides]
     if bad:
         raise ValueError(f"every clip needs the same hand sides {sides}; differs: {bad[:5]}")
+    native = [m.get("native_reference") for m in metas]
+    if any(item is not None for item in native) and not all(item is not None for item in native):
+        raise ValueError("one motion.pt cannot mix native references with scalar-wrist stock clips")
 
     packed: dict = {k: torch.from_numpy(np.concatenate([r[k] for r in rows])) for k in rows[0]}
     frames = torch.tensor([len(r["joint_pos"]) for r in rows], dtype=torch.long)
     packed["motion_num_frames"] = frames
     packed["length_starts"] = torch.cumsum(frames, 0) - frames
     packed["motion_filename"] = [f.stem for f in files]
+    packed["motion_source_lineage"] = [m.get("source_lineage") for m in metas]
+    if native[0] is not None:
+        packed["motion_native_reference"] = native
     for s in sides:
         packed[f"mano_{s}_joint_names"] = list(C.MANO_JOINT_NAMES)
 
     # One object slot per distinct (right, left) object pair; a single-hand file has one per object.
     slots: dict[tuple, int] = {}
-    slot_of = [slots.setdefault(tuple(m[s] for s in sides), len(slots)) for m in metas]
-    for i, s in enumerate(sides):
-        packed[f"{s}_object_mesh_dirs"] = [f"objects/{key[i][0]}" for key in slots]
-        packed[f"{s}_object_mesh_scales"] = [key[i][1] for key in slots]
-        if any(key[i][2] > 0 for key in slots):
-            packed[f"{s}_object_masses"] = [key[i][2] for key in slots]
-        packed[f"motion_object_slot_{s}"] = torch.tensor(slot_of, dtype=torch.long)
+    if native[0] is None:
+        slot_of = [slots.setdefault(tuple(m[s] for s in sides), len(slots)) for m in metas]
+        for i, s in enumerate(sides):
+            packed[f"{s}_object_mesh_dirs"] = [f"objects/{key[i][0]}" for key in slots]
+            packed[f"{s}_object_mesh_scales"] = [key[i][1] for key in slots]
+            if any(key[i][2] > 0 for key in slots):
+                packed[f"{s}_object_masses"] = [key[i][2] for key in slots]
+            packed[f"motion_object_slot_{s}"] = torch.tensor(slot_of, dtype=torch.long)
 
     disks = [m["support"] for m in metas]
     if any(x is not None for x in disks):

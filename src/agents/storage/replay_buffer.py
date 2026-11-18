@@ -1,4 +1,4 @@
-"""Replay storage of the recipe: compact obs layout, head rewards, timeout-only final-obs copies."""
+"""Compact replay with explicit timeout and physical-fragment endpoints."""
 
 from __future__ import annotations
 
@@ -136,8 +136,8 @@ class ReplayObsLayout:
 
 
 class ReplayBuffer(MemoryEfficientTorchUniformBuffer):
-    """Memory-efficient replay with int32 aux groups, (m, H) head rewards and final-obs copies for
-    timeouts only; CPU rows on a CUDA host are page-locked and gathered through a mapped view."""
+    """Compact replay with int32 aux groups, head rewards and factual boundary endpoints;
+    CPU rows on a CUDA host are page-locked and gathered through a mapped view."""
 
     _ROW_ATTRS = {"action": "_actions", "reward": "_rewards", "terminated": "_terminateds", "truncated": "_truncateds"}
 
@@ -199,6 +199,8 @@ class ReplayBuffer(MemoryEfficientTorchUniformBuffer):
         self._current_idx = 0
         self._add_batch_size: int | None = None
         self._timeout_next_observations: dict[int, dict[str, torch.Tensor]] = {}
+        self._boundary_next_observations: dict[int, dict[str, torch.Tensor]] = {}
+        self._recent_next_observations: deque[tuple[int, dict[str, torch.Tensor]]] = deque(maxlen=self._n_step)
 
     def _storage(self) -> dict[str, torch.Tensor]:
         rows = {f"observation/{key}": value for key, value in self._observations.items()}
@@ -294,9 +296,10 @@ class ReplayBuffer(MemoryEfficientTorchUniformBuffer):
         self._truncateds[idxs] = prev["truncated"]
 
         # Overwritten slots no longer belong to the timeouts they were recorded for
-        if self._timeout_next_observations:
+        if self._timeout_next_observations or self._boundary_next_observations:
             for idx in idx_tensor.cpu().tolist():
                 self._timeout_next_observations.pop(idx, None)
+                self._boundary_next_observations.pop(idx, None)
         # Terminated rows never bootstrap, so only timeouts keep their final observation
         timeout_mask = prev["truncated"].bool() & ~prev["terminated"].bool()
         if timeout_mask.any():
@@ -307,8 +310,29 @@ class ReplayBuffer(MemoryEfficientTorchUniformBuffer):
             for row, idx in enumerate(idx_tensor[timeout_mask].cpu().tolist()):
                 self._timeout_next_observations[idx] = {key: value[row].clone() for key, value in final_obs.items()}
 
+        # Retain factual endpoints for the implicit next-obs frontier. A fresh
+        # physical fragment cannot fill these old future slots.
+        self._recent_next_observations.append((self._current_idx, {
+            key: value.detach().to(dtype=self._observations[key].dtype, device=self._device, copy=True)
+            for key, value in prev["next_observation"].items()
+        }))
         self._num_in_buffer = min(self._num_in_buffer + add_batch_size, self._max_length)
         self._current_idx = end_idx % self._max_length
+
+    def _sealed_next_observations(self) -> dict[int, dict[str, torch.Tensor]]:
+        endpoints = dict(self._boundary_next_observations)
+        for start, observations in self._recent_next_observations:
+            for row in range(self._add_batch_size):
+                idx = (start + row) % self._max_length
+                # Each batch above already owns an immutable detached copy.
+                endpoints[idx] = {key: value[row] for key, value in observations.items()}
+        return endpoints
+
+    def end_collection(self) -> None:
+        """Close a physical fragment without fabricating episode ends or future states."""
+        self._boundary_next_observations = self._sealed_next_observations()
+        self._recent_next_observations.clear()
+        self._n_step_transitions.clear()
 
     def _obs_batch(self, storage: dict[str, torch.Tensor], idxs: torch.Tensor) -> TensorDict:
         cast = self._obs_storage_dtype is not None
@@ -333,11 +357,11 @@ class ReplayBuffer(MemoryEfficientTorchUniformBuffer):
 
         next_idxs = (idxs + self._n_step * self._add_batch_size) % self._max_length
         next_observation = self._obs_batch(self._observations, next_idxs)
-        if self._timeout_next_observations:
+        if self._timeout_next_observations or self._boundary_next_observations:
             hits = [
                 (pos, obs)
                 for pos, idx in enumerate(idxs.cpu().tolist())
-                if (obs := self._timeout_next_observations.get(idx)) is not None
+                if (obs := self._timeout_next_observations.get(idx, self._boundary_next_observations.get(idx))) is not None
             ]
             if hits:
                 positions = torch.as_tensor([pos for pos, _ in hits], device=self._device)
@@ -357,24 +381,43 @@ class ReplayBuffer(MemoryEfficientTorchUniformBuffer):
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         n = self._num_in_buffer
+        pending_rows = 0
+        if self._n_step_transitions:
+            pending_batches = len(self._n_step_transitions) - int(len(self._n_step_transitions) == self._n_step)
+            pending_rows = pending_batches * self._n_step_transitions[0]["reward"].shape[0]
         torch.save(
             {
-                "observation": {key: self._cpu_rows(f"observation/{key}")[:n] for key in self._store_groups},
-                **{name: self._cpu_rows(name)[:n] for name in self._ROW_ATTRS},
+                # A slice alone retains the full capacity's backing storage.
+                # Copy occupied rows directly to CPU, including for host replay.
+                "observation": {key: self._cpu_rows(f"observation/{key}")[:n].to("cpu", copy=True)
+                                for key in self._store_groups},
+                **{name: self._cpu_rows(name)[:n].to("cpu", copy=True) for name in self._ROW_ATTRS},
+                "capacity": self._max_length,
+                "n_step": self._n_step,
+                "gamma": self._gamma,
                 "num_in_buffer": self._num_in_buffer,
                 "current_idx": self._current_idx,
                 "add_batch_size": self._add_batch_size,
-                "timeout_next_observations": self._timeout_next_observations,
+                "pending_collector_rows": pending_rows,
+                "timeout_next_observations": {
+                    idx: {key: value.to("cpu", copy=True) for key, value in obs.items()}
+                    for idx, obs in self._timeout_next_observations.items()
+                },
+                "boundary_next_observations": {
+                    idx: {key: value.to("cpu", copy=True) for key, value in obs.items()}
+                    for idx, obs in self._sealed_next_observations().items()
+                },
             },
             path,
         )
 
     def load(self, path: str) -> None:
-        """Load our format or flash_rl's (flat observation + observation_aux) through a CPU mmap:
-        a device map_location would double the device memory of a large buffer."""
+        """Restore the current fragment-safe format through a CPU mmap."""
         dataset = torch.load(path, map_location="cpu", mmap=True)
-        if isinstance(dataset["observation"], torch.Tensor):
-            dataset = self._from_flash_rl(dataset)
+        if (dataset["capacity"], dataset["n_step"], dataset["gamma"]) != (
+            self._max_length, self._n_step, self._gamma,
+        ):
+            raise ValueError("replay capacity, n-step and gamma must match the saved constructor")
         n = dataset["num_in_buffer"]
         for key in self._store_groups:
             self._cpu_rows(f"observation/{key}")[:n] = dataset["observation"][key]
@@ -387,28 +430,9 @@ class ReplayBuffer(MemoryEfficientTorchUniformBuffer):
             int(idx): {key: value.to(self._device) for key, value in obs.items()}
             for idx, obs in dataset["timeout_next_observations"].items()
         }
-        self._n_step_transitions.clear()
-
-    def _from_flash_rl(self, dataset: dict[str, Any]) -> dict[str, Any]:
-        """Split flash_rl's flat observation columns into the float groups (in store order)."""
-        float_groups = [key for key in self._store_groups if key not in self._aux_groups]
-        widths = [self._obs_shapes[key][-1] for key in float_groups]
-        aux_key = next(iter(self._aux_groups), None)
-        if aux_key is not None and dataset.get("observation_aux") is None:
-            raise ValueError("replay buffer file has no observation_aux but obs compaction is on.")
-
-        def split(flat: torch.Tensor, aux: torch.Tensor | None) -> dict[str, torch.Tensor]:
-            groups = dict(zip(float_groups, flat.split(widths, dim=-1)))
-            if aux_key is not None:
-                groups[aux_key] = aux
-            return groups
-
-        timeout_aux = dataset.get("timeout_next_aux") or {}
-        return {
-            **dataset,
-            "observation": split(dataset["observation"], dataset.get("observation_aux")),
-            "timeout_next_observations": {
-                idx: split(obs, timeout_aux.get(idx))
-                for idx, obs in dataset.get("timeout_next_observations", {}).items()
-            },
+        self._boundary_next_observations = {
+            int(idx): {key: value.to(self._device) for key, value in obs.items()}
+            for idx, obs in dataset["boundary_next_observations"].items()
         }
+        self._n_step_transitions.clear()
+        self._recent_next_observations.clear()

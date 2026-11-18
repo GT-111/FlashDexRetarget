@@ -316,8 +316,30 @@ class ObservationManager(ManagerBase):
     self._obs_buffer = obs_buffer
     return obs_buffer
 
+  def refresh(
+    self, env_ids: torch.Tensor, *,
+    previous_observations: dict[str, torch.Tensor | dict[str, torch.Tensor]],
+  ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    """Initialize selected reset rows without advancing other observations."""
+    obs_buffer = {}
+    for group_name in self._group_obs_term_names:
+      updated = self.compute_group(group_name, env_ids=env_ids)
+      previous = previous_observations[group_name]
+      if isinstance(previous, torch.Tensor):
+        value = previous.clone()
+        value[env_ids] = updated
+      else:
+        value = {}
+        for name, old in previous.items():
+          value[name] = old.clone()
+          value[name][env_ids] = updated[name]
+      obs_buffer[group_name] = value
+    self._obs_buffer = obs_buffer
+    return obs_buffer
+
   def compute_group(
-    self, group_name: str, update_history: bool = False
+    self, group_name: str, update_history: bool = False, *,
+    env_ids: torch.Tensor | None = None,
   ) -> torch.Tensor | dict[str, torch.Tensor]:
     group_cfg = self.cfg[group_name]
     group_term_names = self._group_obs_term_names[group_name]
@@ -327,10 +349,12 @@ class ObservationManager(ManagerBase):
     )
     for term_name, term_cfg in obs_terms:
       obs: torch.Tensor = term_cfg.func(self._env, **term_cfg.params).clone()
+      if env_ids is not None:
+        obs = obs[env_ids]
       if isinstance(term_cfg.noise, noise_cfg.NoiseCfg):
         obs = term_cfg.noise.apply(obs)
       elif isinstance(term_cfg.noise, noise_cfg.NoiseModelCfg):
-        obs = self._group_obs_class_instances[term_name](obs)
+        obs = self._group_obs_class_instances[term_name](obs, env_ids=env_ids)
       if term_cfg.clip:
         obs = obs.clip_(min=term_cfg.clip[0], max=term_cfg.clip[1])
       if term_cfg.scale is not None:
@@ -346,17 +370,25 @@ class ObservationManager(ManagerBase):
 
       if term_cfg.delay_max_lag > 0:
         delay_buffer = self._group_obs_term_delay_buffer[group_name][term_name]
-        delay_buffer.append(obs)
-        obs = delay_buffer.compute()
+        if env_ids is None:
+          delay_buffer.append(obs)
+          obs = delay_buffer.compute()
+        else:
+          obs = delay_buffer.initialize(obs, env_ids)
       if term_cfg.history_length > 0:
         circular_buffer = self._group_obs_term_history_buffer[group_name][term_name]
-        if update_history or not circular_buffer.is_initialized:
+        if env_ids is not None:
+          circular_buffer.initialize(obs, env_ids)
+        elif update_history or not circular_buffer.is_initialized:
           circular_buffer.append(obs)
 
+        history = circular_buffer.buffer
+        if env_ids is not None:
+          history = history[env_ids]
         if term_cfg.flatten_history_dim:
-          group_obs[term_name] = circular_buffer.buffer.reshape(self._env.num_envs, -1)
+          group_obs[term_name] = history.reshape(obs.shape[0], -1)
         else:
-          group_obs[term_name] = circular_buffer.buffer
+          group_obs[term_name] = history
       else:
         group_obs[term_name] = obs
 

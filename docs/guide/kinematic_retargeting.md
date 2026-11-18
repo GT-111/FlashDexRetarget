@@ -15,8 +15,18 @@ go to `kinematic_retargeting.yaml`. The scripts run two commands, which can also
 
 ```sh
 bash scripts/retarget/import_human_demo.sh source=taco raw=<raw_dataset_path> dataset=<output_dataset_path>   # taco | oakink2 | hot3d
-bash scripts/retarget/kinematic_retargeting.sh dataset=<output_dataset_path> robot=xhand
+bash scripts/retarget/kinematic_retargeting.sh --profile isaac dataset=<output_dataset_path> robot=xhand
 ```
+
+`--profile` selects the existing activation file: `isaac` (the default) uses
+Python 3.11 from `scripts/env.sh`; `mjwarp` and `newton` use Python 3.12 from
+`env/native.sh`. Run the corresponding [setup](../../README.md#setup) first.
+The selected activation must exist and match its Python minor. It clears
+inherited `PYTHONPATH`, supplies node-local cache defaults, and preserves
+operator cache overrides and license acceptance. Unlike the training wrapper,
+preparation's profile chooses only the environment; input, steps, robot and
+task stay explicit Hydra configuration. Full human import and physics IK use
+the author environment, since native setup omits that processing stack.
 
 | | step | does | writes (under the dataset) |
 |---|---|---|---|
@@ -31,6 +41,64 @@ Settings live in `config/retarget/import_human_demo.yaml` and `config/retarget/k
 any key is overridden as `key=value`, and each run's config is kept under `.hydra/` next to the outputs.
 `workers=` sets the CPU parallelism (default: half the cores), `steps.<name>=false` skips a step (e.g.
 `steps.retarget=false steps.pack=false` to review `report.csv` first).
+
+## Prepared native input
+
+`input=human_demo` is the default input constructor. It retains the preprocessing,
+physics IK and report flow above, including object preparation from an existing
+`motion.pt` when `human_demo/` is absent.
+
+For an already prepared native dataset, select its own input constructor:
+
+```sh
+bash scripts/retarget/kinematic_retargeting.sh --profile mjwarp dataset=<prepared_dataset> \
+  input=prepared_native steps.convex=false steps.usd=false steps.sdf=false
+```
+
+`--profile newton` uses the same native activation with its selected public
+DexForge packages. Neither profile silently enables native input or skips steps.
+
+The default manifest is `<prepared_dataset>/native-reference.json`; select a
+different dataset-relative manifest with `input.manifest=...`. It declares the
+actual selection and cadence:
+
+```json
+{
+  "clip_directory": "native_reference",
+  "clips": ["prepared-stage"],
+  "fps": 50.0,
+  "control_period_ns": 20000000
+}
+```
+
+`clip_directory` is relative to the dataset. `clips` contains NPZ stems without
+the suffix; only those clips enter `motion.pt`, even if the directory contains
+other preparations. Each selected clip must carry the existing explicit
+`native_reference`, genuine MANO/object fields and its own matching `fps`.
+The manifest does not replace the native carrier's names, independent support,
+exact query clock or source lineage.
+
+Prepared input bypasses human-demo desk estimation, rejection filters and rigid
+physics IK. It is already retargeted, so `steps.retarget` performs no additional
+operation on this route. A leftover `human_demo/` directory does not select the
+input or change its population. Native support belongs to the authored scene;
+clips carrying stock `support_disks` are rejected rather than converted into a
+second support authority.
+
+The selected clips use the unchanged `build_motion_pt.build` packer. Ordinary
+`MotionLibrary` reading retains named physical scalar joints (including passive
+hand followers), FREE hand roots, object parts and passive object joints, with
+their independent pose/rate support and original prepared clock phase.
+`NativeMotionTrackingCommand` remains responsible for matching those names and
+the cadence to the selected physical scene and actual control period. Unknown
+rates remain zero with false support; they are not filled by this entry point.
+
+Supply the original `objects/<id>/visual.obj` files needed by the normal packer.
+Native MJCF mechanics, per-part meshes and static support still come from the
+configured native scene. The existing convex/USD/SDF steps are independently
+selectable object preparation; they do not qualify a native articulation or
+replace its scene bindings. Packing and reading a requested reference alone do
+not establish physical contact, task success or a successful Flash policy.
 
 ## Dataset layout
 
@@ -117,6 +185,15 @@ penetration is kept. Clips are kept but flagged in `report.csv` (`flags`) on:
 - `pack`: concatenates the kept clips into `motion.pt`, with velocities and fingertip contact labels.
 - `usd`: object USDs for Isaac Sim.
 - `sdf`: object SDF grids (`sdf.grid_n`, `sdf.extent`), which must match `commands.object.sdf` of training.
+
+USD conversion inherits the operator's `OMNI_KIT_ACCEPT_EULA` environment value.
+Set it after accepting NVIDIA's terms; the pipeline does not create acceptance.
+`usd_gpu` selects the CUDA visibility mask for the existing converter process.
+`usd_kit_args` (default `""`) forwards extra AppLauncher arguments as one command
+argument. When CUDA and graphics ordinals differ, the resource owner can pass,
+for example, `'usd_kit_args="--/renderer/activeGpu=1"'`. Use the actual Kit GPU
+table and allocation to choose that ordinal; the CUDA mask alone does not
+constrain graphics contexts.
 
 ### `motion.pt` contents
 

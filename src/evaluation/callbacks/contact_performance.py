@@ -30,6 +30,9 @@ class ContactPerformance:
         self.valid_steps_per_env = (
             self.cmd.motion_num_frames - self.cmd.motion_steps
         ).clamp(min=0)
+        self.motion_start_steps = self.cmd.motion_steps.clone()
+        metadata_reader = getattr(env.scene, "tracking_contact_metadata", None)
+        self.measurement_metadata = metadata_reader() if metadata_reader is not None else None
         self.scored_env_mask = self.valid_steps_per_env > self.grace_steps
         if not torch.any(self.scored_env_mask):
             self.scored_env_mask = torch.ones(
@@ -59,6 +62,7 @@ class ContactPerformance:
         self.count_contact = _z()
         self.miss_counter = _z()
         self.miss_max = _z()
+        self.count_per_env = torch.zeros(self.num_envs, device=self.device)
         self.t = 0
 
     def on_step(self, env: Any) -> None:
@@ -70,6 +74,7 @@ class ContactPerformance:
         self.t += 1
         if not torch.any(in_window):
             return
+        self.count_per_env += in_window.to(self.count_per_env.dtype)
 
         cmd = self.cmd
         valid_mask = in_window[:, None].to(torch.float32)
@@ -102,6 +107,9 @@ class ContactPerformance:
         Raw ``valid_steps_per_env`` lets scored basis + fallback span the full concat."""
         sel = slice(None) if active_mask is None else active_mask
         return {
+            "motion_ids": self.cmd.motion_ids[sel].clone(),
+            "motion_start_steps": self.motion_start_steps[sel].clone(),
+            "count_per_env": self.count_per_env[sel],
             "sum_ref_dist": self.sum_ref_dist[sel],
             "sum_pen": self.sum_pen[sel],
             "sum_force": self.sum_force[sel],
@@ -109,6 +117,28 @@ class ContactPerformance:
             "count_contact": self.count_contact[sel],
             "miss_max": self.miss_max[sel],
             "valid_steps_per_env": self.valid_steps_per_env[sel],
+        }
+
+    def current_policy_outcomes(self, states: list[dict[str, Any]]) -> dict:
+        cat = {key: torch.cat([state[key] for state in states]) for key in states[0]}
+        return {
+            "motion_ids": cat["motion_ids"],
+            "metadata": {
+                "meaning": "existing reference-contact gated sensor measurements, not a task-success criterion",
+                "side_prefixes": self.side_prefixes, "finger_names": self.finger_names,
+                "grace_steps": self.grace_steps, "sensor_measurement_authority": self.measurement_metadata,
+                "pair_force_authority": "Only the backend metadata can establish pair-force support; SDF found/proximity and net-link force cannot",
+                "denominators": {"ref_distance": "count_ref", "found_fraction": "count_ref",
+                                 "penetration_and_force": "count_contact"},
+            },
+            "columns": {
+                "motion_start_step": cat["motion_start_steps"],
+                "remaining_source_steps": cat["valid_steps_per_env"],
+                "observed_steps": cat["count_per_env"], "scored": cat["count_per_env"] > 0,
+                "raw_sum_ref_distance_m": cat["sum_ref_dist"], "raw_sum_penetration_m": cat["sum_pen"],
+                "raw_sum_sensor_force_N": cat["sum_force"], "reference_contact_count": cat["count_ref"],
+                "associated_contact_count": cat["count_contact"], "max_miss_streak_steps": cat["miss_max"],
+            },
         }
 
     def reduce_state(self, states: list[dict[str, Any]]) -> dict[str, float]:
@@ -166,3 +196,130 @@ class ContactPerformance:
                     f"force: {m[f'contact_force_{p}_{finger}']:.4f} N  "
                     f"found: {m[f'contact_found_{p}_{finger}']:.4f}"
                 )
+
+
+class NativeContactPerformance:
+    """Named pair-force sample durations, independently of source task roles.
+
+    Known absence counts as a supported negative sample. Unavailable pair
+    forces, missing clocks or reset rows never become measured zero contact.
+    """
+
+    def __init__(self, command_name: str, normal_force_threshold_n: float,
+                 separation_bound_m: float, grace_steps: int = 0):
+        self.command_name, self.grace_steps = command_name, int(grace_steps)
+        self.normal_force_threshold_n = float(normal_force_threshold_n)
+        self.separation_bound_m = float(separation_bound_m)
+
+    def on_start(self, env):
+        self.cmd = env.command_manager.get_term(self.command_name)
+        layout = self.cmd.native_layout
+        self.addresses = {
+            f"{hand.side}/{obj.entity_name}/{part.name}": dict(hand_side=hand.side, hand_body_name=hand.root_body_name,
+                part_entity_name=obj.entity_name, part_body_name=part.body_name)
+            for hand in layout.hands for obj, part in layout.part_bindings
+        }
+        self.pair_names = tuple(self.addresses)
+        self.num_substeps, self.control_dt = int(env.cfg.decimation), float(env.step_dt)
+        self.motion_start_steps = self.cmd.motion_steps.clone()
+        self.valid_steps = (self.cmd.motion_num_frames - self.cmd.motion_steps).clamp_min(0)
+        self.rollout_steps, self.t = int(self.valid_steps.max()), 0
+        self.reader = env.scene.hand_part_contact_interval_facts
+        facts = self.reader()
+        self.available = facts is not None
+        if self.available and (facts["addresses"] != self.addresses or facts["num_substeps"] != self.num_substeps):
+            raise ValueError("native contact interval differs from actual scene bindings or configured decimation")
+        self.metadata = {
+            "meaning": "discrete native solver pair-force measurements; no source-required contact or task-success claim",
+            "pairs": self.addresses, "pair_order": self.pair_names,
+            "num_substeps": self.num_substeps, "configured_physics_dt_s": float(env.physics_dt),
+            "configured_control_dt_s": self.control_dt, "grace_steps": self.grace_steps,
+            "normal_force_threshold_n": self.normal_force_threshold_n, "separation_bound_m": self.separation_bound_m,
+            "pair_measurement_available": self.available,
+            "normal_force_authority": None if facts is None else facts["normal_force_authority"],
+            "distance_authority": None if facts is None else facts["distance_authority"],
+            "sampling": None if facts is None else facts["sampling"],
+            "duration_authority": "actual recorded solver end minus begin for supported discrete samples; not continuous force proof",
+            "scored_basis": "at least one supported discrete named-pair sample; no task score",
+            "complete_interval_meaning": "all configured substeps recorded with valid contiguous solver clocks; force support remains independent",
+            "source_required_contact_phase": "UNKNOWN; no source engagement inferred from force, proximity or hinge sign",
+            "backend": env.scene.backend_identity,
+        }
+        shape = (env.num_envs, len(self.pair_names))
+        self.counts = {key: torch.zeros(shape, dtype=torch.int64, device=env.device)
+                       for key in ("recorded_sample_count", "clock_supported_sample_count",
+                                   "supported_sample_count", "qualified_sample_count")}
+        self.sums = {key: torch.zeros(shape, dtype=torch.float64, device=env.device)
+                     for key in ("recorded_duration_s", "supported_duration_s", "qualified_duration_s",
+                                 "sample_force_duration_sum_n_s")}
+        self.maximum_force = torch.zeros(shape, device=env.device)
+        self.observed_controls = torch.zeros(env.num_envs, dtype=torch.int64, device=env.device)
+        self.complete_intervals = torch.zeros_like(self.observed_controls)
+
+    def on_step(self, env):
+        del env
+        active = (self.t < self.valid_steps) & (self.t >= self.grace_steps)
+        self.t += 1
+        self.observed_controls += active
+        if not self.available:
+            return
+        facts = self.reader()
+        self.complete_intervals += facts["interval_complete"] & active
+        force = torch.stack([facts["pairs"][name]["normal_force_n"] for name in self.pair_names], -1)
+        present = torch.stack([facts["pairs"][name]["force_bearing_contact_present"] for name in self.pair_names], -1)
+        distance = torch.stack([facts["pairs"][name]["force_bearing_distance_max_m"] for name in self.pair_names], -1)
+        recorded = facts["sample_recorded"] & active[:, None]
+        clock = recorded & facts["clock_support"]
+        known = (clock & facts["measurement_support"])[..., None] & torch.isfinite(force) & (force >= 0)
+        known &= ~present | torch.isfinite(distance)
+        qualified = known & present & (force >= self.normal_force_threshold_n) & (distance <= self.separation_bound_m)
+        duration = torch.where(clock, facts["sample_end_time_s"] - facts["sample_begin_time_s"], 0.0)
+        width = len(self.pair_names)
+        self.counts["recorded_sample_count"] += recorded.sum(1)[:, None].expand(-1, width)
+        self.counts["clock_supported_sample_count"] += clock.sum(1)[:, None].expand(-1, width)
+        self.counts["supported_sample_count"] += known.sum(1)
+        self.counts["qualified_sample_count"] += qualified.sum(1)
+        self.sums["recorded_duration_s"] += duration.sum(1)[:, None].expand(-1, width)
+        self.sums["supported_duration_s"] += torch.where(known, duration[..., None], 0.0).sum(1)
+        self.sums["qualified_duration_s"] += torch.where(qualified, duration[..., None], 0.0).sum(1)
+        self.sums["sample_force_duration_sum_n_s"] += (torch.where(known, force, 0.0) * duration[..., None]).sum(1)
+        self.maximum_force = torch.maximum(self.maximum_force, torch.where(known, force, 0.0).amax(1))
+
+    def collect_state(self, active_mask=None):
+        rows = slice(None) if active_mask is None else active_mask
+        return {
+            "motion_ids": self.cmd.motion_ids[rows].clone(),
+            "motion_start_steps": self.motion_start_steps[rows].clone(),
+            "valid_steps": self.valid_steps[rows].clone(),
+            "observed_controls": self.observed_controls[rows].clone(),
+            "complete_intervals": self.complete_intervals[rows].clone(),
+            "maximum_supported_normal_force_n": self.maximum_force[rows].clone(),
+            **{key: value[rows].clone() for key, value in self.counts.items()},
+            **{key: value[rows].clone() for key, value in self.sums.items()},
+        }
+
+    def current_policy_outcomes(self, states):
+        cat = {key: torch.cat([state[key] for state in states]) for key in states[0]}
+        observed = cat["observed_controls"]
+        expected = observed[:, None] * self.num_substeps
+        columns = {key: value for key, value in cat.items() if key != "motion_ids"}
+        columns.update(
+            scored=cat["supported_sample_count"].sum(-1) > 0,
+            expected_sample_count=expected.expand_as(cat["supported_sample_count"]),
+            unsupported_or_unrecorded_sample_count=expected - cat["supported_sample_count"],
+            nominal_control_duration_s=observed * self.control_dt,
+        )
+        return {"motion_ids": cat["motion_ids"], "metadata": self.metadata, "columns": columns}
+
+    def reduce_state(self, states):
+        output = {}
+        for index, name in enumerate(self.pair_names):
+            for key in (*self.counts, *self.sums):
+                value = torch.cat([state[key] for state in states])[:, index].sum()
+                output[f"native/contact_samples/{name}/{key}"] = float(value)
+            duration = output[f"native/contact_samples/{name}/supported_duration_s"]
+            force_duration_sum = output[f"native/contact_samples/{name}/sample_force_duration_sum_n_s"]
+            output[f"native/contact_samples/{name}/mean_supported_normal_force_n"] = (
+                force_duration_sum / duration if duration else float("nan")
+            )
+        return output

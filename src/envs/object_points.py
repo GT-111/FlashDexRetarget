@@ -124,6 +124,70 @@ def obj_surface_keypoints(command, device, n_points: int, n_obj_verts: int):
     return surf
 
 
+def native_part_surface_points(command, device, n_points: int, n_obj_verts: int):
+    """Cache actual body-local samples in the configured entity/part order."""
+    if n_points < 1 or n_obj_verts < n_points:
+        raise ValueError("native surfaces require a positive point count and a sufficient surface pool")
+    cache = getattr(command, "_native_part_surface_cache", None)
+    if cache is None:
+        cache = command._native_part_surface_cache = {}
+    key = (int(n_points), int(n_obj_verts), str(torch.device(device)))
+    if key not in cache:
+        import trimesh
+
+        points, parts = [], []
+        for obj, part in command.native_layout.part_bindings:
+            mesh = trimesh.load(part.mesh_path, force="mesh", process=False, skip_materials=True)
+            pool = torch.as_tensor(surface_pool(mesh, n_obj_verts))
+            sampled = pool[farthest_point_sample(pool, n_points)]
+            rotation = matrix_from_quat(torch.tensor(part.body_from_mesh_quat_wxyz, dtype=sampled.dtype))
+            sampled = sampled @ rotation.T + sampled.new_tensor(part.body_from_mesh_position_m)
+            points.append(sampled)
+            parts.append(dict(entity_name=obj.entity_name, part_name=part.name, body_name=part.body_name,
+                mesh_path=part.mesh_path, body_from_mesh_position_m=part.body_from_mesh_position_m,
+                body_from_mesh_quat_wxyz=part.body_from_mesh_quat_wxyz, points_body_m=sampled.tolist()))
+        cache[key] = (torch.stack(points).to(device), dict(
+            schema="named-native-part-surface-v1", n_points=n_points, n_obj_verts=n_obj_verts,
+            sampling="deterministic_area_uniform_surface_pool_then_farthest_point_sampling",
+            point_frame="actual_part_body_local_meters_without_recentring_or_size_normalization",
+            observation_order="hand_then_configured_entity_part_then_sample_XYZ; trailing_hand_part_support",
+            hand_sides=list(command._side_list), parts=parts))
+    return cache[key][0]
+
+
+def native_part_surface_metadata(command):
+    """Static geometry only; exported once per factual tape, not once per step."""
+    return [metadata for _points, metadata in getattr(command, "_native_part_surface_cache", {}).values()]
+
+
+def native_part_reference(motion_lib, motion_ids, motion_steps, *, offset=0):
+    """Real current/next part queries with independent tail and pose support."""
+    next_step = motion_steps + offset
+    last = motion_lib._motion_num_frames[motion_ids] - 1
+    available = (next_step >= 0) & (next_step <= last)
+    ids = motion_lib.length_starts[motion_ids] + next_step.clamp_min(0).minimum(last)
+    return dict(state=motion_lib.native_object_part_state_w[ids],
+        pose_support=motion_lib.native_object_part_pose_support[ids] & available[:, None],
+        query_support=available, reference_time_ns=motion_lib.native_time_ns[ids])
+
+
+def native_part_surface_cloud(relative_part_state, points_body):
+    """Use the native per-hand [all P, all R6, all V, all W] observation chart."""
+    batch, parts = relative_part_state.shape[0], points_body.shape[0]
+    relative = relative_part_state.reshape(batch, -1, parts * 15)
+    position = relative[..., :parts * 3].reshape(batch, -1, parts, 3)
+    columns = relative[..., parts * 3:parts * 9].reshape(batch, -1, parts, 3, 2)
+    rotation = torch.cat((columns, torch.cross(columns[..., 0], columns[..., 1], dim=-1)[..., None]), -1)
+    cloud = position[..., None, :] + torch.einsum("bhpij,pnj->bhpni", rotation, points_body)
+    support = torch.isfinite(position).all(-1) & torch.isfinite(columns).all(dim=(-1, -2))
+    return cloud, support
+
+
+def pack_native_part_surface(cloud, support):
+    """Unavailable surfaces have zero values and a separate hand/part mask."""
+    return torch.cat((torch.where(support[..., None, None], cloud, 0.).flatten(1), support.float().flatten(1)), -1)
+
+
 _BOX_SIGNS = [(x, y, z) for x in (-1.0, 1.0) for y in (-1.0, 1.0) for z in (-1.0, 1.0)]
 
 

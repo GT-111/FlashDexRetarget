@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 class MultiObjectMixin:
     def _init_object_swap(self, cfg: MotionTrackingCommandCfg) -> None:
         """Harvest swap rows + expand model fields (recaptures CUDA graphs)."""
+        if getattr(self._env.sim, "wp_model", None) is None:
+            raise NotImplementedError("object swapping requires executing per-world MuJoCo model-field writes")
         import numpy as np
         from omegaconf import OmegaConf
 
@@ -127,40 +129,11 @@ class MultiObjectMixin:
         d0 = self._swap_dof0
         m.dof_invweight0[env_ids, d0 : d0 + 6] = T["dinvw"][slots]
 
-    def _slot_tree_ids(self, side: str) -> torch.Tensor:
-        cache = getattr(self, "_slot_tree_ids_cache", None)
-        if cache is None:
-            cache = {}
-            self._slot_tree_ids_cache = cache
-        t = cache.get(side)
-        if t is None:
-            mjm = self._env.sim.mj_model
-            ids = []
-            for name in self.obj_entity_names(side):
-                obj = self._env.scene[name]
-                bid = int(obj.indexing.body_ids[self._obj_mass_body_idx(obj)])
-                ids.append(int(mjm.body_treeid[bid]))
-            t = torch.tensor(ids, device=self.device, dtype=torch.long)
-            cache[side] = t
-        return t
-
-    def _sleep_park_trees(
-        self, side: str, env_ids: torch.Tensor, slot: torch.Tensor
-    ) -> None:
-        """Parked trees asleep, active awake (NVMAX compact solve assumes this)."""
-        try:
-            ta = self._env.sim.data.tree_awake  # (nworld, ntree)
-        except AttributeError:
-            return  # MJWarp < 3.10: no sleeping islands
-        trees = self._slot_tree_ids(side)
-        ta[env_ids[:, None], trees[None, :]] = 0
-        ta[env_ids, trees[slot]] = 1
-
     def _park_root_state(self, slot: int, env_ids: torch.Tensor) -> torch.Tensor:
         n = env_ids.shape[0]
         state = torch.zeros(n, 13, device=self.device)
         park = torch.tensor(
-            object_park_position(slot, on_ground=self._sleep_mode),
+            object_park_position(slot, on_ground=self._park_inactive_on_ground),
             device=self.device,
             dtype=state.dtype,
         )
@@ -254,7 +227,7 @@ class MultiObjectMixin:
                 parked = torch.zeros(B, len(names), 7, device=self.device)
                 for s in range(len(names)):
                     p = torch.tensor(
-                        object_park_position(s, on_ground=self._sleep_mode),
+                        object_park_position(s, on_ground=self._park_inactive_on_ground),
                         device=self.device,
                         dtype=parked.dtype,
                     )

@@ -14,10 +14,11 @@ import gymnasium as gym
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+from rsl_rl_flashsac.utils import resolve_compile_mode
 from tensordict import TensorDict
 
 from .algorithms.flashsac import MultiHeadFlashSAC
-from .base import Agent
+from .base import Agent, Policy
 from .modules.actor_critic import ActorTower, MultiHeadCritic, SideFactoredActor
 from .storage.replay_buffer import ReplayBuffer, ReplayObsLayout
 from .utils.legacy import is_legacy_checkpoint, load_legacy_checkpoint
@@ -124,6 +125,30 @@ def _dtype(name: str | None) -> torch.dtype | None:
     return getattr(torch, name) if name else None
 
 
+def build_actor(
+    cfg: FlashSACConfig,
+    layout: ReplayObsLayout,
+    num_actions: int,
+    *,
+    action_bias: torch.Tensor,
+    action_scale: torch.Tensor,
+    traj_cfg: dict[str, Any] | None = None,
+    side_action_ids: list[list[int]] | None = None,
+) -> ActorTower | SideFactoredActor:
+    """The same registered actor architecture for learning and frozen inference."""
+    template = layout.network_template()
+    groups = layout.network_groups
+
+    actor: ActorTower | SideFactoredActor
+    tower_kwargs = {"num_blocks": cfg.actor_num_blocks, "hidden_dim": cfg.actor_hidden_dim, "traj_cfg": traj_cfg}
+    if side_action_ids:
+        actor = SideFactoredActor(template, groups, "actor", side_action_ids, **tower_kwargs)
+    else:
+        actor = ActorTower(template, groups, "actor", num_actions, **tower_kwargs)
+    actor.set_action_scaling(action_bias.cpu(), action_scale.cpu())
+    return actor
+
+
 def build_flashsac(
     cfg: FlashSACConfig,
     layout: ReplayObsLayout,
@@ -141,16 +166,12 @@ def build_flashsac(
     """Actor (one tower per side if side_action_ids), 2 * num_heads critic, compact-aware buffer."""
     if not cfg.buffer_optimize_memory_usage:
         raise ValueError("only the memory-efficient replay buffer is ported (buffer_optimize_memory_usage=true).")
+    actor = build_actor(
+        cfg, layout, num_actions, action_bias=action_bias, action_scale=action_scale,
+        traj_cfg=traj_cfg, side_action_ids=side_action_ids,
+    )
     template = layout.network_template()
     groups = layout.network_groups
-
-    actor: ActorTower | SideFactoredActor
-    tower_kwargs = {"num_blocks": cfg.actor_num_blocks, "hidden_dim": cfg.actor_hidden_dim, "traj_cfg": traj_cfg}
-    if side_action_ids:
-        actor = SideFactoredActor(template, groups, "actor", side_action_ids, **tower_kwargs)
-    else:
-        actor = ActorTower(template, groups, "actor", num_actions, **tower_kwargs)
-    actor.set_action_scaling(action_bias.cpu(), action_scale.cpu())
 
     critic = MultiHeadCritic(
         template,
@@ -204,6 +225,98 @@ def resolve_device_type(device_type: str) -> str:
     return device_type if ":" in device_type else f"cuda:{int(os.environ.get('LOCAL_RANK', '0'))}"
 
 
+def _action_affine(action_space: gym.spaces.Space) -> tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(action_space, gym.spaces.Box):
+        raise TypeError(f"FlashSAC expects a Box action space, got {type(action_space).__name__}.")
+    action_dim = int(action_space.shape[-1])
+    low = torch.as_tensor(np.asarray(action_space.low), dtype=torch.float32).reshape(-1, action_dim)[0]
+    high = torch.as_tensor(np.asarray(action_space.high), dtype=torch.float32).reshape(-1, action_dim)[0]
+    if not torch.isfinite(low).all() or not torch.isfinite(high).all():
+        raise ValueError("FlashSAC requires finite action bounds for tanh-squashed policies.")
+    if (high < low).any():
+        raise ValueError("FlashSAC received an action space with high < low.")
+    return 0.5 * (high + low), 0.5 * (high - low)
+
+
+def _check_observation_layout(path: str, encoded_layout: list, obs_terms: list) -> None:
+    """Use the same saved column authority for full-agent and policy-only loads."""
+    f = os.path.join(path, "obs_layout.json")
+    saved = json.load(open(f)) if os.path.exists(f) else {}
+    enc = saved.get("encoded_obs_dims")
+    if enc is None and not any(n == "future_traj" for n, _ in encoded_layout):
+        return  # checkpoints without obs_layout.json predate future_traj (split windows)
+    if enc != encoded_layout:
+        raise ValueError(
+            f"checkpoint {path} has encoded obs {enc or 'of the split-window layout'}, env has "
+            f"{encoded_layout}; split-window runs need envs/obs@obs=flashdexretarget_split."
+        )
+    terms = saved.get("obs_terms")
+    if terms is not None and obs_terms:
+        widths = [[g, w] for g, _, w in terms]
+        if widths != [[g, w] for g, _, w in obs_terms]:
+            raise ValueError(
+                f"checkpoint {path} obs layout differs from the env's:\n  ckpt {terms}\n  env  {obs_terms}"
+            )
+
+
+def _named_actor_columns(terms: list, encoded_layout: list) -> tuple[dict, int, list]:
+    """Read the ordinary shared flat columns; encoded groups retain their named tail."""
+    if not terms:
+        raise ValueError("actor input extension requires saved named obs_terms")
+    encoded_widths = dict(encoded_layout)
+    observed_widths = dict.fromkeys(encoded_widths, 0)
+    columns, windows, width = {}, [], 0
+    for group, name, count in terms:
+        if count < 0:
+            raise ValueError("named observation widths cannot be negative")
+        if group == "actor" and not windows:
+            key = (group, name)
+            if key in columns:
+                raise ValueError(f"duplicate named actor observation {key}")
+            columns[key] = (width, count)
+            width += count
+        elif group in encoded_widths:
+            windows.append([group, name, count])
+            observed_widths[group] += count
+        else:
+            raise ValueError("actor input extension requires shared actor observations before encoded groups")
+    if observed_widths != encoded_widths:
+        raise ValueError("named encoded observation widths disagree with encoded_obs_dims")
+    return columns, width, windows
+
+
+class FlashSACPolicy:
+    """Frozen deterministic acting owner; no learner, critic, reward RMS or replay."""
+
+    def __init__(
+        self, actor: ActorTower | SideFactoredActor, layout: ReplayObsLayout,
+        action_bias: torch.Tensor, action_scale: torch.Tensor, cfg: FlashSACConfig,
+        checkpoint_authority: dict[str, Any],
+    ) -> None:
+        self._device = torch.device(resolve_device_type(cfg.device_type))
+        self.actor = actor.to(self._device).eval().requires_grad_(False)
+        self._layout = layout
+        self._action_bias = action_bias.to(self._device)
+        self._action_scale = action_scale.to(self._device)
+        self._use_compile = cfg.use_compile
+        self._actor_mean_std = (
+            torch.compile(self.actor.get_mean_and_std, mode=resolve_compile_mode(cfg.compile_mode))
+            if cfg.use_compile else self.actor.get_mean_and_std
+        )
+        self.checkpoint_authority = checkpoint_authority
+
+    @torch.no_grad()
+    def act(self, obs: Any, deterministic: bool = False) -> np.ndarray:
+        if not deterministic:
+            raise ValueError("A frozen FlashSACPolicy exposes deterministic evaluation only.")
+        if self._use_compile:
+            torch.compiler.cudagraph_mark_step_begin()
+        tensor = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+        actor_obs = self._layout.actor_input(tensor)
+        mean, _ = self._actor_mean_std(self.actor.flatten_obs(actor_obs), training=False)
+        return (self._action_bias + self._action_scale * torch.tanh(mean)).cpu().numpy()
+
+
 class FlashSACAgent(Agent):
     """Env-facing FlashSAC agent: actions leave in the env's bounds and are stored in [-1, 1];
     observations arrive flat ([actor | critic] or shared + encoded windows) as numpy or tensors."""
@@ -215,8 +328,7 @@ class FlashSACAgent(Agent):
         env_info: dict[str, Any],
         cfg: FlashSACConfig,
     ) -> None:
-        if not isinstance(action_space, gym.spaces.Box):
-            raise TypeError(f"FlashSAC expects a Box action space, got {type(action_space).__name__}.")
+        action_bias, action_scale = _action_affine(action_space)
         self._cfg = cfg
         self._device = torch.device(resolve_device_type(cfg.device_type))
         full_dim = int(observation_space.shape[-1])  # type: ignore[index]
@@ -225,17 +337,14 @@ class FlashSACAgent(Agent):
 
         self._encoded_layout = [[str(n), int(d)] for n, d in (env_info.get("encoded_obs_dims") or [])]
         self._obs_terms = [list(t) for t in (env_info.get("obs_terms") or [])]
+        self._native_surface_metadata = env_info.get("native_part_surface_metadata", [])
         head_names = self._reward_head_names(cfg, env_info)
         side_action_ids = self._side_action_ids(cfg, env_info, head_names)
+        self._head_names, self._side_action_ids = head_names, side_action_ids
+        self._actor_input_extension_initialized = False
 
-        low = torch.as_tensor(np.asarray(action_space.low), dtype=torch.float32).reshape(-1, action_dim)[0]
-        high = torch.as_tensor(np.asarray(action_space.high), dtype=torch.float32).reshape(-1, action_dim)[0]
-        if not torch.isfinite(low).all() or not torch.isfinite(high).all():
-            raise ValueError("FlashSAC requires finite action bounds for tanh-squashed policies.")
-        if (high < low).any():
-            raise ValueError("FlashSAC received an action space with high < low.")
-        self._action_bias = (0.5 * (high + low)).to(self._device)
-        self._action_scale = (0.5 * (high - low)).to(self._device)
+        self._action_bias = action_bias.to(self._device)
+        self._action_scale = action_scale.to(self._device)
 
         compactor = None
         if cfg.buffer_compact_obs:
@@ -262,20 +371,69 @@ class FlashSACAgent(Agent):
     def build(
         cls, cfg: DictConfig, env: Any, env_info: dict[str, Any], command_name: str
     ) -> FlashSACAgent:
-        if env.share_obs and bool(cfg.asymmetric_observation):
-            # One stored obs copy has no [actor | critic] split, so the critic reads the actor group.
-            print("[flashsac] share_actor_critic_obs=true -> forcing agent.asymmetric_observation=false")
-            cfg.asymmetric_observation = False
-        fields = OmegaConf.to_container(cfg, resolve=True)
-        fields.pop("class_name", None)
-        agent_cfg = FlashSACConfig(**fields)
+        agent_cfg = cls._resolved_config(cfg, env.share_obs)
         if agent_cfg.buffer_compact_obs:
             from .storage.obs_compact import build_obs_compactor  # needs mjlab
 
             compactor = build_obs_compactor(env, command_name, resolve_device_type(agent_cfg.device_type))
             env.set_aux_provider(compactor.aux_from_command)
             env_info = {**env_info, "obs_compactor": compactor}
+        surface_terms = {"native_part_point_cloud_wrist", "native_next_part_point_cloud_delta_wrist"}
+        if any(name in surface_terms for _group, name, _width in env_info.get("obs_terms", ())):
+            command = env.unwrapped.command_manager.get_term(command_name)
+            env_info = {**env_info, "native_part_surface_metadata": command.part_surface_geometry_metadata()}
         return cls(env.single_observation_space, env.single_action_space, env_info, agent_cfg)
+
+    @staticmethod
+    def _resolved_config(cfg: DictConfig, share_obs: bool) -> FlashSACConfig:
+        if share_obs and bool(cfg.asymmetric_observation):
+            # One stored obs copy has no [actor | critic] split, so the critic reads the actor group.
+            print("[flashsac] share_actor_critic_obs=true -> forcing agent.asymmetric_observation=false")
+            cfg.asymmetric_observation = False
+        fields = OmegaConf.to_container(cfg, resolve=True)
+        fields.pop("class_name", None)
+        return FlashSACConfig(**fields)
+
+    @classmethod
+    def load_policy(
+        cls, cfg: DictConfig, env: Any, env_info: dict[str, Any],
+        command_name: str, checkpoint: str,
+    ) -> Policy:
+        """Load the actual saved actor and its running statistics, without training owners.
+
+        Live observations already contain the full network inputs. Replay compaction
+        therefore requires no buffer or auxiliary reconstruction for this path.
+        """
+        del command_name
+        agent_cfg = cls._resolved_config(cfg, env.share_obs)
+        encoded = [[str(n), int(d)] for n, d in (env_info.get("encoded_obs_dims") or [])]
+        terms = [list(t) for t in (env_info.get("obs_terms") or [])]
+        _check_observation_layout(checkpoint, encoded, terms)
+        full_dim = int(env.single_observation_space.shape[-1])
+        actor_dim = int(env_info["actor_observation_size"][-1]) if agent_cfg.asymmetric_observation else None
+        layout = ReplayObsLayout(full_dim, actor_dim)
+        bias, scale = _action_affine(env.single_action_space)
+        head_names = cls._reward_head_names(agent_cfg, env_info)
+        actor = build_actor(
+            agent_cfg, layout, int(env.single_action_space.shape[-1]),
+            action_bias=bias, action_scale=scale,
+            traj_cfg=cls._traj_cfg(agent_cfg, env_info),
+            side_action_ids=cls._side_action_ids(agent_cfg, env_info, head_names) or None,
+        )
+        model_file = os.path.join(checkpoint, CHECKPOINT_FILE)
+        saved = torch.load(model_file, map_location="cpu", mmap=True, weights_only=True)
+        actor.load_state_dict(saved["actor_state_dict"], strict=True)
+        authority = {
+            "checkpoint_directory": os.path.abspath(checkpoint),
+            "model_file": model_file,
+            "algorithm_update_step": int(saved["update_step"]),
+            "normalization": "Strict actor state includes BatchNorm running statistics and trajectory encoder; no renormalization after load.",
+            "loaded_owner": "Only actor_state_dict is installed. The common model container is CPU-mapped, including nonactor tensor metadata; no other owner is restored or copied to device.",
+            "replay_loaded": False, "critic_constructed": False,
+            "optimizer_owner_constructed_or_restored": False,
+        }
+        del saved
+        return FlashSACPolicy(actor, layout, bias, scale, agent_cfg, authority)
 
     # ─── env_info / config resolution ──────────────────────────────────────────
 
@@ -363,16 +521,169 @@ class FlashSACAgent(Agent):
 
     # ─── checkpoints ───────────────────────────────────────────────────────────
 
+    def initialize_actor_input_extension(
+        self, path: str, parent_config_path: str, current_config_path: str,
+    ) -> dict[str, Any]:
+        """Initialize a native actor by retained named inputs, optionally adding features.
+
+        Both configurations are ordinary resolved train.py outputs. This is not
+        FULL restore: every non-actor owner keeps its newly constructed state.
+        """
+        if (self._actor_input_extension_initialized or self._alg.update_step
+                or self._alg.replay_buffer._num_in_buffer or self._alg.replay_buffer._n_step_transitions):
+            raise ValueError("actor input extension is only available once before collection or updates")
+        parent = OmegaConf.to_container(OmegaConf.load(parent_config_path), resolve=True)
+        current = OmegaConf.to_container(OmegaConf.load(current_config_path), resolve=True)
+        for config in (parent, current):
+            if (config["runner"]["agent"]["class_name"] != "agents.flashsac.FlashSACAgent"
+                    or not config["runner"]["share_actor_critic_obs"]):
+                raise ValueError("actor input extension requires the shared-observation FlashSAC configuration")
+        if self._layout.actor_dim is not None:
+            raise ValueError("actor input extension requires shared actor/critic observations")
+        for key in ("actor_num_blocks", "actor_hidden_dim", "traj_encoder"):
+            if (parent["runner"]["agent"][key] != current["runner"]["agent"][key]
+                    or current["runner"]["agent"][key] != getattr(self._cfg, key)):
+                raise ValueError(f"actor input extension requires unchanged actor configuration: {key}")
+        for key in ("enable", "side_actors"):
+            if (parent["runner"]["agent"]["reward_heads"][key]
+                    != current["runner"]["agent"]["reward_heads"][key]
+                    or current["runner"]["agent"]["reward_heads"][key]
+                    != (self._cfg.reward_heads or {}).get(key, False)):
+                raise ValueError(f"actor input extension requires unchanged reward-head ownership: {key}")
+        from envs.scene.native import NativeSceneCfg
+
+        def parent_scene(config: dict) -> NativeSceneCfg:
+            # Archived actors used one real object under "object". Only this
+            # explicit initializer reads that archive form; runtime and FULL
+            # still require the current collection configuration.
+            config = dict(config)
+            if "objects" not in config and "object" in config:
+                config["objects"] = [config.pop("object")]
+            return NativeSceneCfg.from_mapping(config)
+
+        scene = parent_scene(parent["robot"]["native_scene"])
+        current_scene = NativeSceneCfg.from_mapping(current["robot"]["native_scene"])
+        old_action = {key: value for key, value in parent["actions"].items() if key != "native_scene"}
+        new_action = {key: value for key, value in current["actions"].items() if key != "native_scene"}
+        if (scene != current_scene
+                or parent_scene(parent["actions"]["native_scene"]) != scene
+                or NativeSceneCfg.from_mapping(current["actions"]["native_scene"]) != current_scene
+                or old_action != new_action):
+            raise ValueError("actor input extension requires the unchanged named native action/scene contract")
+        # NativeResidualAction groups translations, rotations, then named finger
+        # actuators; MotionLibrary orders admitted source sides right then left.
+        sides = [hand.side for hand in scene.hands]
+        owners = ([side for side in sides for _ in "xyz"] * 2
+                  + [hand.side for hand in scene.hands for _ in hand.command_actuator_names])
+        head_names = [side for side in ("right", "left") if side in sides]
+        expected_ids = [[i for i, owner in enumerate(owners) if owner == side] for side in head_names]
+        if (len(owners) != self._action_bias.numel()
+                or (self._side_action_ids and (self._head_names != head_names
+                                             or self._side_action_ids != expected_ids))):
+            raise ValueError("actor input extension action columns disagree with the named native scene")
+        term_settings = ("obs_params", "obs_scales", "noise_scales")
+        parent_obs = {key: value for key, value in parent["obs"].items()
+                      if key not in ("obs_dict", *term_settings)}
+        current_obs = {key: value for key, value in current["obs"].items()
+                       if key not in ("obs_dict", *term_settings)}
+        if parent_obs != current_obs:
+            raise ValueError("actor input extension requires unchanged observation transforms and future queries")
+        with open(os.path.join(path, "obs_layout.json")) as stream:
+            saved_layout = json.load(stream)
+        if saved_layout.get("encoded_obs_dims") != self._encoded_layout:
+            raise ValueError("actor input extension requires unchanged named encoded groups")
+        old_columns, old_width, old_windows = _named_actor_columns(
+            saved_layout.get("obs_terms"), self._encoded_layout,
+        )
+        new_columns, new_width, new_windows = _named_actor_columns(self._obs_terms, self._encoded_layout)
+        if old_windows != new_windows:
+            raise ValueError("actor input extension requires unchanged named future window terms")
+        if new_width + sum(width for _, width in self._encoded_layout) != self._layout.full_dim:
+            raise ValueError("named observations disagree with the constructed actor input")
+        if new_width < old_width:
+            raise ValueError("actor input extension cannot reduce named flat input width")
+        indices = []
+        for key, (_, width) in old_columns.items():
+            if key not in new_columns or new_columns[key][1] != width:
+                raise ValueError(f"actor input extension cannot remove or resize named feature {key}")
+            start, _ = new_columns[key]
+            indices.extend(range(start, start + width))
+        added_names = {name for _group, name in new_columns.keys() - old_columns.keys()}
+        for setting in term_settings:
+            previous = {name: value for name, value in parent["obs"].get(setting, {}).items()
+                        if name not in added_names}
+            selected = {name: value for name, value in current["obs"].get(setting, {}).items()
+                        if name not in added_names}
+            if previous != selected:
+                raise ValueError(
+                    "actor input extension requires unchanged existing observation transforms "
+                    f"and future queries: {setting}"
+                )
+
+        loaded = torch.load(os.path.join(path, CHECKPOINT_FILE), map_location="cpu", mmap=True, weights_only=True)
+        prior, target = loaded["actor_state_dict"], self._alg.actor.state_dict()
+        if prior.keys() != target.keys():
+            raise ValueError("actor input extension requires the complete unchanged actor module roster")
+        towers = ([(f"sides.{i}.", tower) for i, tower in enumerate(self._alg.actor.sides)]
+                  if isinstance(self._alg.actor, SideFactoredActor) else [("", self._alg.actor)])
+        expanded = {}
+        for prefix, tower in towers:
+            future_width = (tower.traj_encoder.latent_dim if tower.traj_encoder is not None
+                            else sum(width for _, width in self._encoded_layout))
+            columns = indices + list(range(new_width, new_width + future_width))
+            column_ids = torch.tensor(columns, dtype=torch.long, device=self._device)
+            for field, initial in (("weight", 1), ("bias", 0), ("running_mean", 0), ("running_var", 1)):
+                key = f"{prefix}embedder.norm.{field}"
+                if prior[key].shape != (old_width + future_width,) or target[key].shape != (new_width + future_width,):
+                    raise ValueError(f"named actor columns disagree with input normalization {key}")
+                value = torch.full_like(target[key], initial)
+                value.index_copy_(0, column_ids, prior[key].to(self._device))
+                expanded[key] = value
+            key = f"{prefix}embedder.w.w.weight"
+            if prior[key].shape != (target[key].shape[0], old_width + future_width):
+                raise ValueError(f"named actor columns disagree with first linear layer {key}")
+            value = torch.zeros_like(target[key])
+            value.index_copy_(1, column_ids, prior[key].to(self._device))
+            expanded[key] = value
+        for key, value in prior.items():
+            if value.dtype != target[key].dtype or (key not in expanded and value.shape != target[key].shape):
+                raise ValueError(f"actor input extension changes an existing actor tensor: {key}")
+            if key.endswith(("predictor.action_bias", "predictor.action_scale", "predictor.log_action_scale")):
+                if not torch.equal(value, target[key].cpu()):
+                    raise ValueError(f"actor input extension requires unchanged action affine: {key}")
+        # No normalize_parameters call: it would change retained BN affine values.
+        self._alg.actor.load_state_dict({**prior, **expanded}, strict=True)
+        self._actor_input_extension_initialized = True
+        return {
+            "checkpoint": path, "parent_config": parent_config_path, "current_config": current_config_path,
+            "retained_flat_terms": [list(key) for key in old_columns],
+            "added_flat_terms": [list(key) for key in new_columns if key not in old_columns],
+            "encoded_obs_dims": self._encoded_layout,
+            "actor_only": True, "renormalized_at_initialization": False,
+            "native_scene_validation": {
+                "owner": "envs.scene.native.NativeSceneCfg",
+                "archived_singleton_parent": "objects" not in parent["robot"]["native_scene"],
+                "scene_xml_path": scene.scene_xml_path,
+                "hand_sides": sides,
+                "command_actuator_names": [name for hand in scene.hands for name in hand.command_actuator_names],
+                "object_entities": [obj.entity_name for obj in scene.objects],
+                "part_body_names": [part.body_name for _, part in scene.part_bindings],
+            },
+            "fresh_owners": ["critic_and_targets", "temperature", "optimizers_and_schedulers",
+                             "reward_normalizer", "replay", "collection", "progress"],
+        }
+
     def save(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)
         torch.save(self._alg.save(), os.path.join(path, CHECKPOINT_FILE))
         with open(os.path.join(path, "obs_layout.json"), "w") as f:
-            json.dump({"encoded_obs_dims": self._encoded_layout, "obs_terms": self._obs_terms}, f)
+            json.dump({"encoded_obs_dims": self._encoded_layout, "obs_terms": self._obs_terms,
+                       "native_part_surface_metadata": self._native_surface_metadata}, f)
         print(f"\033[32m[FlashSAC]\033[0m Successfully saved checkpoint {self._alg.update_step} at {path}.")
 
     def load(self, path: str) -> None:
         """Load our checkpoint, or a flash_rl one (per-network .pt files) through utils/legacy.py."""
-        self._check_obs_layout(path)
+        _check_observation_layout(path, self._encoded_layout, self._obs_terms)
         ckpt = os.path.join(path, CHECKPOINT_FILE)
         if os.path.exists(ckpt):
             loaded = torch.load(ckpt, map_location=self._device)
@@ -397,24 +708,5 @@ class FlashSACAgent(Agent):
         self._alg.replay_buffer.load(os.path.join(path, REPLAY_BUFFER_FILE))
         print(f"\033[32m[FlashSAC]\033[0m Successfully loaded replay buffer from {path}.")
 
-    def _check_obs_layout(self, path: str) -> None:
-        """Refuse a checkpoint whose obs layout differs from this env's: equal-width changes (merged
-        future_traj window, split SDF terms) would otherwise load silently with permuted inputs."""
-        f = os.path.join(path, "obs_layout.json")
-        saved = json.load(open(f)) if os.path.exists(f) else {}
-        enc = saved.get("encoded_obs_dims")
-        if enc is None and not any(n == "future_traj" for n, _ in self._encoded_layout):
-            return  # checkpoints without obs_layout.json predate future_traj (split windows)
-        if enc != self._encoded_layout:
-            raise ValueError(
-                f"checkpoint {path} has encoded obs {enc or 'of the split-window layout'}, env has "
-                f"{self._encoded_layout}; split-window runs need envs/obs@obs=flashdexretarget_split."
-            )
-        # a renamed term is fine; a different [group, width] sequence means the inputs moved
-        terms = saved.get("obs_terms")
-        if terms is not None and self._obs_terms:
-            widths = [[g, w] for g, _, w in terms]
-            if widths != [[g, w] for g, _, w in self._obs_terms]:
-                raise ValueError(
-                    f"checkpoint {path} obs layout differs from the env's:\n  ckpt {terms}\n  env  {self._obs_terms}"
-                )
+    def reset_collection(self) -> None:
+        self._alg.reset_collection()

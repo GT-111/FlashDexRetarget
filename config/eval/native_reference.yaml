@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - native
+  - _self_
+
+eval:
+  policy:
+    _target_: evaluation.policies.NativeReferenceFollower
+    command_name: ${commands.name}
+    action_name: ${actions.name}
+    method_id: analytic-native-reference-follower-v1

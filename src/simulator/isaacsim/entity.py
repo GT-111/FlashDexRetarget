@@ -4,12 +4,23 @@ a freshness token. Conventions: wxyz quats, world frame, MJCF ordering."""
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
-from mjlab.utils.lab_api.math import quat_apply, quat_mul
+from mjlab.utils.lab_api.math import (
+    quat_apply,
+)
 
-from .mjcf_meta import RobotMjcfMeta, site_table
+from simulator.mjcf_meta import RobotMjcfMeta, site_table
+from simulator.native.entity import (
+    ArticulationData,
+    BodyInertialProperties,
+    FloatingRootView,
+    NamedArticulationView,
+    _Cached,
+    _FreshnessClock,
+)
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation, RigidObject
@@ -19,130 +30,20 @@ def _xyzw_to_wxyz(q: torch.Tensor) -> torch.Tensor:
     return q[..., [3, 0, 1, 2]]
 
 
-class _FreshnessClock:
-    """Monotonic token shared by all adapters; bump = invalidate caches."""
-
-    def __init__(self) -> None:
-        self.token = 0
-
-    def bump(self) -> None:
-        self.token += 1
-
-
-class _Cached:
-    """Per-clock-token memo for the raw physx fetches."""
-
-    def __init__(self, clock: _FreshnessClock) -> None:
-        self._clock = clock
-        self._token = -1
-        self._store: dict[str, torch.Tensor] = {}
-
-    def get(self, key: str, fn) -> torch.Tensor:
-        if self._token != self._clock.token:
-            self._store.clear()
-            self._token = self._clock.token
-        v = self._store.get(key)
-        if v is None:
-            v = fn()
-            self._store[key] = v
-        return v
+def _installed_body_properties(view, body_names, body_ids, count, device):
+    """Read post-install PhysX values once; tensor inertia is body-frame already."""
+    mass = view.get_masses().reshape(count, -1).to(device)[:, body_ids]
+    com = view.get_coms().reshape(count, -1, 7).to(device)[:, body_ids, :3]
+    # PhysX stores the nine body-frame inertia entries in column-major order.
+    inertia = view.get_inertias().reshape(count, -1, 3, 3).transpose(-1, -2)
+    inertia = inertia.to(device)[:, body_ids]
+    return BodyInertialProperties(
+        tuple(body_names), mass.detach().clone(), com.detach().clone(), inertia.detach().clone(),
+    )
 
 
-# ─── Robot (articulation) ────────────────────────────────────────────────────
-
-
-class ArticulationData:
-    """Duck-typed ``EntityData`` view for the robot articulation."""
-
-    def __init__(self, adapter: "ArticulationAdapter") -> None:
-        self._a = adapter
-
-    # joint space (entity == MJCF order)
-    @property
-    def joint_pos(self) -> torch.Tensor:
-        return self._a._joint_pos()
-
-    @property
-    def joint_vel(self) -> torch.Tensor:
-        return self._a._joint_vel()
-
-    @property
-    def joint_pos_target(self) -> torch.Tensor:
-        return self._a._joint_pos_target
-
-    @property
-    def soft_joint_pos_limits(self) -> torch.Tensor:
-        return self._a._soft_limits
-
-    @property
-    def default_joint_pos(self) -> torch.Tensor:
-        return self._a._default_joint_pos
-
-    @property
-    def default_joint_vel(self) -> torch.Tensor:
-        return self._a._default_joint_vel
-
-    @property
-    def qfrc_actuator(self) -> torch.Tensor:
-        # applied joint efforts (implicit PD), entity joint order
-        tau = self._a._art.data.applied_torque
-        return tau[:, self._a._isaac_joint_ids]
-
-    # bodies (entity == MJCF order, world excluded)
-    @property
-    def body_link_pos_w(self) -> torch.Tensor:
-        return self._a._body_pose()[0]
-
-    @property
-    def body_link_quat_w(self) -> torch.Tensor:
-        return self._a._body_pose()[1]
-
-    @property
-    def body_link_lin_vel_w(self) -> torch.Tensor:
-        return self._a._body_vel()[0]
-
-    @property
-    def body_link_ang_vel_w(self) -> torch.Tensor:
-        return self._a._body_vel()[1]
-
-    # root == first MJCF body (fixed-base chain anchor), matching mjlab's
-    # ``indexing.root_body_id`` semantics for this entity.
-    @property
-    def root_link_pos_w(self) -> torch.Tensor:
-        return self.body_link_pos_w[:, 0]
-
-    @property
-    def root_link_quat_w(self) -> torch.Tensor:
-        return self.body_link_quat_w[:, 0]
-
-    @property
-    def root_link_lin_vel_w(self) -> torch.Tensor:
-        return self.body_link_lin_vel_w[:, 0]
-
-    @property
-    def root_link_ang_vel_w(self) -> torch.Tensor:
-        return self.body_link_ang_vel_w[:, 0]
-
-    # sites (MJCF site frames rigidly attached to parent bodies)
-    @property
-    def site_pos_w(self) -> torch.Tensor:
-        return self._a._site_kin()[0]
-
-    @property
-    def site_quat_w(self) -> torch.Tensor:
-        return self._a._site_kin()[1]
-
-    @property
-    def site_lin_vel_w(self) -> torch.Tensor:
-        return self._a._site_kin()[2]
-
-    @property
-    def site_ang_vel_w(self) -> torch.Tensor:
-        return self._a._site_kin()[3]
-
-
-class ArticulationAdapter:
-    """mjlab ``Entity`` surface for the xhand articulation."""
+class ArticulationAdapter(NamedArticulationView):
+    """MJCF-ordered ``Entity`` view with explicit imported body names."""
 
     is_fixed_base = True
 
@@ -153,6 +54,8 @@ class ArticulationAdapter:
         clock: _FreshnessClock,
         device: str,
         spec_fn=None,
+        *,
+        body_name_map: Mapping[str, str] | None = None,
     ) -> None:
         self._art = articulation
         self._meta = meta
@@ -165,20 +68,18 @@ class ArticulationAdapter:
         self.num_joints = len(self.joint_names)
         self._body_index = {n: i for i, n in enumerate(self.body_names)}
 
-        # MJCF -> URDF link-name divergences (the URDF twin renames the palms).
-        alias = {
-            "R_forearm_rot_y_link": "right_hand_link",
-            "L_forearm_rot_y_link": "left_hand_link",
-        }
-        # Only the xhand URDF renames the palms; MJCF-named USDs (sharpa) keep the MJCF name.
-        have = set(articulation.body_names)
-        urdf_names = [alias[n] if (n in alias and n not in have) else n for n in self.body_names]
+        names = body_name_map or {}
+        urdf_names = [names.get(n, n) for n in self.body_names]
 
         # entity(MJCF) order -> isaac articulation order permutations
         ids, _ = articulation.find_bodies(urdf_names, preserve_order=True)
         self._isaac_body_ids = torch.tensor(ids, dtype=torch.long, device=device)
         jids, _ = articulation.find_joints(self.joint_names, preserve_order=True)
         self._isaac_joint_ids = torch.tensor(jids, dtype=torch.long, device=device)
+        self._driven_joint_ids = torch.tensor(
+            [self.joint_names.index(n) for n in meta.driven_joint_names],
+            dtype=torch.long, device=device,
+        )
         # inverse permutation: isaac joint slot -> entity column
         inv = torch.empty_like(self._isaac_joint_ids)
         inv[torch.argsort(self._isaac_joint_ids)] = torch.arange(
@@ -196,12 +97,10 @@ class ArticulationAdapter:
         self._default_joint_pos = torch.zeros(B, self.num_joints, device=device)
         self._default_joint_vel = torch.zeros(B, self.num_joints, device=device)
 
-        # link-frame <- com offset (constant, physx link com in link frame)
-        view = articulation.root_physx_view
-        coms = view.get_coms()  # (B, nl, 7) or (B*nl, 7) depending on backend
-        coms = coms.reshape(B, -1, 7)[..., :3].to(device)
-        self._com_local = coms  # (B, nl, 3), isaac link order
-        self._gravcomp_full: torch.Tensor | None = None  # (B, nl, 3) world +z m*g per link
+        self._body_properties = _installed_body_properties(
+            articulation.root_physx_view, self.body_names, self._isaac_body_ids, B, device,
+        )
+        self._gravcomp_full: torch.Tensor | None = None  # named WORLD force at link COM
         self._gravcomp_scale = 0.0
 
         # A standalone MJCF spec factory so the command's CPU-FK reference
@@ -218,34 +117,11 @@ class ArticulationAdapter:
 
     # ── name/index resolution (mjlab API) ──────────────────────────────────
 
-    def find_sites(self, names, preserve_order: bool = False):
-        from mjlab.utils.lab_api.string import resolve_matching_names
-
-        return resolve_matching_names(names, self.site_names, preserve_order)
-
-    def find_joints(self, names, preserve_order: bool = False):
-        from mjlab.utils.lab_api.string import resolve_matching_names
-
-        return resolve_matching_names(names, self.joint_names, preserve_order)
-
-    def find_bodies(self, names, preserve_order: bool = False):
-        from mjlab.utils.lab_api.string import resolve_matching_names
-
-        return resolve_matching_names(names, self.body_names, preserve_order)
-
-    def find_joints_by_actuator_names(self, names):
-        """Actuator names OR joint names -> entity joint ids (input order)."""
-        joint_names = []
-        for n in names:
-            if n in self._meta.actuator_joint:
-                joint_names.append(self._meta.actuator_joint[n])
-            elif n in self.joint_names:
-                joint_names.append(n)
-            else:
-                raise KeyError(f"unknown actuator/joint name {n!r}")
-        return [self.joint_names.index(j) for j in joint_names], joint_names
-
     # ── raw fetches (freshness-cached) ─────────────────────────────────────
+
+    def body_inertial_properties(self):
+        """Installed fixed-recipe snapshot in the same order as body state."""
+        return self._body_properties
 
     def _joint_pos(self) -> torch.Tensor:
         def fetch():
@@ -260,6 +136,9 @@ class ArticulationAdapter:
             return v[:, self._isaac_joint_ids]
 
         return self._cache.get("joint_vel", fetch)
+
+    def _joint_effort(self) -> torch.Tensor:
+        return self._art.data.applied_torque[:, self._isaac_joint_ids]
 
     def _body_pose(self):
         def fetch_pair():
@@ -278,45 +157,14 @@ class ArticulationAdapter:
             return v.reshape(self._art.num_instances, -1, 6).to(self.device)
 
         v = self._cache.get("link_vel", fetch_vel)
-        tf = self._cache.get(
-            "link_tf",
-            lambda: self._art.root_physx_view.get_link_transforms()
-            .reshape(self._art.num_instances, -1, 7)
-            .to(self.device),
-        )
         # physx: linear velocity reported at link COM; shift to link origin.
-        quat_all = _xyzw_to_wxyz(tf[..., 3:7])
-        r_com = quat_apply(quat_all, self._com_local)  # link->world com offset
+        _, quat = self._body_pose()
+        r_com = quat_apply(quat, self._body_properties.com_position_body_m)
+        v = v[:, self._isaac_body_ids]
         lin_com = v[..., 0:3]
         ang = v[..., 3:6]
         lin_link = lin_com + torch.cross(ang, -r_com, dim=-1)
-        lin = lin_link[:, self._isaac_body_ids]
-        ang = ang[:, self._isaac_body_ids]
-        return lin, ang
-
-    def _site_kin(self):
-        def compute():
-            pos, quat = self._body_pose()
-            lin, ang = self._body_vel()
-            bp = pos[:, self._site_parent]  # (B, S, 3)
-            bq = quat[:, self._site_parent]
-            bl = lin[:, self._site_parent]
-            ba = ang[:, self._site_parent]
-            lpos = self._site_lpos.unsqueeze(0).expand(bp.shape[0], -1, -1)
-            lquat = self._site_lquat.unsqueeze(0).expand(bq.shape[0], -1, -1)
-            r = quat_apply(bq, lpos)
-            spos = bp + r
-            squat = quat_mul(bq, lquat)
-            slin = bl + torch.cross(ba, r, dim=-1)
-            return spos, squat, slin, ba
-
-        key = "site_kin"
-        if self._cache._token != self._clock.token or key not in self._cache._store:
-            out = compute()
-            # stash as tuple via individual keys
-            self._cache.get("_sync", lambda: torch.zeros(1))
-            self._cache._store[key] = out  # type: ignore[assignment]
-        return self._cache._store[key]
+        return lin_link, ang
 
     # ── writes (mjlab API) ─────────────────────────────────────────────────
 
@@ -338,9 +186,11 @@ class ArticulationAdapter:
             self._joint_pos_target[:] = position
         else:
             self._joint_pos_target[env_ids] = position
-        self._art.set_joint_position_target(
-            position.to(self.device), joint_ids=ids.tolist(), env_ids=env_ids
-        )
+        if self._driven_joint_ids.numel():
+            self._art.set_joint_position_target(
+                position[:, self._driven_joint_ids].to(self.device),
+                joint_ids=ids[self._driven_joint_ids].tolist(), env_ids=env_ids,
+            )
         self._clock.bump()
 
     def set_joint_position_target(
@@ -352,6 +202,8 @@ class ArticulationAdapter:
             ent_ids = joint_ids
         else:
             ent_ids = torch.tensor(joint_ids, dtype=torch.long, device=self.device)
+        if any(self.joint_names[int(i)] not in self._meta.driven_joint_names for i in ent_ids):
+            raise ValueError("passive native joints cannot receive position targets")
         self._joint_pos_target[:, ent_ids] = target
         isaac_ids = self._isaac_joint_ids[ent_ids]
         self._art.set_joint_position_target(target, joint_ids=isaac_ids.tolist())
@@ -362,33 +214,98 @@ class ArticulationAdapter:
         if self._gravcomp_full is not None:
             self._write_gravcomp()
 
-    def init_gravcomp(self, scale: float) -> None:
+    def init_gravcomp(self, scale: float, gravity_world_m_per_s2) -> None:
         """Per-link world-frame m*g lift at the COM, kept through resets (MJCF gravcomp)."""
-        masses = self._art.root_physx_view.get_masses().to(self.device)
-        masses = masses.reshape(self._art.num_instances, -1)
-        self._gravcomp_full = torch.zeros(*masses.shape, 3, device=self.device)
-        self._gravcomp_full[..., 2] = 9.81 * masses
         self._gravcomp_scale = float(scale)
+        self.update_gravcomp_gravity(gravity_world_m_per_s2)
+
+    def update_gravcomp_gravity(self, gravity_world_m_per_s2) -> None:
+        mass = self._body_properties.mass_kg
+        self._gravcomp_full = -mass[..., None] * mass.new_tensor(gravity_world_m_per_s2)
         self._write_gravcomp()
 
     def _write_gravcomp(self) -> None:
         # Always the full buffer: Isaac Lab derives has_external_wrench from the written slice only.
         f = self._gravcomp_full * self._gravcomp_scale
-        self._art.set_external_force_and_torque(f, torch.zeros_like(f), is_global=True)
+        self._art.set_external_force_and_torque(
+            f, torch.zeros_like(f), body_ids=self._isaac_body_ids.tolist(), is_global=True,
+        )
 
 
-# ─── Object (single free rigid body) ─────────────────────────────────────────
+class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
+    """One actual floating articulation; scalar joints remain named DOFs.
+
+    The root is reset through Isaac Lab's public link-state API. During a
+    rollout it is driven by an external wrench, never by pose teleportation.
+    """
+
+    is_fixed_base = False
+
+    def __init__(self, articulation, meta, clock, device, *, root_body_name):
+        super().__init__(articulation, meta, clock, device)
+        if articulation.is_fixed_base:
+            raise ValueError(f"native articulation {root_body_name!r} has a fixed base")
+        if meta.body_names[0] != root_body_name:
+            raise ValueError("native root must be the named articulation root body")
+        if len(meta.free_roots) != 1 or meta.free_roots[0].body_name != root_body_name:
+            raise ValueError("native articulation must contain its declared FREE root")
+        self.root_body_name = root_body_name
+        b = articulation.num_instances
+        self._default_root_state = torch.zeros(b, 13, device=device)
+        self._default_root_state[:, :7] = torch.as_tensor(
+            meta.free_roots[0].default_pose, dtype=torch.float32, device=device
+        )
+        self._default_joint_pos[:] = torch.as_tensor(
+            meta.joint_default, dtype=torch.float32, device=device
+        )
+        self._external_force_w = torch.zeros(b, len(self.body_names), 3, device=device)
+        self._external_torque_w = torch.zeros_like(self._external_force_w)
+
+    def write_root_state_to_sim(self, root_state, env_ids=None) -> None:
+        self._art.write_root_link_state_to_sim(root_state, env_ids=env_ids)
+        self._clock.bump()
+
+    def _submit_external_wrenches(self):
+        # Lab derives has_external_wrench from the submitted slice. Submit the
+        # complete request so clearing one world cannot disable the others.
+        self._art.set_external_force_and_torque(
+            self._external_force_w, self._external_torque_w,
+            body_ids=self._isaac_body_ids.tolist(), is_global=True,
+        )
+
+    def write_external_wrench_to_sim(self, forces, torques, env_ids=None, body_ids=None):
+        """Replace named WORLD forces/torques at the actual body COMs."""
+        rows = torch.arange(self._art.num_instances, device=self.device) if env_ids is None else env_ids
+        ids = torch.arange(len(self.body_names), device=self.device) if body_ids is None else torch.as_tensor(
+            body_ids, device=self.device, dtype=torch.long,
+        )
+        self._external_force_w[rows[:, None], ids[None]] = forces.detach()
+        self._external_torque_w[rows[:, None], ids[None]] = torques.detach()
+        self._submit_external_wrenches()
+
+    def clear_external_wrenches(self, env_ids=None):
+        rows = slice(None) if env_ids is None else env_ids
+        self._external_force_w[rows] = 0
+        self._external_torque_w[rows] = 0
+        self._submit_external_wrenches()
+
+    def reset(self, env_ids=None):
+        super().reset(env_ids)
+        self.clear_external_wrenches(env_ids)
+
+    def _write_root_wrench(self, force, torque):
+        self._external_force_w.zero_()
+        self._external_torque_w.zero_()
+        self._external_force_w[:, 0] = force
+        self._external_torque_w[:, 0] = torque
+        self._submit_external_wrenches()
 
 
-class _ObjIndexing:
-    def __init__(self, body_ids: torch.Tensor) -> None:
-        self.body_ids = body_ids
 
 
 class RigidObjectData:
     def __init__(self, adapter: "RigidObjectAdapter") -> None:
         self._a = adapter
-        self.indexing = adapter.indexing
 
     @property
     def default_root_state(self) -> torch.Tensor:
@@ -424,29 +341,44 @@ class RigidObjectAdapter:
 
     is_fixed_base = False
 
+    def joint_coordinate_metadata(self):
+        """A physical rigid body has no scalar joint coordinates."""
+        return {
+            "joint_names": (), "joint_types": (),
+            "position_units": (), "velocity_units": (),
+        }
+
     def __init__(
         self,
         obj: "RigidObject",
-        global_body_id: int,
         clock: _FreshnessClock,
         device: str,
         default_root_state: torch.Tensor,
+        *,
+        body_name: str,
     ) -> None:
         self._obj = obj
         self._clock = clock
         self._cache = _Cached(clock)
         self.device = device
-        self.indexing = _ObjIndexing(
-            torch.tensor([global_body_id], dtype=torch.long, device=device)
-        )
         self._default_root_state = default_root_state  # (B, 13)
+        if list(obj.body_names) != [body_name]:
+            raise ValueError("rigid adapter requires its actual single named body")
+        self.body_names = [body_name]
+        self.root_body_name = body_name
+        self.joint_names = ()  # A physical rigid object has no scalar joints.
         view = obj.root_physx_view
-        com = view.get_coms().reshape(obj.num_instances, -1)[:, :3].to(device)
-        self._com_local = com  # (B, 3)
+        self._body_properties = _installed_body_properties(
+            view, self.body_names, [0], obj.num_instances, device,
+        )
+        self._com_local = self._body_properties.com_position_body_m[:, 0]
         self.data = RigidObjectData(self)
         # world-frame external wrench support probe (isaaclab >= is_global)
         sig = inspect.signature(obj.set_external_force_and_torque)
         self._has_is_global = "is_global" in sig.parameters
+
+    def body_inertial_properties(self):
+        return self._body_properties
 
     def _pose(self):
         def fetch():
@@ -491,7 +423,10 @@ class RigidObjectAdapter:
         forces: torch.Tensor,
         torques: torch.Tensor,
         env_ids: torch.Tensor | None = None,
+        body_ids=None,
     ) -> None:
+        if body_ids is not None and list(body_ids) != [0]:
+            raise ValueError("a rigid object wrench selects its sole named body")
         f = forces.reshape(-1, 1, 3)
         t = torques.reshape(-1, 1, 3)
         # Apply at the COM (mujoco xfrc parity); FDR_PIN_AT_COM=0
@@ -500,6 +435,11 @@ class RigidObjectAdapter:
 
         if _os.environ.get("FDR_PIN_AT_COM", "0") == "1":
             com = self._com_local if env_ids is None else self._com_local[env_ids]
+            if self._has_is_global:
+                link_pos, quat = self._pose()
+                if env_ids is not None:
+                    link_pos, quat = link_pos[env_ids], quat[env_ids]
+                com = link_pos + quat_apply(quat, com)
             pos = com.reshape(-1, 1, 3)
         else:
             pos = None
@@ -522,3 +462,8 @@ class RigidObjectAdapter:
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         self._obj.reset(env_ids=env_ids)
+
+    def clear_external_wrenches(self, env_ids=None):
+        count = self._obj.num_instances if env_ids is None else len(env_ids)
+        zero = torch.zeros(count, 1, 3, device=self.device)
+        self.write_external_wrench_to_sim(zero, zero.clone(), env_ids=env_ids)

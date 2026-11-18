@@ -106,6 +106,16 @@ class CommandTerm(ManagerTermBase):
     self._resample(env_ids)
     return extras
 
+  def apply_substep(self) -> None:
+    """Refresh persistent command forces before each actual physics substep."""
+
+  def refresh(self, env_ids: torch.Tensor) -> None:
+    """Refresh selected reset rows without an elapsed control step.
+
+    Resampled commands are already current. Time-indexed terms override this
+    to install their first endpoint without advancing any other environment.
+    """
+
   def compute(self, dt: float) -> None:
     self._update_metrics()
     self.time_left -= dt
@@ -246,6 +256,14 @@ class CommandManager(ManagerBase):
         extras[f"Metrics/{name}/{metric_name}"] = metric_value
     return extras
 
+  def compute_substep(self) -> None:
+    for term in self._terms.values():
+      term.apply_substep()
+
+  def refresh(self, env_ids: torch.Tensor) -> None:
+    for term in self._terms.values():
+      term.refresh(env_ids)
+
   def compute(self, dt: float):
     for term in self._terms.values():
       term.compute(dt)
@@ -319,6 +337,12 @@ class NullCommandManager:
 
   def reset(self, env_ids: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     return {}
+
+  def compute_substep(self) -> None:
+    pass
+
+  def refresh(self, env_ids: torch.Tensor) -> None:
+    pass
 
   def compute(self, dt: float) -> None:
     pass

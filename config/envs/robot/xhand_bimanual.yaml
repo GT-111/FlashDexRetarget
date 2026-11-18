@@ -1,5 +1,14 @@
 # @package _global_
 
+sim:
+  robot_asset:
+    source_urdf_path: assets/robot/xhand/urdf/xhand_bimanual_spec.urdf
+    usd_path: ${oc.env:FDR_ROBOT_USD,assets/robot/xhand/urdf/converted_spec/xhand_bimanual_spec.usd}
+    collision_visual_usd_path: assets/robot/xhand/urdf/converted_colvis/xhand_bimanual_spec.usd
+    body_name_map:
+      R_forearm_rot_y_link: right_hand_link
+      L_forearm_rot_y_link: left_hand_link
+
 robot:
   entity_name: robot
   self_collision: true
@@ -300,27 +309,27 @@ robot:
 
   body_mapping:
     all:
-      - [hand_thumb_bend_link,  thumb_proximal]
-      - [hand_thumb_rota_link1, thumb_intermediate]
-      - [hand_thumb_rota_link2, thumb_distal]
-      - [hand_index_bend_link,  index_proximal]
-      - [hand_index_rota_link1, index_proximal]
-      - [hand_index_rota_link2, index_distal]
-      - [hand_mid_link1,        middle_proximal]
-      - [hand_mid_link2,        middle_distal]
-      - [hand_ring_link1,       ring_proximal]
-      - [hand_ring_link2,       ring_distal]
-      - [hand_pinky_link1,      pinky_proximal]
-      - [hand_pinky_link2,      pinky_distal]
+      - [{left: left_hand_thumb_bend_link, right: right_hand_thumb_bend_link}, thumb_proximal]
+      - [{left: left_hand_thumb_rota_link1, right: right_hand_thumb_rota_link1}, thumb_intermediate]
+      - [{left: left_hand_thumb_rota_link2, right: right_hand_thumb_rota_link2}, thumb_distal]
+      - [{left: left_hand_index_bend_link, right: right_hand_index_bend_link}, index_proximal]
+      - [{left: left_hand_index_rota_link1, right: right_hand_index_rota_link1}, index_proximal]
+      - [{left: left_hand_index_rota_link2, right: right_hand_index_rota_link2}, index_distal]
+      - [{left: left_hand_mid_link1, right: right_hand_mid_link1}, middle_proximal]
+      - [{left: left_hand_mid_link2, right: right_hand_mid_link2}, middle_distal]
+      - [{left: left_hand_ring_link1, right: right_hand_ring_link1}, ring_proximal]
+      - [{left: left_hand_ring_link2, right: right_hand_ring_link2}, ring_distal]
+      - [{left: left_hand_pinky_link1, right: right_hand_pinky_link1}, pinky_proximal]
+      - [{left: left_hand_pinky_link2, right: right_hand_pinky_link2}, pinky_distal]
     level1:
-      thumb:  [hand_thumb_bend_link,  thumb_proximal]
-      index:  [hand_index_bend_link,  index_proximal]
-      middle: [hand_mid_link1,        middle_proximal]
-      ring:   [hand_ring_link1,       ring_proximal]
-      pinky:  [hand_pinky_link1,      pinky_proximal]
+      thumb:  [{left: left_hand_thumb_bend_link, right: right_hand_thumb_bend_link}, thumb_proximal]
+      index:  [{left: left_hand_index_bend_link, right: right_hand_index_bend_link}, index_proximal]
+      middle: [{left: left_hand_mid_link1, right: right_hand_mid_link1}, middle_proximal]
+      ring:   [{left: left_hand_ring_link1, right: right_hand_ring_link1}, ring_proximal]
+      pinky:  [{left: left_hand_pinky_link1, right: right_hand_pinky_link1}, pinky_proximal]
     level2:
-      thumb:  [hand_thumb_rota_link2, thumb_distal]
-      index:  [hand_index_rota_link2, index_distal]
-      middle: [hand_mid_link2,        middle_distal]
-      ring:   [hand_ring_link2,       ring_distal]
-      pinky:  [hand_pinky_link2,      pinky_distal]
+      thumb:  [{left: left_hand_thumb_rota_link2, right: right_hand_thumb_rota_link2}, thumb_distal]
+      index:  [{left: left_hand_index_rota_link2, right: right_hand_index_rota_link2}, index_distal]
+      middle: [{left: left_hand_mid_link2, right: right_hand_mid_link2}, middle_distal]
+      ring:   [{left: left_hand_ring_link2, right: right_hand_ring_link2}, ring_distal]
+      pinky:  [{left: left_hand_pinky_link2, right: right_hand_pinky_link2}, pinky_distal]

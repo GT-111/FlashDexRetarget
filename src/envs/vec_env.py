@@ -3,7 +3,6 @@ obs, auto_reset single-pass stepping, final_obs truncation bootstrap, share_obs 
 
 from __future__ import annotations
 
-import re
 from typing import Any, Union
 
 import gymnasium as gym
@@ -23,6 +22,7 @@ class FlatObsVecEnv(VectorEnv):
     def __init__(
         self,
         env: Any,
+        command: Any,
         to_numpy: bool = True,
         share_obs: bool = False,
         reward_heads: dict[str, Any] | None = None,
@@ -83,7 +83,7 @@ class FlatObsVecEnv(VectorEnv):
         self._head_checks_left = 0
         self._action_sides: dict[str, list[int]] = {}
         if reward_heads and bool(reward_heads.get("enable", False)):
-            self._setup_reward_heads(dict(reward_heads.get("overrides") or {}))
+            self._setup_reward_heads(dict(reward_heads.get("overrides") or {}), command)
             self._ep_head_returns = np.zeros((self.num_envs, len(self._head_names)), dtype=np.float32)
         # Optional obs-aux provider (obs compaction): called right after each obs compute.
         self._aux_fn: Any = None
@@ -101,11 +101,13 @@ class FlatObsVecEnv(VectorEnv):
         """Obs aux of the current state (None without a provider)."""
         return self._aux_now()
 
-    def _setup_reward_heads(self, overrides: dict[str, str]) -> None:
-        """Map every active reward term to a hand side by its `_r_`/`_l_` name token (or an
-        explicit override: right|left|both); untagged terms are split evenly across heads."""
-        cmd = self._env.command_manager.get_term("motion")
-        sides = list(cmd._side_list)
+    def _setup_reward_heads(self, overrides: dict[str, str], command: Any) -> None:
+        """Route actual term-side metadata to the command's declared heads.
+
+        Explicit overrides win; terms without a side are shared across heads.
+        Every routing row sums to one, preserving the manager's global reward.
+        """
+        sides = list(command._side_list)
         if len(sides) < 2:
             raise ValueError(f"reward_heads needs a bimanual command, got sides {sides}.")
         rm = self._env.reward_manager
@@ -114,14 +116,15 @@ class FlatObsVecEnv(VectorEnv):
         for name in names:
             tag = overrides.get(name)
             if tag is None:
-                m = re.search(r"(^|_)([rl])(_|$)", name)
-                tag = {"r": "right", "l": "left"}.get(m.group(2)) if m else "both"
+                tag = rm.get_term_cfg(name).params.get("side")
+            if tag is None:
+                tag = "both"
             if tag == "both":
                 row = [1.0 / len(sides)] * len(sides)
             elif tag in sides:
                 row = [1.0 if s_ == tag else 0.0 for s_ in sides]
             else:
-                raise ValueError(f"reward_heads: term {name!r} tagged {tag!r}, expected right|left|both.")
+                raise ValueError(f"reward_heads: term {name!r} tagged {tag!r}, expected one of {sides} or 'both'.")
             rows.append(row)
             table.append(f"  {name:<44s} -> {tag}")
         self._head_names = sides
@@ -131,18 +134,15 @@ class FlatObsVecEnv(VectorEnv):
         self._action_sides = self._action_side_indices(sides)
 
     def _action_side_indices(self, sides: list[str]) -> dict[str, list[int]]:
-        """Action-vector indices per side (joint-name prefix R_/right_ vs L_/left_); the action
-        term groups dims by type ([wrist_trans R,L | wrist_rot R,L | fingers R,L]), not by side."""
+        """Use the action term's ownership; coordinates are grouped by type, not side."""
         from envs._common import action_term
 
         act_term = action_term(self._env)
-        names = act_term._entity.joint_names
-        joint_ids = [int(j) for j in act_term._all_joint_ids.tolist()]
-        prefixes = {"right": ("R_", "right_"), "left": ("L_", "left_")}
-        out = {s_: [i for i, j in enumerate(joint_ids) if names[j].startswith(prefixes[s_])] for s_ in sides}
+        names = act_term.action_names
+        out = {s_: [i for i, owner in enumerate(act_term.action_sides) if owner == s_] for s_ in sides}
         covered = sorted(i for v in out.values() for i in v)
-        if covered != list(range(len(joint_ids))):
-            raise ValueError(f"action dims not partitioned by side: {out} over {len(joint_ids)} dims")
+        if covered != list(range(act_term.action_dim)):
+            raise ValueError(f"action dims not partitioned by side: {out} over {names}")
         print("[reward_heads] action sides: " + ", ".join(f"{k}={v}" for k, v in out.items()), flush=True)
         return out
 
@@ -171,11 +171,12 @@ class FlatObsVecEnv(VectorEnv):
     def from_env(
         cls,
         env: Any,
+        command: Any,
         to_numpy: bool = True,
         share_obs: bool = False,
         reward_heads: dict[str, Any] | None = None,
     ) -> "FlatObsVecEnv":
-        return cls(env, to_numpy=to_numpy, share_obs=share_obs, reward_heads=reward_heads)
+        return cls(env, command, to_numpy=to_numpy, share_obs=share_obs, reward_heads=reward_heads)
 
     @property
     def unwrapped(self) -> Any:

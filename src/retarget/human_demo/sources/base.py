@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import importlib
 import itertools
+import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,7 @@ class Demo:
     scales: dict[str, float] = field(default_factory=dict)
     scene: dict[str, np.ndarray] = field(default_factory=dict)
     context: dict[str, np.ndarray] = field(default_factory=dict)
+    source_lineage: dict | None = None
 
 
 class Source:
@@ -193,6 +195,22 @@ def _write(source: Source, demo: Demo, cfg, out_dir: Path, shared: dict) -> dict
     else:
         z0 = _floor(world, source, demo.scales, demo.fps) - table_z
     clip: dict = {"fps": np.float32(cfg.fps)}
+    if demo.source_lineage is not None:
+        lineage = dict(demo.source_lineage)
+        selected = lineage["selected_source_frame_index"]
+        if len(selected) != min(lengths):
+            raise ValueError("source frame lineage differs from the actual imported hand/object rows")
+        ordinal = _resample(np.arange(len(selected), dtype=np.float64), demo.fps, cfg.fps)
+        placement = np.eye(4)
+        placement[:3, :3] = R
+        placement[2, 3] = -z0
+        lineage.update(scene_from_source_world=placement.tolist(), import_target_fps=float(cfg.fps),
+                       prepared_scope="source program stage; actual later IK crop remains explicit")
+        # Static IDs are JSON so a crop cannot mistake an equal-length inventory
+        # for per-output-frame facts. Only the actual query vectors are sliced.
+        clip["source_lineage_json"] = np.asarray(json.dumps(lineage, sort_keys=True))
+        clip["source_query_ordinal"] = ordinal
+        clip["source_import_elapsed_ns"] = np.rint(ordinal / demo.fps * 1e9).astype(np.int64)
     mano_dir = str(cfg.mano_dir)
     for side in sides:
         hand = demo.hands[side]

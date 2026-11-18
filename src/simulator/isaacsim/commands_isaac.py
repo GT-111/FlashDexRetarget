@@ -1,5 +1,4 @@
-"""Isaac motion-tracking command: neutralizes mjwarp sensor registration,
-binds the Isaac sensor adapters, restricts sampling in per-env-object mode."""
+"""Stock Isaac command sampling for the scene's fixed per-environment objects."""
 
 from __future__ import annotations
 
@@ -7,27 +6,13 @@ from dataclasses import dataclass
 
 import torch
 
-from envs.commands.motion_tracking import motion_tracking as _mt
 from envs.commands.motion_tracking.motion_tracking import MotionTrackingCommand
 from envs.commands.motion_tracking.motion_tracking_cfg import MotionTrackingCommandCfg
 
 
 class IsaacMotionTrackingCommand(MotionTrackingCommand):
     def __init__(self, cfg: MotionTrackingCommandCfg, env) -> None:
-        orig_raw = _mt.register_raw_contact_views
-        orig_mux = _mt.register_multi_object_sensor_views
-        _mt.register_raw_contact_views = lambda *a, **k: None
-        _mt.register_multi_object_sensor_views = lambda *a, **k: None
-        try:
-            super().__init__(cfg, env)
-        finally:
-            _mt.register_raw_contact_views = orig_raw
-            _mt.register_multi_object_sensor_views = orig_mux
-
-        bind = getattr(env.scene, "_bind_sensor_callbacks", None)
-        if bind is not None:
-            side = self._side_list[0]
-            bind(lambda: self.active_obj_slot(side), lambda: self)
+        super().__init__(cfg, env)
 
         # Per-env-object mode: resampling must stay within the env's fixed
         # object; build a padded (S, maxM) per-slot motion table once.
@@ -51,6 +36,15 @@ class IsaacMotionTrackingCommand(MotionTrackingCommand):
             counts[s] = r.numel()
         self._slot_motion_table = table
         self._slot_motion_count = counts
+
+    def clear_object_wrenches(self, env_ids=None):
+        names = {name for side in self._side_list for name in self.obj_entity_names(side)}
+        count = self.num_envs if env_ids is None else len(env_ids)
+        zero = torch.zeros(count, 1, 3, device=self.device)
+        for name in names:
+            self._env.scene[name].write_external_wrench_to_sim(
+                zero, zero.clone(), env_ids=env_ids,
+            )
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
         assigned = getattr(self._env.scene, "assigned_obj_slot", None)
@@ -76,25 +70,6 @@ class IsaacMotionTrackingCommand(MotionTrackingCommand):
             super()._resample_command(env_ids)
         finally:
             self._eval_mode = prev
-
-    def _obj_inertia_body(self, side: str) -> torch.Tensor:
-        """Per-slot inertia stack (S, 3, 3) for the xfrc pin; the single model
-        row can't describe per-env heterogeneous objects."""
-        stack = getattr(self._env.scene, "obj_inertia_stack", None)
-        if stack is not None and getattr(
-            self._env.scene, "assigned_obj_slot", None
-        ) is not None:
-            if not isinstance(stack, dict):
-                return stack
-            if side not in stack:
-                # shared-object pt: only one side was spawned, the other aliases its entity
-                names = self.cfg.object.entity_names
-                for s2 in stack:
-                    if names.get(s2) == names.get(side):
-                        return stack[s2]
-            return stack[side]
-        return super()._obj_inertia_body(side)
-
 
 @dataclass(kw_only=True)
 class IsaacMotionTrackingCommandCfg(MotionTrackingCommandCfg):

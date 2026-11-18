@@ -103,10 +103,10 @@ class ObjectCfg:
     mesh_scales: dict[str, float | list[float]] | None = None
     shared_slots: list[bool] | None = None
     contact_sensor_mode: Literal["raw", "native"] = "raw"
-    raw_sensor_specs: list | None = None
     swap_spec: dict | None = None
 
     # Yaml-tunable.
+    park_inactive_on_ground: bool = False
     sdf: ObjectSdfCfg = field(default_factory=ObjectSdfCfg)
     zero_init_vel: bool = False
     pin_objects: bool = False
@@ -154,6 +154,7 @@ class MotionTrackingCommandCfg(CommandTermCfg):
     finger_names: tuple[str, ...]
     joint_names: dict[str, list[str]]
     site_names: dict[str, dict]
+    # Pairs are [{available_side: exact_full_body_name}, original_MANO_joint_name].
     body_mapping: dict
 
     sampling: MotionSamplingCfg = field(default_factory=MotionSamplingCfg)

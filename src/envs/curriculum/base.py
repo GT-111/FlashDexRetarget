@@ -15,20 +15,17 @@ def gravity_curriculum(
     schedule_steps: int = 1920,
     full_g: float = 9.81,
 ) -> dict[str, torch.Tensor]:
-    """Linear ramp of -z gravity from 0 to -full_g over schedule_steps env-steps
-    (mutates opt.gravity[2] in place); schedule_steps <= 0 = constant -full_g."""
+    """One scene-global -z gravity schedule, including subset-reset calls."""
+    if schedule_steps > 0 and not env.sim.supports_dynamic_gravity:
+        raise NotImplementedError("this backend supports constant constructor gravity only")
     s = int(env.common_step_counter)
     if schedule_steps <= 0:
         frac = 1.0
     else:
         frac = min(s / max(1, schedule_steps), 1.0)
     gz = -float(full_g) * frac
-    g = env.sim.model.opt.gravity
-    if g.ndim == 2:  # mjwarp expands opt.gravity to (nworld, 3)
-        g[:, 2] = gz
-    else:
-        g[2] = gz
-    return {"gravity_z": torch.tensor(gz)}
+    actual = env.sim.set_gravity_world_m_per_s2((0.0, 0.0, gz))
+    return {"gravity_z": torch.tensor(actual[2])}
 
 
 def xfrc_curriculum(
@@ -55,38 +52,16 @@ def xfrc_curriculum(
 
     cmd = env.command_manager.get_term(command_name)
     sides = list(cmd.cfg.object.entity_names or {})
-    first_side = sides[0]
-    obj_names = cmd.obj_entity_names(first_side)
-
-    def _entity_mass(name: str) -> float:
-        obj = env.scene[name]
-        # body_mass is (B, nbody): index env 0 explicitly, then sum the entity's
-        # body_ids (bare body_ids would index the batch dim — past ~10x-mass bug).
-        return float(env.sim.model.body_mass[0, obj.indexing.body_ids].sum())
-
-    if len(obj_names) == 1:
-        # Bimanual single-object: one scalar gain pair serves both sides' pins,
-        # so use the mean object mass across sides.
-        m = sum(
-            _entity_mass(cmd.obj_entity_names(s)[0]) for s in sides
-        ) / len(sides)
-        kp = m * w * w
-        kv = 2.0 * float(zeta) * m * w
-        cmd.cfg.object.xfrc.kp.pos = kp
-        cmd.cfg.object.xfrc.kd.pos = kv
-    else:
-        # Multi-object: per-slot masses → per-env gains via each env's ACTIVE
-        # slot (the command's per-env gain buffers override the scalar cfg).
-        masses = torch.tensor(
-            [_entity_mass(n) for n in obj_names], device=env.device
-        )
-        m_env = masses[cmd.active_obj_slot(first_side)]  # (B,)
-        cmd._xfrc_kp_pos_env = m_env * w * w
-        cmd._xfrc_kv_pos_env = 2.0 * float(zeta) * m_env * w
-        # Scalar logging values use the mean mass.
-        m = float(masses.mean())
-        kp = m * w * w
-        kv = 2.0 * float(zeta) * m * w
+    # Preserve the side-mean gain recipe independently in every world. Actual
+    # selected slots and mixed shared-object aliases use the state-read owner.
+    mass_env = torch.stack([cmd._obj_mass_env(side) for side in sides]).mean(0)
+    cmd._xfrc_kp_pos_env = mass_env * w * w
+    cmd._xfrc_kv_pos_env = 2.0 * float(zeta) * mass_env * w
+    m = float(mass_env.mean())
+    kp = m * w * w
+    kv = 2.0 * float(zeta) * m * w
+    cmd.cfg.object.xfrc.kp.pos = kp
+    cmd.cfg.object.xfrc.kd.pos = kv
     # ω_rot = rot_omega_mult·ω_n: mult>1 holds orientation stiffer (kp_rot ∝ mult²)
     # yet decays to 0 on the same schedule; mult=1 keeps the old ω_rot = ω_n.
     w_rot = float(w) * float(rot_omega_mult)

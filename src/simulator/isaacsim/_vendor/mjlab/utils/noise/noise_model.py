@@ -26,7 +26,7 @@ class NoiseModel:
   def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
     """Reset noise model state. Override in subclasses if needed."""
 
-  def __call__(self, data: torch.Tensor) -> torch.Tensor:
+  def __call__(self, data: torch.Tensor, env_ids: torch.Tensor | None = None) -> torch.Tensor:
     """Apply noise to input data."""
     assert self._noise_model_cfg.noise_cfg is not None
     return self._noise_model_cfg.noise_cfg.apply(data)
@@ -77,8 +77,8 @@ class NoiseModelWithAdditiveBias(NoiseModel):
       self.reset()
 
   @override
-  def __call__(self, data: torch.Tensor) -> torch.Tensor:
+  def __call__(self, data: torch.Tensor, env_ids: torch.Tensor | None = None) -> torch.Tensor:
     """Apply noise and additive bias to input data."""
     self._initialize_bias_shape(data.shape)
-    noisy_data = super().__call__(data)
-    return noisy_data + self._bias
+    noisy_data = super().__call__(data, env_ids=env_ids)
+    return noisy_data + (self._bias if env_ids is None else self._bias[env_ids])

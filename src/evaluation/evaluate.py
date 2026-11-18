@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import tempfile
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,42 +15,210 @@ from hydra.utils import instantiate
 from mjlab.rl import RslRlVecEnvWrapper
 from omegaconf import DictConfig
 
-from agents import Agent
-from evaluation.callbacks.success_export import export_success
+from agents import Policy
+from evaluation.callbacks.success_export import export_current_attempts, export_success
+
+
+def validate_recording_authority(authority):
+    """Require a real learned checkpoint or explicit parameterless method identity."""
+    if not authority or not authority.get("source_revision"):
+        raise ValueError("frozen recording requires explicit acting method and source_revision authority")
+    if authority.get("checkpoint"):
+        return
+    policy = authority.get("policy", {})
+    if (policy.get("kind") != "analytic" or policy.get("has_learned_parameters") is not False
+            or not policy.get("method_id") or policy.get("checkpoint") is not None):
+        raise ValueError("analytic recording requires a named parameterless policy without a checkpoint")
 
 
 def evaluate(
-    agent: Agent,
+    agent: Policy,
     eval_env: RslRlVecEnvWrapper,
     eval_cfg: DictConfig,
     device: str,
     ever_state: dict | None = None,
     success_dir: Path | None = None,
     env_step: int = 0,
+    *,
+    outcome_dir: Path,
+    recording_dir: Path | None = None,
+    frozen_authority: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     """Roll the deterministic policy through every eval batch, then turn the callback
     states into metrics."""
     raw_eval = eval_env.unwrapped
-    # RolloutRecord only feeds the success archive; skip its capture when not saving.
+    if recording_dir is not None:
+        validate_recording_authority(frozen_authority)
+    # Keep capture only for a selected success archive or explicit frozen export.
     save_success = bool(eval_cfg.get("save_success_data", True))
     callbacks = [
         instantiate(cb) for cb in eval_cfg.callbacks
-        if save_success or "rollout_record" not in str(cb.get("_target_", ""))
+        if save_success or recording_dir is not None or "rollout_record" not in str(cb.get("_target_", ""))
     ]
 
-    states = _rollout(agent, eval_env, callbacks, device)
-
-    metrics = reduce_metrics(callbacks, states)
-    metrics.update(tracking_success_metrics(
-        raw_eval, eval_cfg, callbacks, states, ever_state,
-        success_dir if save_success else None, env_step,
-    ))
+    attempt_rows = [] if recording_dir is not None else None
+    states = {id(cb): [] for cb in callbacks if hasattr(cb, "reduce_state")}
+    stage = "rollout"
+    try:
+        _rollout(agent, eval_env, callbacks, device, attempt_rows=attempt_rows, states=states)
+        stage = "metric_reduction"
+        metrics = reduce_metrics(callbacks, states)
+        metrics.update(tracking_success_metrics(
+            raw_eval, eval_cfg, callbacks, states, ever_state,
+            success_dir if save_success else None, env_step,
+        ))
+        stage = "outcome_export"
+        write_current_policy_outcomes(agent, raw_eval, eval_cfg, callbacks, states, metrics,
+                                      outcome_dir=outcome_dir, env_step=env_step,
+                                      recording_dir=recording_dir, frozen_authority=frozen_authority,
+                                      attempt_rows=attempt_rows)
+    except BaseException as exc:
+        if recording_dir is not None:
+            # A failed forward or scorer does not erase already recorded facts.
+            # Do not reduce partial metric callbacks into successful outcomes.
+            recorders = [cb for cb in callbacks if hasattr(cb, "rollout_arrays")]
+            try:
+                write_current_policy_outcomes(
+                    agent, raw_eval, eval_cfg, recorders, states, {}, outcome_dir=outcome_dir,
+                    env_step=env_step, recording_dir=recording_dir, frozen_authority=frozen_authority,
+                    attempt_rows=attempt_rows,
+                    evaluation_error={"stage": stage, "exception": f"{type(exc).__name__}: {exc}",
+                                      "scoring": "UNKNOWN; factual prefixes do not establish task success"},
+                )
+            except BaseException:
+                traceback.print_exc()  # Keep the original failure as the raised exception.
+        raise
     return {f"eval/{k}": float(v) for k, v in metrics.items() if isinstance(v, (int, float))}
+
+
+def _json_value(value):
+    if torch.is_tensor(value):
+        return _json_value(value.detach().cpu().tolist())
+    if isinstance(value, dict):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    return value
+
+
+def _outcome_row(columns, index):
+    return {key: (_outcome_row(value, index) if isinstance(value, dict)
+                  else value[index] if isinstance(value, list) else value)
+            for key, value in columns.items()}
+
+
+def write_current_policy_outcomes(
+    agent, raw_eval, eval_cfg, callbacks, states, metrics, *, outcome_dir: Path, env_step: int,
+    recording_dir: Path | None = None, frozen_authority: dict[str, Any] | None = None,
+    attempt_rows: list[dict[str, int]] | None = None,
+    evaluation_error: dict[str, Any] | None = None,
+) -> Path:
+    """Persist every current attempt separately from first/ever-success selection."""
+    library = raw_eval.command_manager.get_term(eval_cfg.command_name).motion_lib
+    names = _motion_names(library)
+    motions = [{"motion_id": motion_id, "motion_name": names[motion_id] if names else None,
+                "callbacks": {}} for motion_id in range(int(library.num_trajectories))]
+    callback_metadata = {}
+    for callback_index, callback in enumerate(callbacks):
+        if id(callback) not in states or not hasattr(callback, "current_policy_outcomes"):
+            continue
+        key = f"{callback_index}:{type(callback).__module__}.{type(callback).__qualname__}"
+        outcome = callback.current_policy_outcomes(states[id(callback)])
+        callback_metadata[key] = _json_value(outcome["metadata"])
+        columns = _json_value(outcome["columns"])
+        for row_index, motion_id in enumerate(outcome["motion_ids"].detach().cpu().tolist()):
+            row = _outcome_row(columns, row_index)
+            row["evaluation_row"] = row_index
+            for criterion in ("full", "object"):
+                failed = row.get(f"{criterion}_failed")
+                if failed is not None:
+                    finite = row.get(f"{criterion}_finite_metrics", row.get("finite_metrics", True))
+                    if not row["scored"]:
+                        row[f"{criterion}_status"] = ["unscored"] * len(failed)
+                    elif not finite:
+                        row[f"{criterion}_status"] = ["nonfinite"] * len(failed)
+                    else:
+                        row[f"{criterion}_status"] = ["fail" if flag else "pass" for flag in failed]
+            motions[motion_id]["callbacks"].setdefault(key, {"attempts": []})["attempts"].append(row)
+        for motion in motions:
+            result = motion["callbacks"].setdefault(key, {"attempts": []})
+            rows = result["attempts"]
+            result["attempt_count"] = len(rows)
+            result["scored_attempt_count"] = sum(bool(row["scored"]) for row in rows)
+            result["unscored_attempt_count"] = len(rows) - result["scored_attempt_count"]
+            result["coverage"] = "not_evaluated" if not rows else "observed" if result["scored_attempt_count"] else "unscored"
+            for criterion in ("full", "object"):
+                statuses = [row[f"{criterion}_status"] for row in rows if f"{criterion}_status" in row]
+                if statuses:
+                    result[f"{criterion}_threshold_counts"] = [
+                        {status: sum(row[index] == status for row in statuses)
+                         for status in ("pass", "fail", "unscored", "nonfinite")}
+                        for index in range(len(statuses[0]))
+                    ]
+    recorded_at = datetime.now(timezone.utc)
+    report = {
+        "selection": "current_policy_all_attempts; independent of first_success_ever archive",
+        "policy_authority": getattr(agent, "acting_authority", {"kind": "current_in_memory_agent", "deterministic": True,
+                             "agent_class": f"{type(agent).__module__}.{type(agent).__qualname__}",
+                             "training_env_step": int(env_step),
+                             "checkpoint_mapping": "Normal post-evaluation FULL/operation receipt; no checkpoint is inferred here"}),
+        "recorded_UTC": recorded_at.isoformat(),
+        "motion_file": getattr(library, "motion_file", None),
+        "selected_motion_count": len(motions), "configured_replicas_per_motion": int(eval_cfg.num_per_motion),
+        "selected_archive_criterion": str(eval_cfg.get("success_criterion", "obj")),
+        "callback_metadata": callback_metadata, "motions": motions,
+        "ordinary_aggregate_metrics": _json_value(metrics),
+        "aggregate_note": "Original aggregate reduction/fallback and SR thresholds remain unchanged; attempt denominators are explicit",
+        "physical_task_success": "UNQUALIFIED by generic tracking or SDF/contact association metrics; consume the declared downstream task contract",
+    }
+    if evaluation_error is not None:
+        report["evaluation_error"] = evaluation_error
+    outcome_dir = Path(outcome_dir)
+    outcome_dir.mkdir(parents=True, exist_ok=True)
+    destination = outcome_dir / f"current-policy-{int(env_step):012d}-{recorded_at:%Y%m%dT%H%M%S%fZ}.json"
+    if recording_dir is not None:
+        if attempt_rows is None or not frozen_authority:
+            raise ValueError("frozen recording needs actual rollout attempt rows and explicit authority")
+        recorder = next((cb for cb in callbacks if hasattr(cb, "rollout_arrays")), None)
+        recorder_states = [] if recorder is None else states[id(recorder)]
+        manifest, factual_motions = export_current_attempts(
+            Path(recording_dir) / destination.stem, recorder, recorder_states, attempt_rows,
+            evaluation_id=destination.stem, env_step=env_step,
+            frozen_authority=_json_value(frozen_authority),
+            motion_names=[motion["motion_name"] for motion in motions],
+            num_per_motion=int(eval_cfg.num_per_motion), motion_file=getattr(library, "motion_file", None),
+            evaluation_report=destination,
+        )
+        by_row = {attempt["evaluation_row"]: (motion["motion_id"], attempt)
+                  for motion in factual_motions for attempt in motion["attempts"]
+                  if attempt["execution"] == "executed"}
+        for motion, factual in zip(motions, factual_motions, strict=True):
+            motion["factual_attempts"] = factual["attempts"]
+            for result in motion["callbacks"].values():
+                for row in result["attempts"]:
+                    motion_id, attempt = by_row[row["evaluation_row"]]
+                    if motion_id != motion["motion_id"]:
+                        raise ValueError("scalar outcome row differs from its actual frozen attempt")
+                    row["attempt_id"] = attempt["attempt_id"]
+                    row["replica_index"] = attempt["replica_index"]
+        report["factual_recording_manifest"] = os.path.relpath(manifest, outcome_dir)
+        report["frozen_authority"] = _json_value(frozen_authority)
+    with tempfile.NamedTemporaryFile(mode="w", dir=outcome_dir, prefix=".current-policy-", delete=False) as stream:
+        json.dump(report, stream, indent=2, allow_nan=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(stream.name, destination)
+    return destination
 
 
 # ─── rollout ───────────────────────────────────────────────────────────────────
 def _rollout(
-    agent: Agent, eval_env: RslRlVecEnvWrapper, callbacks: list, device: str
+    agent: Policy, eval_env: RslRlVecEnvWrapper, callbacks: list, device: str,
+    *, attempt_rows: list[dict[str, int]] | None = None,
+    states: dict[int, list] | None = None,
 ) -> dict[int, list]:
     """Reset + deterministic inference over every eval batch;
     returns each metric callback's per-batch states, keyed by id(callback)."""
@@ -54,28 +226,43 @@ def _rollout(
     setup_cb = next(cb for cb in callbacks if hasattr(cb, "set_batch"))
     metric_cbs = [cb for cb in callbacks if hasattr(cb, "reduce_state")]
     eval_k, num_motions = raw_eval.eval_k, raw_eval.eval_num_motions
-    states: dict[int, list] = {id(cb): [] for cb in metric_cbs}
-    with torch.no_grad():
-        for b in range(raw_eval.eval_num_batches):
-            setup_cb.set_batch(b, eval_k, num_motions)
-            for cb in callbacks:
-                if hasattr(cb, "on_eval_setup"):
-                    cb.on_eval_setup(raw_eval)
-            obs, _ = eval_env.reset()
-            for cb in callbacks:
-                cb.on_start(raw_eval)
-            enc_keys = sorted(key for key in obs.keys() if key not in ("actor", "critic"))
-            n_steps = max(1, max((int(getattr(cb, "rollout_steps", 0)) for cb in callbacks), default=1))
-            active_mask = setup_cb.active_mask
-            for _ in range(n_steps):
-                actions = agent.act(_flat_actor_obs(obs, enc_keys), deterministic=True)
-                obs, _, _, _ = eval_env.step(torch.as_tensor(np.asarray(actions), device=device))
+    states = {id(cb): [] for cb in metric_cbs} if states is None else states
+    try:
+        with torch.no_grad():
+            for b in range(raw_eval.eval_num_batches):
+                setup_cb.set_batch(b, eval_k, num_motions)
                 for cb in callbacks:
-                    cb.on_step(raw_eval)
-            for cb in metric_cbs:
-                states[id(cb)].append(cb.collect_state(active_mask))
-    if hasattr(eval_env, "exit_eval"):
-        eval_env.exit_eval()
+                    if hasattr(cb, "on_eval_setup"):
+                        cb.on_eval_setup(raw_eval)
+                obs, _ = eval_env.reset()
+                for cb in callbacks:
+                    cb.on_start(raw_eval)
+                enc_keys = sorted(key for key in obs.keys() if key not in ("actor", "critic"))
+                n_steps = max(1, max((int(getattr(cb, "rollout_steps", 0)) for cb in callbacks), default=1))
+                active_mask = setup_cb.active_mask
+                if attempt_rows is not None:
+                    command = raw_eval.command_manager.get_term(setup_cb.command_name)
+                    selected = (torch.arange(raw_eval.num_envs, device=raw_eval.device) if active_mask is None
+                                else torch.nonzero(active_mask, as_tuple=False).flatten())
+                    motion_ids = command.motion_ids[selected].detach().cpu().tolist()
+                    for env_index, motion_id in zip(selected.detach().cpu().tolist(), motion_ids, strict=True):
+                        attempt_rows.append({"evaluation_row": len(attempt_rows), "batch_index": b,
+                                             "env_index": int(env_index), "motion_id": int(motion_id)})
+                completed = False
+                try:
+                    for _ in range(n_steps):
+                        actions = agent.act(_flat_actor_obs(obs, enc_keys), deterministic=True)
+                        obs, _, _, _ = eval_env.step(torch.as_tensor(np.asarray(actions), device=device))
+                        for cb in sorted(callbacks, key=lambda item: not hasattr(item, "rollout_arrays")):
+                            cb.on_step(raw_eval)
+                    completed = True
+                finally:
+                    for cb in sorted(metric_cbs, key=lambda item: not hasattr(item, "rollout_arrays")):
+                        if completed or hasattr(cb, "rollout_arrays"):
+                            states[id(cb)].append(cb.collect_state(active_mask))
+    finally:
+        if hasattr(eval_env, "exit_eval"):
+            eval_env.exit_eval()
     return states
 
 
@@ -160,7 +347,7 @@ def _archive_success(
             ok=(~failed) & scored,
             motion_ids=torch.cat([s["motion_ids"] for s in states[id(rec_cb)]]),
             env_step=env_step,
-            criterion=f"{crit} SR@1.0",
+            criterion=f"{crit} {getattr(tp_cb, 'success_criterion_label', 'SR@1.0')}",
             motion_names=_motion_names(lib),
             motion_file=getattr(lib, "motion_file", None),
         )

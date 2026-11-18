@@ -1,31 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 
 import wandb
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-_LOG_ROOT = Path("logs/rsl_rl")
-
 
 def setup_logger(logger_cfg: DictConfig, runner_cfg: DictConfig) -> None:
-    """Create log_dir, initialize the backend, and mutate ``runner_cfg`` in place:
+    """Use the entry's admitted run directory, initialize the backend, and mutate ``runner_cfg``:
     logger-related keys + ``log_dir`` are added for the runner builder (``train_cfg``)."""
-    resume_path = runner_cfg.get("resume_path", None)
-    if resume_path:
-        # Resume: reuse the checkpoint's run folder so new checkpoints/tfevents/
-        # wandb files land in the SAME directory (not a fresh timestamped one).
-        log_dir = Path(resume_path).resolve().parent
-        full_name = log_dir.name
-        OmegaConf.update(logger_cfg.wandb, "run_name", full_name)
-    else:
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        full_name = f"{timestamp}_{logger_cfg.wandb.run_name}"
-        OmegaConf.update(logger_cfg.wandb, "run_name", full_name)
-        log_dir = _LOG_ROOT / full_name
-
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path(runner_cfg.run_dir)
     OmegaConf.update(runner_cfg, "log_dir", str(log_dir), force_add=True)
 
     if logger_cfg.type == "wandb":
@@ -33,6 +17,11 @@ def setup_logger(logger_cfg: DictConfig, runner_cfg: DictConfig) -> None:
         _inject_wandb_runner_keys(logger_cfg, runner_cfg)
     else:
         raise NotImplementedError(f"logger.type={logger_cfg.type!r} not supported")
+
+
+def close_logger() -> None:
+    if wandb.run is not None:
+        wandb.finish()
 
 
 def _init_wandb(wb: DictConfig, log_dir: str) -> None:
@@ -111,9 +100,8 @@ def _resolve_tags(tags_cfg) -> list[str]:
 
 
 def log_metrics(metrics: dict[str, float], step: int) -> None:
-    """Log to wandb (initialized by ``setup_logger``); echo a short head to stdout."""
+    """Log every supplied scalar to wandb and stdout without rounding."""
     if not metrics:
         return
     wandb.log(metrics, step=step)
-    head = {k: round(v, 4) for k, v in list(metrics.items())[:8]}
-    print(f"[train] step={step} {head}")
+    print(f"[train] step={step} {metrics}", flush=True)

@@ -6,32 +6,28 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import isaaclab.sim as sim_utils
 import numpy as np
 import torch
-import trimesh
-
-import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sensors import ContactSensor, ContactSensorCfg
 
-from envs.commands.motion_tracking.reference.hand import ALLLINK_BODY_NAMES_BY_SIDE
 from envs.scene._object_setup import object_park_position
+from envs.scene.native import NativeSceneCfg
+from simulator.mjcf_meta import RobotMjcfMeta
+from simulator.native.entity import NativeRobotAdapter, _FreshnessClock
 
-from .convert_assets import COLVIS_ROBOT_DIRNAME, colvis_enabled
-from .entity import ArticulationAdapter, RigidObjectAdapter, _FreshnessClock
-from .mjcf_meta import RobotMjcfMeta
-from .sensors import (
-    AlllinkContactAdapter,
-    AlllinkContactPosAdapter,
-    FingertipContactAdapter,
-    FingertipPenetrationAdapter,
-    LinkContactBank,
+from .assets import IsaacRobotAsset, resolve_robot_asset
+from .convert_assets import colvis_enabled, validate_native_usd
+from .entity import (
+    ArticulationAdapter,
+    FreeArticulationAdapter,
+    RigidObjectAdapter,
 )
-from .sim import IsaacSimAdapter, principal_inertia
-
-_SIM_DIR = Path(__file__).resolve().parents[3]  # simulation/
+from .sensors import build_tracking_contact_views
+from .sim import IsaacSimAdapter
 
 
 def _abl(name: str) -> bool:
@@ -41,8 +37,7 @@ def _abl(name: str) -> bool:
 
 
 def _alllink_bodies_by_side(cfg) -> dict[str, list[str]]:
-    """{side: all-link contact bodies} from the scene's {r,l}_alllink_contact sensors (the mujoco
-    source of truth, so other hands work); the xhand constant is the fallback."""
+    """Configured sensor order, or the selected robot's explicit contact links."""
     out: dict[str, list[str]] = {}
     for side in ("right", "left"):
         pat = None
@@ -50,41 +45,59 @@ def _alllink_bodies_by_side(cfg) -> dict[str, list[str]]:
             if str(sn.get("name", "")) == f"{side[0]}_alllink_contact":
                 pat = [str(b) for b in sn["primary"]["pattern"]]
                 break
-        out[side] = pat or list(ALLLINK_BODY_NAMES_BY_SIDE[side])
+        out[side] = pat if pat is not None else list(cfg.robot.contact_links.get(side, []))
     return out
-
-
-def _robot_usd_path(meta: RobotMjcfMeta) -> Path:
-    """Converted robot USD for the configured MJCF (xhand_right / xhand_bimanual).
-    FDR_COLVIS: debug robot whose visuals ARE the collided convex hulls."""
-    override = os.environ.get("FDR_ROBOT_USD")
-    if override:
-        return Path(override)
-    stem = Path(meta.xml_path).stem
-    variant = next((v for v in ("bimanual", "left") if v in stem), "right")
-    if Path(meta.xml_path).parent.name == "sharpa":
-        return _SIM_DIR / "assets/robot/sharpa/urdf/converted" / f"sharpa_{variant}.usd"
-    return _SIM_DIR / "assets/robot/xhand/urdf" / (
-        COLVIS_ROBOT_DIRNAME if colvis_enabled() else "converted"
-    ) / f"xhand_{variant}.usd"
-
-
-# MJCF -> URDF/USD link renames (see assets fork report).
-_URDF_LINK_ALIAS = {
-    "R_forearm_rot_y_link": "right_hand_link",
-    "L_forearm_rot_y_link": "left_hand_link",
-}
 
 
 class IsaacSceneAdapter:
     """Duck-typed mjlab ``Scene``: name lookup, origins, step-loop hooks."""
 
-    def __init__(self, scene: InteractiveScene, device: str) -> None:
+    def __init__(
+        self, scene: InteractiveScene, device: str, sim_ctx: sim_utils.SimulationContext
+    ) -> None:
+        self.backend_identity = {
+            "backend": "isaacsim", "solver": "PhysX",
+            "physics_clock": {
+                "authority": "Isaac Sim SimulationContext.current_time physics-step callback accumulation",
+                "scope": "scene-global time repeated over cloned environments",
+                "partial_reset": "entity reset does not reset the global SDK clock",
+                "continuation": "raw callback clock; no accepted-step ledger or opaque solver snapshot",
+            },
+        }
+        self._sim_ctx = sim_ctx
+        self.root_wrench_application = {
+            "frame": "WORLD", "point": "root_link_COM",
+            "recorded_wrench_point": "root_link_COM",
+        }
         self._scene = scene
         self.device = device
         self.entities: dict[str, object] = {}
         self.sensors: dict[str, object] = {}
         self.sensor_context = None
+        self._reset_entities = None
+        self._tracking_banks = {}
+
+    def bind_tracking_command(self, command) -> None:
+        """Bind this scene's views after the command has admitted its references."""
+        for bank in self._tracking_banks.values():
+            bank.bind_command(command)
+
+    def tracking_contact_metadata(self):
+        return {side: bank.measurement_metadata for side, bank in self._tracking_banks.items()}
+
+    def hand_part_contact_facts(self):
+        """Net-link forces and SDF association do not provide exact pair forces."""
+        return None
+
+    def hand_part_contact_interval_facts(self):
+        """Exact pair-force intervals are unavailable from net-link/SDF views."""
+        return None
+
+    def physics_time_s(self):
+        """Raw scene-global SDK physics time, repeated over the clone-world axis."""
+        return torch.full(
+            (self.num_envs,), self._sim_ctx.current_time, dtype=torch.float64, device=self.device
+        )
 
     @property
     def num_envs(self) -> int:
@@ -114,21 +127,24 @@ class IsaacSceneAdapter:
         self._scene.update(dt)
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
-        for ent in self.entities.values():
-            ent.reset(env_ids)
+        # SDK resets clear persistent wrenches; adapter restoration must be last.
         self._scene.reset(env_ids)
+        entities = self.entities.values() if self._reset_entities is None else self._reset_entities
+        for ent in entities:
+            ent.reset(env_ids)
 
 
 def _robot_articulation_cfg(
-    meta: RobotMjcfMeta, self_collision: bool, pos_iters: int, vel_iters: int,
+    meta: RobotMjcfMeta, asset: IsaacRobotAsset,
+    self_collision: bool, pos_iters: int, vel_iters: int,
     contact_offset: float = 0.002, rest_offset: float = 0.0,
     max_depen: float = 5.0, max_contact_impulse: float | None = None,
 ) -> ArticulationCfg:
-    """xhand articulation: converted USD + MJCF-derived implicit PD gains."""
-    robot_usd = _robot_usd_path(meta)
+    """Explicit converted USD with MJCF-derived implicit PD gains."""
+    robot_usd = asset.usd_path
     if not robot_usd.exists():
         raise FileNotFoundError(
-            f"{robot_usd} missing — run convert_assets.py --robot"
+            f"{robot_usd} missing — run convert_assets.py --robot-config <robot-or-run.yaml>"
             + (" --collision-visual" if colvis_enabled() else "")
         )
 
@@ -234,7 +250,6 @@ def _spawn_support_disks(cfg, stage, num_envs: int, coff: float, roff: float, ma
     if not bool(sd.enable):
         return {}
     from omegaconf import open_dict
-
     from pxr import Sdf, UsdPhysics
 
     from envs.scene._support_disk_setup import support_disk_name, support_park_position
@@ -325,9 +340,8 @@ class SupportDiskAdapter:
         self._obj.reset(env_ids)
 
 
-def _apply_contact_material(stage, prim_path: str, mat_path: str) -> None:
-    """De-instance the subtree (holosoma recipe) then force-bind the material;
-    converted USDs hide colliders behind instanced references otherwise."""
+def _apply_contact_material(stage, prim_path: str, mat_path: str, collision_props=None) -> None:
+    """Make referenced colliders editable, install their selected properties/material."""
     from pxr import Usd
 
     prim = stage.GetPrimAtPath(prim_path)
@@ -341,6 +355,8 @@ def _apply_contact_material(stage, prim_path: str, mat_path: str) -> None:
         sub = stage.GetPrimAtPath(path)
         if sub:
             sub.SetInstanceable(False)
+    if collision_props is not None:
+        sim_utils.modify_collision_properties(prim_path, collision_props)
     from isaaclab.sim.utils import bind_physics_material
 
     bind_physics_material(prim_path, mat_path)
@@ -356,6 +372,9 @@ def build_isaac_scene(
 ):
     """Author + clone the scene, boot physics, wrap in adapters. assigned_obj_slot
     (B,) selects PER-ENV-OBJECT mode; None = legacy parked-slot mode."""
+    if cfg.robot.get("native_scene") is not None:
+        return _build_native_isaac_scene(cfg, sim_ctx, device, meta)
+    robot_asset = resolve_robot_asset(cfg, collision_visual=colvis_enabled())
     num_envs = int(cfg.scene.num_envs)
     per_env_mode = assigned_obj_slot is not None
     scene = InteractiveScene(
@@ -428,25 +447,30 @@ def build_isaac_scene(
     mdep = float(px.get("max_depenetration_velocity", 5.0))
     mimp = px.get("max_contact_impulse", None)
     mimp = None if mimp is None else float(mimp)
-    robot = Articulation(
-        _robot_articulation_cfg(
-            meta, bool(cfg.robot.get("self_collision", False)), pos_iters, vel_iters,
-            coff, roff, mdep, mimp,
-        )
+    robot_cfg = _robot_articulation_cfg(
+        meta, robot_asset, bool(cfg.robot.get("self_collision", False)), pos_iters, vel_iters,
+        coff, roff, mdep, mimp,
     )
-    _apply_contact_material(stage, "/World/envs/env_0/Robot", _MAT)
+    robot = Articulation(robot_cfg.replace(
+        spawn=robot_cfg.spawn.replace(collision_props=None)
+    ))
+    _apply_contact_material(
+        stage, "/World/envs/env_0/Robot", _MAT, robot_cfg.spawn.collision_props
+    )
     objects: dict[str, RigidObject] = {}
     if not per_env_mode:
         for slot, spec in enumerate(object_slots):
             park = object_park_position(slot)
-            objects[spec["entity_name"]] = RigidObject(
-                _object_rigid_cfg(
-                    spec["entity_name"], spec["usd_path"], park, pos_iters, vel_iters,
-                    float(spec.get("scale", 1.0)), coff, roff, mdep, mimp,
-                )
+            object_cfg = _object_rigid_cfg(
+                spec["entity_name"], spec["usd_path"], park, pos_iters, vel_iters,
+                float(spec.get("scale", 1.0)), coff, roff, mdep, mimp,
             )
+            objects[spec["entity_name"]] = RigidObject(object_cfg.replace(
+                spawn=object_cfg.spawn.replace(collision_props=None)
+            ))
             _apply_contact_material(
-                stage, f"/World/envs/env_0/{spec['entity_name']}", _MAT_OBJ
+                stage, f"/World/envs/env_0/{spec['entity_name']}", _MAT_OBJ,
+                object_cfg.spawn.collision_props,
             )
 
 
@@ -511,13 +535,14 @@ def build_isaac_scene(
                 )
                 c.func(
                     f"/World/envs/env_{i}/object_{side}",
-                    c,
+                    c.replace(collision_props=None),
                     translation=(0.0, 0.0, -3.0)
                     if ghost
                     else (0.0, 0.15 if side == "left" else 0.0, 0.2),
                 )
                 _apply_contact_material(
-                    stage, f"/World/envs/env_{i}/object_{side}", _MAT_OBJ
+                    stage, f"/World/envs/env_{i}/object_{side}", _MAT_OBJ,
+                    c.collision_props,
                 )
         # Verify per-env spawns landed: a reference clone would compose env_0's
         # object everywhere and the spawner would skip silently.
@@ -570,15 +595,13 @@ def build_isaac_scene(
     alllink = _alllink_bodies_by_side(cfg)
     robot_sides = [
         s for s in ("right", "left")
-        if alllink[s][0] in meta.body_names
+        if alllink[s] and alllink[s][0] in meta.body_names
     ]
     link_sensors: dict[str, list[ContactSensor]] = {}
     for side in robot_sides:
         link_sensors[side] = []
         for body in [] if _abl("NOREPORT") else alllink[side]:
-            urdf_body = body  # xhand URDF renames the palms; MJCF-named USDs keep the name
-            if not stage.GetPrimAtPath(f"/World/envs/env_0/Robot/{body}").IsValid():
-                urdf_body = _URDF_LINK_ALIAS.get(body, body)
+            urdf_body = robot_asset.body_name(body)
             s = ContactSensor(
                 ContactSensorCfg(
                     prim_path=f"/World/envs/env_.*/Robot/{urdf_body}",
@@ -610,87 +633,48 @@ def build_isaac_scene(
     )
     sim_adapter._clock = clock
 
-    robot_adapter = ArticulationAdapter(robot, meta, clock, device)
+    robot_adapter = ArticulationAdapter(
+        robot, meta, clock, device, body_name_map=robot_asset.body_name_map
+    )
     # 0.0 matches every run before the fix (resets cleared it); 0.8 is the MJCF gravcomp.
-    robot_adapter.init_gravcomp(float(cfg.sim.get("robot_gravcomp", 0.0)))
+    sim_adapter.add_gravity_compensator(robot_adapter, float(cfg.sim.get("robot_gravcomp", 0.0)))
 
-    scene_adapter = IsaacSceneAdapter(scene, device)
+    scene_adapter = IsaacSceneAdapter(scene, device, sim_ctx)
     scene_adapter._clock = clock
     scene_adapter.entities[cfg.robot.entity_name] = robot_adapter
     for name in support_views:
         scene_adapter.entities[name] = SupportDiskAdapter(objects[name], device)
 
-    # Per-slot mass properties from the COACD hulls (mjwarp compile parity);
-    # written into PhysX below so pin feedforward == true sim inertia.
+    # Optional hull-derived INSTALLATION recipe. Execution/control consumers
+    # below read the installed PhysX properties, including the default USD path.
     from pathlib import Path as _P
 
     from .sim import hull_mass_props
 
     hull_mass, hull_com, hull_I = {s: [] for s in obj_sides}, {s: [] for s in obj_sides}, {s: [] for s in obj_sides}
-    gids = {s: [] for s in obj_sides}
-    for _si, spec in enumerate(object_slots):
-        for side in _slot_sides(spec):
-            _side_slot[(_si, side)] = len(gids[side])
-            m, c, I = hull_mass_props(
-                _P(_slot_val(spec, "mesh_path", side)).parent,
-                _slot_val(spec, "scale", side) if "scale" in spec else 1.0,
-                800.0,
-            )
-            # Measured mass wins over the density estimate, clamp included.
-            _tgt = float(_slot_val(spec, "mass", side)) if "mass" in spec else 0.0
-            if _tgt > 0.0 and m > 0.0:
-                I, m = I * (_tgt / m), _tgt
-            hull_mass[side].append(m)
-            hull_com[side].append(c)
-            hull_I[side].append(I)
-            evals, evecs = np.linalg.eigh(I)
-            if np.linalg.det(evecs) < 0:
-                evecs[:, 0] = -evecs[:, 0]
-            import trimesh.transformations as _tt
-
-            T = np.eye(4)
-            T[:3, :3] = evecs
-            gids[side].append(
-                sim_adapter.model.register_body(
-                    m, np.maximum(evals, 1e-7), _tt.quaternion_from_matrix(T)
+    _hull_props = os.environ.get("FDR_HULL_PROPS", "0") == "1"
+    if _hull_props:
+        for _si, spec in enumerate(object_slots):
+            for side in _slot_sides(spec):
+                _side_slot[(_si, side)] = len(hull_mass[side])
+                m, c, I = hull_mass_props(
+                    _P(_slot_val(spec, "mesh_path", side)).parent,
+                    _slot_val(spec, "scale", side) if "scale" in spec else 1.0,
+                    800.0,
                 )
-            )
-    import os as _os0
-
-    if _os0.environ.get("FDR_HULL_PROPS", "0") == "1":
-        scene_adapter.obj_inertia_stack = {
-            s: torch.tensor(np.stack(hull_I[s]), dtype=torch.float32, device=device)
-            for s in obj_sides
-        }  # side -> (S, 3, 3)
-    else:
-        # USD-authored (visual-mesh) inertia — what PhysX actually simulates.
-        from mjlab.utils.lab_api.math import matrix_from_quat as _mfq
-
-        stacks = {}
-        for side in obj_sides:
-            mats = []
-            for spec in object_slots:
-                mesh = trimesh.load(_slot_val(spec, "mesh_path", side), force="mesh")
-                scale = _slot_val(spec, "scale", side) if "scale" in spec else 1.0
-                if scale != 1.0:
-                    mesh = mesh.copy()
-                    mesh.apply_scale(float(scale))
-                _m, _diag, _iq = principal_inertia(mesh, density=800.0)
-                _t = float(_slot_val(spec, "mass", side)) if "mass" in spec else 0.0
-                if _t > 0.0 and _m > 0.0:
-                    _diag = _diag * (_t / _m)
-                R = _mfq(torch.tensor(_iq, dtype=torch.float32).unsqueeze(0))[0]
-                mats.append(
-                    R @ torch.diag(torch.tensor(_diag, dtype=torch.float32)) @ R.T
-                )
-            stacks[side] = torch.stack(mats).to(device)
-        scene_adapter.obj_inertia_stack = stacks
+                # Measured mass wins over the density estimate, clamp included.
+                _tgt = float(_slot_val(spec, "mass", side)) if "mass" in spec else 0.0
+                if _tgt > 0.0 and m > 0.0:
+                    I, m = I * (_tgt / m), _tgt
+                hull_mass[side].append(m)
+                hull_com[side].append(c)
+                hull_I[side].append(I)
 
     def _write_hull_props(view, slot_of_row: np.ndarray, side: str) -> None:
         """Overwrite PhysX mass/com/inertia with the hull-parity values (CPU)."""
         n = len(slot_of_row)
         view.set_masses(
-            torch.tensor([hull_mass[side][s] for s in slot_of_row]), torch.arange(n)
+            torch.tensor([hull_mass[side][s] for s in slot_of_row]).reshape(n, 1), torch.arange(n)
         )
         coms = view.get_coms().clone().reshape(n, 7)
         coms[:, :3] = torch.tensor(
@@ -699,15 +683,12 @@ def build_isaac_scene(
         view.set_coms(coms.reshape(*view.get_coms().shape), torch.arange(n))
         view.set_inertias(
             torch.tensor(
-                np.stack([hull_I[side][s].reshape(9) for s in slot_of_row]),
+                np.stack([hull_I[side][s].T.reshape(9) for s in slot_of_row]),
                 dtype=torch.float32,
             ),
             torch.arange(n),
         )
 
-    import os as _os
-
-    _hull_props = _os.environ.get("FDR_HULL_PROPS", "0") == "1"
     if per_env_mode:
         scene_adapter.assigned_obj_slot = assigned_obj_slot.to(device)
         for side in obj_sides:
@@ -724,14 +705,15 @@ def build_isaac_scene(
             )
             default_state[:, 3] = 1.0
             scene_adapter.entities[name] = RigidObjectAdapter(
-                objects[name], gids[side][0], clock, device, default_state
+                objects[name], clock, device, default_state,
+                body_name=objects[name].body_names[0],
             )
     else:
         for slot_idx, spec in enumerate(object_slots):
             if _hull_props:
                 _write_hull_props(
                     objects[spec["entity_name"]].root_physx_view,
-                    np.full(num_envs, slot_idx),
+                    np.full(num_envs, _side_slot[(slot_idx, _slot_sides(spec)[0])]),
                     _slot_sides(spec)[0],
                 )
             park = object_park_position(slot_idx)
@@ -742,44 +724,252 @@ def build_isaac_scene(
             default_state[:, 3] = 1.0
             scene_adapter.entities[spec["entity_name"]] = RigidObjectAdapter(
                 objects[spec["entity_name"]],
-                gids[_slot_sides(spec)[0]][_side_slot[(slot_idx, _slot_sides(spec)[0])]],
                 clock, device,
                 default_state,
+                body_name=objects[spec["entity_name"]].body_names[0],
             )
 
-    # sensor adapters (command callback bound after command-term creation);
+    # Scene-owned views bind after complete command/reference construction.
     # one bank per hand side, each SDF-gated against its own side's object.
-    banks: dict[str, LinkContactBank] = {}
     for side in robot_sides:
         names = alllink[side]
-        bank = LinkContactBank(link_sensors[side], clock, device)
-        bank.side = side
-        bank.margins = torch.tensor(
+        margins = torch.tensor(
             [meta.body_bound.get(b, 0.03) + 0.015 for b in names],
             dtype=torch.float32, device=device,
         )
-        # fingertip rows = the links carrying contact_<side>_<finger>_tip (xhand: 3,6,8,10,12; sharpa: 3,7,11,15,20)
-        tip_sites = [meta.sites.get(f"contact_{side}_{f}_tip") for f in ("thumb", "index", "middle", "ring", "pinky")]
-        if all(t is not None and t.body_name in names for t in tip_sites):
-            bank.tip_rows = tuple(names.index(t.body_name) for t in tip_sites)
-        ids, _ = robot_adapter.find_bodies(names, preserve_order=True)
-        bank.link_pos_fn = (
-            lambda ids=tuple(ids): robot_adapter.data.body_link_pos_w[:, list(ids)]
+        bank, views = build_tracking_contact_views(
+            link_sensors[side], clock, device, side=side, body_names=names,
+            contact_site_names=cfg.robot.site_names.contact[side], metadata=meta,
+            robot=robot_adapter, margins=margins,
         )
-        p = side[0]
-        scene_adapter.sensors[f"{p}_alllink_contact"] = AlllinkContactAdapter(bank)
-        scene_adapter.sensors[f"{p}_alllink_contact_pos"] = AlllinkContactPosAdapter(bank)
-        scene_adapter.sensors[f"{p}_fingertip_contact"] = FingertipContactAdapter(bank)
-        scene_adapter.sensors[f"{p}_fingertip_penetration"] = FingertipPenetrationAdapter(
-            bank, side=side
-        )
-        banks[side] = bank
-
-    def _bind(slot_fn, cmd_fn) -> None:
-        del slot_fn  # slot attribution is SDF-side now
-        for bank in banks.values():
-            bank.command_fn = cmd_fn
-
-    scene_adapter._bind_sensor_callbacks = _bind
+        scene_adapter.sensors.update(views)
+        scene_adapter._tracking_banks[side] = bank
 
     return scene_adapter, sim_adapter, robot_adapter
+
+
+def _native_articulation_cfg(binding, meta, cfg) -> ArticulationCfg:
+    """Native scalar drives only; no PD drive is created for a passive joint."""
+    usd_path = cfg.sim.native_assets.articulations[binding.entity_name]
+    if not Path(usd_path).is_file():
+        raise FileNotFoundError(usd_path)
+    validate_native_usd(usd_path, meta)
+    driven = meta.driven_joint_names
+    actuators = {}
+    if driven:
+        actuators["native_position"] = ImplicitActuatorCfg(
+            joint_names_expr=driven,
+            stiffness={j: meta.kp_kv_for_joint(j)[0] for j in driven},
+            damping={
+                j: meta.kp_kv_for_joint(j)[1]
+                + float(meta.joint_damping[meta.joint_names.index(j)])
+                for j in driven
+            },
+            effort_limit_sim={
+                j: float(meta.actuator_effort_limit[meta.actuator_names.index(a)])
+                for a, j in meta.actuator_joint.items()
+            },
+        )
+    return ArticulationCfg(
+        prim_path=f"/World/envs/env_.*/{binding.entity_name}",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=usd_path,
+            activate_contact_sensors=True,
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=bool(cfg.robot.get("self_collision", False)),
+                solver_position_iteration_count=int(
+                    cfg.sim.physx.solver_position_iteration_count
+                ),
+                solver_velocity_iteration_count=int(
+                    cfg.sim.physx.solver_velocity_iteration_count
+                ),
+            ),
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=tuple(meta.free_roots[0].default_pose[:3]),
+            rot=tuple(meta.free_roots[0].default_pose[3:]),
+            joint_pos={
+                name: float(value)
+                for name, value in zip(meta.joint_names, meta.joint_default, strict=True)
+            },
+        ),
+        actuators=actuators,
+    )
+
+
+def _native_rigid_object_cfg(binding, meta, usd_path) -> RigidObjectCfg:
+    """The rigid family has one actual FREE body and no scalar articulation."""
+    if meta.body_names != [binding.root_body_name]:
+        raise ValueError("native rigid object requires its one declared physical body")
+    if not Path(usd_path).is_file():
+        raise FileNotFoundError(usd_path)
+    return RigidObjectCfg(
+        prim_path=f"/World/envs/env_.*/{binding.entity_name}",
+        spawn=sim_utils.UsdFileCfg(usd_path=usd_path),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=tuple(meta.free_roots[0].default_pose[:3]),
+            rot=tuple(meta.free_roots[0].default_pose[3:]),
+        ),
+    )
+
+
+def _install_native_joint_properties(asset, meta, joint_ids, device) -> None:
+    """Keep mimic drive gains zero; its intrinsic viscous term is in the USD."""
+    scalar = dict(joint_ids=joint_ids)
+    damping = meta.joint_damping.copy()
+    followers = [meta.joint_names.index(m.joint_name) for m in meta.mimics]
+    damping[followers] = 0.0
+    if followers:
+        asset.write_joint_stiffness_to_sim(
+            0.0, joint_ids=[joint_ids[i] for i in followers],
+        )
+    for joint in meta.driven_joint_names:
+        damping[meta.joint_names.index(joint)] += meta.kp_kv_for_joint(joint)[1]
+    asset.write_joint_damping_to_sim(
+        torch.as_tensor(damping, dtype=asset.data.joint_damping.dtype, device=device),
+        **scalar,
+    )
+    asset.write_joint_armature_to_sim(
+        torch.as_tensor(
+            meta.joint_armature, dtype=asset.data.joint_armature.dtype, device=device,
+        ),
+        **scalar,
+    )
+    asset.write_joint_friction_coefficient_to_sim(
+        torch.as_tensor(
+            meta.joint_frictionloss, dtype=asset.data.joint_friction_coeff.dtype, device=device,
+        ),
+        **scalar,
+    )
+
+
+def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
+    """Compose named FREE hands and one passive articulated object.
+
+    The converted assets come from the configured, already composed source
+    scene. No visual-mesh density estimate or side-based object duplication is
+    used by this path.
+    """
+    layout = NativeSceneCfg.from_mapping(cfg.robot.native_scene)
+    scene = InteractiveScene(
+        InteractiveSceneCfg(
+            num_envs=int(cfg.scene.num_envs),
+            env_spacing=float(cfg.scene.env_spacing),
+        )
+    )
+    static_cfg = sim_utils.UsdFileCfg(usd_path=cfg.sim.native_assets.static)
+    static_cfg.func("/World/envs/env_0/NativeStatic", static_cfg)
+    sim_utils.DomeLightCfg(intensity=2000.0).func(
+        "/World/Light", sim_utils.DomeLightCfg(intensity=2000.0)
+    )
+    assets, metadata, rigid = {}, {}, set()
+    for binding in layout.articulations:
+        meta = scene_meta.subtree(binding.root_body_name)
+        if (
+            len(meta.free_roots) != 1
+            or meta.free_roots[0].name != binding.root_joint_name
+        ):
+            raise ValueError(f"wrong FREE root for {binding.entity_name!r}")
+        metadata[binding.entity_name] = meta
+        if binding in layout.objects and meta.actuator_names:
+            raise ValueError("native object articulation must remain passive")
+        if binding in layout.objects and not meta.joint_names:
+            assets[binding.entity_name] = RigidObject(_native_rigid_object_cfg(binding, meta, cfg.sim.native_assets.articulations[binding.entity_name]))
+            rigid.add(binding.entity_name)
+        else:
+            assets[binding.entity_name] = Articulation(
+                _native_articulation_cfg(binding, meta, cfg)
+            )
+    from pxr import UsdPhysics
+
+    contacts = {}
+    for hand in layout.hands:
+        asset_path = assets[hand.entity_name].cfg.prim_path
+        entity_path = next(
+            path
+            for path in sim_utils.find_matching_prim_paths(asset_path, stage=scene.stage)
+            if path.startswith(f"{scene.env_prim_paths[0]}/")
+        )
+        bodies = {
+            prim.GetName(): prim
+            for prim in sim_utils.get_all_matching_child_prims(
+                entity_path,
+                predicate=lambda prim: prim.HasAPI(UsdPhysics.RigidBodyAPI),
+                stage=scene.stage,
+            )
+        }
+        for body in cfg.robot.contact_links[hand.side]:
+            metadata[hand.entity_name].body_names.index(body)
+            relative_path = str(bodies[body].GetPath()).removeprefix(entity_path)
+            contacts[body] = ContactSensor(
+                ContactSensorCfg(
+                    prim_path=f"{asset_path}{relative_path}",
+                    update_period=0.0,
+                )
+            )
+    scene.clone_environments(copy_from_source=False)
+    scene.filter_collisions(global_prim_paths=[])
+    for name, asset in assets.items():
+        (scene.rigid_objects if name in rigid else scene.articulations)[name] = asset
+    for name, sensor in contacts.items():
+        scene.sensors[f"_native_contact_{name}"] = sensor
+    sim_ctx.reset()
+    scene.update(0.0)
+    clock = _FreshnessClock()
+    sim = IsaacSimAdapter(sim_ctx, device, render=not bool(cfg.get("headless", True)))
+    sim._clock = clock
+    adapter = IsaacSceneAdapter(scene, device, sim_ctx)
+    adapter._clock = clock
+    adapter.native_layout = layout
+    hands = {}
+    for binding in layout.articulations:
+        meta = metadata[binding.entity_name]
+        asset = assets[binding.entity_name]
+        if binding.entity_name in rigid:
+            default = torch.zeros(asset.num_instances, 13, device=device)
+            default[:, :7] = torch.as_tensor(meta.free_roots[0].default_pose, device=device)
+            ent = RigidObjectAdapter(
+                asset, clock, device, default, body_name=binding.root_body_name,
+            )
+            adapter.entities[binding.entity_name] = ent
+            continue
+        ent = FreeArticulationAdapter(
+            asset,
+            meta,
+            clock,
+            device,
+            root_body_name=binding.root_body_name,
+        )
+        _install_native_joint_properties(
+            asset, meta, ent._isaac_joint_ids.tolist(), device,
+        )
+        adapter.entities[binding.entity_name] = ent
+        if binding in layout.hands:
+            hands[binding.side] = ent
+    robot = NativeRobotAdapter(hands, scene_meta=scene_meta, clock=clock, device=device)
+    adapter.entities[cfg.robot.entity_name] = robot
+    adapter._reset_entities = [
+        adapter.entities[b.entity_name] for b in layout.articulations
+    ]
+    # Exact named parts are available to the public recorder; they are bodies
+    # of their actual configured articulations, never duplicated hand aliases.
+    adapter.object_parts = {
+        f"{obj.entity_name}/{p.name}": {"entity_name": obj.entity_name, "body_name": p.body_name}
+        for obj, p in layout.part_bindings
+    }
+    for hand in layout.hands:
+        names = list(cfg.robot.contact_links[hand.side])
+        margins = torch.tensor(
+            [scene_meta.body_bound[n] + 0.015 for n in names],
+            device=device,
+        )
+        bank, views = build_tracking_contact_views(
+            [contacts[n] for n in names], clock, device, side=hand.side,
+            body_names=names, contact_site_names=cfg.robot.site_names.contact[hand.side],
+            metadata=scene_meta, robot=robot, margins=margins,
+        )
+        adapter.sensors.update(views)
+        adapter._tracking_banks[hand.side] = bank
+    # TODO(Isaac gate): qualify constraint response and installed collision,
+    # filter, material and inertia facts; USD admission does not prove parity.
+    return adapter, sim, robot

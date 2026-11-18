@@ -1,5 +1,5 @@
 """Env builders: pure per-manager ``cfg -> manager dict`` functions (rewards/obs/commands/...);
-``create_envs`` assembles the Isaac train/eval envs from a Hydra cfg."""
+``create_envs`` assembles the selected train/eval envs from a Hydra cfg."""
 
 from __future__ import annotations
 
@@ -22,12 +22,26 @@ from .terminations import build_terminations  # noqa: E402
 
 __all__ = [
     "build_actions", "build_commands", "build_curriculum", "build_events",
-    "build_observations", "build_rewards", "build_terminations", "create_envs",
+    "build_observations", "build_rewards", "build_terminations", "build_manager_cfgs", "create_envs",
 ]
 
 
 def create_envs(cfg: Any, device: str = "cuda"):
-    """(train_env, eval_env) on the Isaac backend (simulator/isaacsim/create.py)."""
-    from simulator.isaacsim.create import create_envs_isaac
+    """Build the selected simulator without importing other engines."""
+    from hydra.utils import get_method
 
-    return create_envs_isaac(cfg, device=device)
+    return get_method(cfg.sim._target_)(cfg, device=device)
+
+
+def build_manager_cfgs(cfg) -> dict:
+    """One task recipe, reused by every scene/simulator implementation."""
+    entity_name, command_name = cfg.robot.entity_name, cfg.commands.name
+    return dict(
+        observations=build_observations(cfg.obs, command_name=command_name, entity_name=entity_name),
+        rewards=build_rewards(cfg.rewards, command_name=command_name, entity_name=entity_name),
+        commands=build_commands(cfg.commands),
+        actions=build_actions(cfg.actions),
+        terminations=build_terminations(cfg.terminations, command_name=command_name, entity_name=entity_name),
+        curriculum=build_curriculum(cfg.curriculum, command_name=command_name, entity_name=entity_name),
+        events=build_events(cfg.events),
+    )

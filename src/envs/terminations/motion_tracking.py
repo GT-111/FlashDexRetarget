@@ -106,6 +106,7 @@ class MotionTrackingTerminations(BaseTerminations):
     @staticmethod
     def task_reward_early_reset(
         env: ManagerBasedRlEnv,
+        command_name: str,
         task_term: str | list[str],
         threshold: float,
         interval: int,
@@ -115,7 +116,7 @@ class MotionTrackingTerminations(BaseTerminations):
             return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
         rm = env.reward_manager
-        cmd = env.command_manager.get_term("motion")
+        cmd = env.command_manager.get_term(command_name)
         
         if getattr(env, "_task_rew_idx", None) is None:
             names = list(rm.active_terms)

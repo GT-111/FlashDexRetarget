@@ -250,8 +250,8 @@ def _parked_spec_fn(
 def expand_multi_object_sensors(
     items: Any, entities: dict[str, EntityCfg], motion_cfg: Any = None
 ) -> Any:
-    """Rewire object-bound contact sensors: "raw" (default) drops them for the
-    raw-contact reader, "native" clones per slot."""
+    """Rewire object-bound contact sensors: "raw" drops them; "native" clones
+    each configured sensor per object slot."""
     if not items:
         return items
     mode = "raw"
@@ -268,7 +268,6 @@ def expand_multi_object_sensors(
         swap_entity = f"object_{swap_entity}"
 
     out = []
-    raw_specs: list[dict] = []
     changed = False
     for s in items:
         secondary = s.get("secondary") if hasattr(s, "get") else None
@@ -284,18 +283,6 @@ def expand_multi_object_sensors(
             continue
         changed = True
         if mode == "raw":
-            pattern = s.primary.pattern
-            names = [pattern] if isinstance(pattern, str) else list(pattern)
-            raw_specs.append(
-                {
-                    "name": str(s.name),
-                    "primary_mode": str(s.primary.mode),
-                    "primary_names": names,
-                    "primary_entity": str(s.primary.entity),
-                    "fields": [str(f) for f in s.get("fields", ("found", "force"))],
-                    "reduce": str(s.get("reduce", "maxforce")),
-                }
-            )
             continue  # drop the native sensor cfg
         for slot, entity_name in enumerate(slot_names):
             c = OmegaConf.create(
@@ -310,10 +297,4 @@ def expand_multi_object_sensors(
             if isinstance(c.secondary.get("pattern"), str):
                 c.secondary.pattern = f"{c.secondary.pattern}_{slot}"
             out.append(c)
-
-    if raw_specs and motion_cfg is not None:
-        from omegaconf import open_dict
-
-        with open_dict(motion_cfg.object):
-            motion_cfg.object.raw_sensor_specs = raw_specs
     return out if changed else items

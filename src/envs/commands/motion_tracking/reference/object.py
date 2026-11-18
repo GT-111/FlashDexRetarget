@@ -11,8 +11,6 @@ from mjlab.utils.lab_api.math import quat_from_matrix
 from utils.sdf import bake_object_sdf_grid as _bake_object_sdf_grid
 
 if TYPE_CHECKING:
-    from mjlab.entity import Entity
-
     from ..motion_tracking_cfg import MotionTrackingCommandCfg
 
 
@@ -70,14 +68,9 @@ class ObjectPropertiesMixin:
         gather is slot-count-proportional, so the result is cached per step."""
         names = self.obj_entity_names(side)
         if len(names) == 1:
-            obj: Entity = self._env.scene[names[0]]
-            out = getattr(obj.data, attr)[:, self._obj_mass_body_idx(obj)]
-            alias = self._obj_alias_to_right(side)
-            if alias is not None:  # mixed pair pt: shared envs read the right entity
-                robj: Entity = self._env.scene[self.obj_entity_names("right")[0]]
-                rout = getattr(robj.data, attr)[:, self._obj_mass_body_idx(robj)]
-                out = torch.where(alias.view(-1, *([1] * (out.dim() - 1))), rout, out)
-            return out
+            return self._active_object_field(
+                side, lambda obj: getattr(obj.data, attr)[:, self._obj_mass_body_idx(obj)],
+            )
 
         token = self._sim_obj_cache_token()
         cache = getattr(self, "_sim_obj_cache", None)
@@ -90,16 +83,31 @@ class ObjectPropertiesMixin:
         if hit is not None:
             return hit
 
-        parts = []
-        for name in names:
-            obj = self._env.scene[name]
-            parts.append(getattr(obj.data, attr)[:, self._obj_mass_body_idx(obj)])
-        stacked = torch.stack(parts, dim=1)  # (B, S, ...)
-        slot = self.active_obj_slot(side)
-        rows = torch.arange(slot.shape[0], device=slot.device)
-        gathered = stacked[rows, slot]
+        gathered = self._active_object_field(
+            side, lambda obj: getattr(obj.data, attr)[:, self._obj_mass_body_idx(obj)],
+        )
         cache[key] = gathered
         return gathered
+
+    def _active_object_field(self, side, read_entity):
+        """Select the same world/slot/shared alias for state and installed dynamics."""
+        names = self.obj_entity_names(side)
+        if len(names) == 1:
+            out = read_entity(self._env.scene[names[0]])
+        else:
+            stacked = torch.stack([read_entity(self._env.scene[name]) for name in names], 1)
+            slot = self.active_obj_slot(side)
+            out = stacked[torch.arange(self.num_envs, device=self.device), slot]
+        alias = self._obj_alias_to_right(side)
+        if alias is not None:
+            other = self._active_object_field("right", read_entity)
+            out = torch.where(alias.view(-1, *([1] * (out.dim() - 1))), other, out)
+        return out
+
+    def _obj_inertial_property(self, side, field):
+        return self._active_object_field(
+            side, lambda obj: getattr(obj.body_inertial_properties(), field)[:, self._obj_mass_body_idx(obj)],
+        )
 
     # --- Reference object trajectory ---
 
@@ -153,8 +161,8 @@ class ObjectPropertiesMixin:
     # --- Sim object state ---
 
     def _obj_mass_body_idx(self, obj) -> int:
-        """Index of the body that carries mass/geoms within the entity's body_ids."""
-        return len(obj.indexing.body_ids) - 1
+        """Actual named root in this entity's local body-state/property order."""
+        return obj.body_names.index(obj.root_body_name)
 
     @property
     def sim_obj_trans_w(self) -> torch.Tensor:
