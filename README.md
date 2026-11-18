@@ -249,6 +249,27 @@ bash scripts/setup.sh --profile mjwarp
 bash scripts/setup.sh --profile newton --dexforge-root /path/to/DexForge
 ```
 
+To reproduce a qualified native dependency closure or select a built dependency
+artifact, use a separately named environment. The lock contains all noneditable
+third-party requirements; it is installed with `--no-deps`. Public project and
+FlashSAC sources still come from this selected checkout and the explicit
+`--dexforge-root`, rather than an editable workspace captured in the lock.
+Each `--package-wheel` is installed as a whole package with `--no-deps`; record
+its normal source/build publication alongside the profile. Default setup keeps
+the existing native requirements and resolver behavior.
+
+```sh
+bash scripts/setup.sh --profile newton --env selected-native-profile \
+    --dexforge-root /path/to/selected-public-source \
+    --requirements-lock /path/to/qualified-third-party-lock.txt \
+    --package-wheel /path/to/published-dependency.whl
+```
+
+Use the lock's owning package indexes through pip's normal index configuration.
+Keep the existing environment and its cache paths unchanged while qualifying
+the new profile. Runtime and checkpoint qualification remain separate from
+installation. These artifact inputs apply to the native profiles.
+
 The native profile pins WandB `0.28.0` for Python 3.12. The author Python 3.11
 freeze retains WandB `0.15.12`; installing that older pin in native pulls
 `pathtools`, whose build imports the removed Python `imp` module. Resolve the

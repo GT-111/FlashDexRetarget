@@ -9,12 +9,14 @@ DEXFORGE_ROOT=""
 NATIVE_SCENE_CONFIG=""
 ROBOT_CONFIGS=()
 SKIP_ASSETS=0
+REQUIREMENTS_LOCK=""
+PACKAGE_WHEELS=()
 
 usage() {
     cat <<EOF
 Usage: bash scripts/setup.sh [--profile isaac|mjwarp|newton] [--env NAME]
        [--robot-config YAML ... | --native-scene-config YAML] [--skip_assets]
-       [--dexforge-root PATH]
+       [--dexforge-root PATH] [--requirements-lock FILE] [--package-wheel FILE ...]
 
   --profile             isaac (Python 3.11, default) or native mjwarp/newton (3.12)
   --env NAME            conda env (default: FlashDexRetarget or FlashDexRetargetNative)
@@ -22,6 +24,8 @@ Usage: bash scripts/setup.sh [--profile isaac|mjwarp|newton] [--env NAME]
   --native-scene-config YAML  resolved native Isaac scene to convert
   --skip_assets         skip Isaac asset conversion
   --dexforge-root PATH  required for Newton's public DexForge core/tracking packages
+  --requirements-lock FILE  native-only complete third-party closure; install --no-deps
+  --package-wheel FILE  native-only whole dependency wheel; repeat for several artifacts
 EOF
 }
 while [[ $# -gt 0 ]]; do
@@ -33,6 +37,8 @@ while [[ $# -gt 0 ]]; do
         --native-scene-config) NATIVE_SCENE_CONFIG="${2:?--native-scene-config requires a path}"; shift 2 ;;
         --dexforge-root) DEXFORGE_ROOT="${2:?--dexforge-root requires a path}"; shift 2 ;;
         --skip_assets) SKIP_ASSETS=1; shift ;;
+        --requirements-lock) REQUIREMENTS_LOCK="${2:?--requirements-lock requires a path}"; shift 2 ;;
+        --package-wheel) PACKAGE_WHEELS+=("${2:?--package-wheel requires a path}"); shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "[setup] unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -54,6 +60,19 @@ case "$PROFILE" in
         ;;
     *) echo "[setup] unknown profile: $PROFILE" >&2; exit 1 ;;
 esac
+if [[ "$PROFILE" == isaac && ( -n "$REQUIREMENTS_LOCK" || ${#PACKAGE_WHEELS[@]} -gt 0 ) ]]; then
+    echo '[setup] --requirements-lock and --package-wheel require a native profile' >&2
+    exit 1
+fi
+if [[ -n "$REQUIREMENTS_LOCK" ]]; then
+    [[ -f "$REQUIREMENTS_LOCK" ]] || { echo "[setup] missing requirements lock: $REQUIREMENTS_LOCK" >&2; exit 1; }
+    REQUIREMENTS_LOCK="$(cd "$(dirname "$REQUIREMENTS_LOCK")" && pwd)/$(basename "$REQUIREMENTS_LOCK")"
+fi
+for index in "${!PACKAGE_WHEELS[@]}"; do
+    wheel="${PACKAGE_WHEELS[$index]}"
+    [[ -f "$wheel" ]] || { echo "[setup] missing package wheel: $wheel" >&2; exit 1; }
+    PACKAGE_WHEELS[$index]="$(cd "$(dirname "$wheel")" && pwd)/$(basename "$wheel")"
+done
 if [[ -n "$NATIVE_SCENE_CONFIG" && ${#ROBOT_CONFIGS[@]} -gt 0 ]]; then
     echo "[setup] select stock robot configs or one resolved native scene" >&2
     exit 1
@@ -108,11 +127,17 @@ if [[ "$PROFILE" == isaac ]]; then
         --extra-index-url https://pypi.nvidia.com
     pip install --no-deps rsl-rl-lib==5.5.1 tensordict==0.13.0 pyvers==0.2.2
     pip install --no-deps coacd==1.0.10 cuacd==0.1.0 smplx==0.1.28
+elif [[ -n "$REQUIREMENTS_LOCK" ]]; then
+    # The selected lock already contains the complete third-party closure.
+    pip install --no-deps -r "$REQUIREMENTS_LOCK"
 else
     # The separate pinned set may resolve its dependencies only in this native env.
     pip install --prefer-binary -r requirements/native_cu128.txt \
         --extra-index-url https://download.pytorch.org/whl/cu128
 fi
+for wheel in "${PACKAGE_WHEELS[@]}"; do
+    pip install --no-deps --force-reinstall "$wheel"
+done
 pip install --no-deps -e third_party/rsl_rl_flashsac
 pip install --no-deps -e .
 if [[ "$PROFILE" == newton ]]; then

@@ -126,6 +126,51 @@ elif name == "python" and "load_robot_asset" in body:
                 self.assertTrue((self.repo / "env/native.sh").exists())
                 self.assertFalse((self.repo / "scripts/env.sh").exists())
 
+    def test_native_lock_and_whole_wheel_preserve_named_environment(self):
+        lock = self.root / "qualified third party lock.txt"
+        lock.write_text("numpy==1.26.4\nwarp-lang==1.17.0\n")
+        wheels = [self.root / "first dependency.whl", self.root / "second dependency.whl"]
+        for wheel in wheels:
+            wheel.touch()
+        result = self.invoke("setup.sh", "--profile", "newton", "--env", "separate-native-profile",
+                             "--dexforge-root", self.public_source(), "--requirements-lock", lock,
+                             "--package-wheel", wheels[0], "--package-wheel", wheels[1])
+        self.assert_success(result)
+        events = self.events()
+        installs = [event for event in events if event["command"] == "pip"]
+        locked = [event for event in installs if "requirements" in event]
+        self.assertEqual(len(locked), 1)
+        self.assertEqual(locked[0]["args"], ["install", "--no-deps", "-r", str(lock)])
+        self.assertEqual(locked[0]["requirements"], lock.read_text())
+        artifact_calls = [event for event in installs if "--force-reinstall" in event["args"]]
+        self.assertEqual([event["args"] for event in artifact_calls],
+                         [["install", "--no-deps", "--force-reinstall", str(wheel)] for wheel in wheels])
+        self.assertTrue(all(event["active_env"] == "separate-native-profile" for event in installs))
+        self.assertTrue(all(event["pythonpath"] is None for event in installs))
+        self.assertFalse(any("native_cu128.txt" in event["args"] for event in installs))
+        local = [event for event in installs if "-e" in event["args"]]
+        self.assertTrue(all("--no-deps" in event["args"] for event in local))
+        self.assertIn("separate-native-profile", (self.repo / "env/native.sh").read_text())
+
+    def test_isaac_rejects_native_dependency_artifacts_before_mutation(self):
+        artifact = self.root / "selected artifact"
+        artifact.touch()
+        for option in ("--requirements-lock", "--package-wheel"):
+            with self.subTest(option=option):
+                result = self.invoke("setup.sh", "--profile", "isaac", option, artifact, python="3.11")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("require a native profile", result.stderr)
+                self.assertEqual(self.events(), [])
+
+    def test_native_missing_dependency_artifact_is_rejected_before_mutation(self):
+        for option, message in (("--requirements-lock", "missing requirements lock"),
+                                ("--package-wheel", "missing package wheel")):
+            with self.subTest(option=option):
+                result = self.invoke("setup.sh", "--profile", "mjwarp", option, self.root / "missing file")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(self.events(), [])
+
     def test_isaac_converts_selected_stock_or_native_config(self):
         configs = [self.root / "renamed hand.yaml", self.root / "another hand.yaml"]
         for config in configs:
