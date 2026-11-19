@@ -206,6 +206,8 @@ author-stack dependency list does not resolve or replace the native runtime.
 installed engine versions and physical qualification come from the selected
 runtime receipt; that file does not establish them or authorize environment
 replacement. Setup selects the isolated author or native environment explicitly.
+Newton's recorded backend identity includes the installed Newton, MuJoCo,
+MuJoCo Warp and Warp package versions.
 
 ## Setup
 

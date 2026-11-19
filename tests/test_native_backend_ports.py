@@ -197,9 +197,14 @@ def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_
     backend.step_torch.side_effect = step
     backend.get_body_pair_contact_facts.return_value = facts
     hand, part = [model.body(name).id for name in ("left_root", "base")]
-    with patch("dexforge_tracking.envs.backend.create_backend", return_value=backend) as factory:
+    installed_versions = {"newton": "1.4.1", "mujoco": "3.10.1", "mujoco-warp": "3.10.4", "warp-lang": "1.10.3"}
+    with (
+        patch("dexforge_tracking.envs.backend.create_backend", return_value=backend) as factory,
+        patch("importlib.metadata.version", side_effect=installed_versions.__getitem__),
+    ):
         plant = NewtonPlant(scene_xml_path=layout.scene_xml_path, num_envs=2, sim_dt=.005,
                             device="cpu", contact_pairs={"left/base": ([hand], [part])})
+    assert plant.identity["engine_versions"] == installed_versions
     args, kwargs = factory.call_args
     assert args[0] == "newton" and isinstance(args[1], NativeSceneSpec)
     assert args[1].model_file == layout.scene_xml_path and args[1].collision_generation is None

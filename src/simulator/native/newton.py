@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from importlib import metadata
+
 import numpy as np
 import torch
 
@@ -35,6 +37,10 @@ class NewtonPlant(NativePlant):
             "backend": "newton", "solver": "SolverMuJoCo",
             "contact_generation": collision_generation,
             "native_engine": "installed_dexforge_tracking",
+            "engine_versions": {
+                package: metadata.version(package)
+                for package in ("newton", "mujoco", "mujoco-warp", "warp-lang")
+            },
             "scene_xml_path": scene_xml_path, "sim_dt_s": float(sim_dt),
         }
         self._bind_execution_clock(float(sim_dt))
