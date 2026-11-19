@@ -585,6 +585,16 @@ def test_warmup_stop_request_commits_without_update(monkeypatch, tmp_path):
     assert (tmp_path / "stop2" / "stop.request").read_text() == "stop during warmup\n"
 
 
+def test_native_hoi_with_disabled_training_eval_finishes_without_a_second_evaluator(monkeypatch, tmp_path):
+    runner, events = _stop_loop(tmp_path, monkeypatch)
+    runner._hoi_curriculum = SimpleNamespace(hoi_zero_receipt=lambda: None)
+    runner._started_at_hoi_zero = False
+    runner._eval_stride = 0
+    runner._finish = lambda: events.append(("finish", runner._final_step))
+    runner.learn(1)
+    assert events == ["collect", ("finish", 2)]
+
+
 def test_stop_save_failure_preserves_request_and_no_committed_checkpoint(
     monkeypatch, capsys, tmp_path,
 ):

@@ -479,6 +479,8 @@ robot configs (`config/envs/robot/{inspire_rh56f1,inspire_rh56dftp,wuji_hand,sha
 Pairing `envs/simulator@simulator=newton` with CoACD convex hulls capped at `<= 16` hulls and `<= 32` vertices/hull runs
 native `SolverMuJoCo` contacts. `NativeRolloutRecord` measures the post-solve force and torque peaks
 over each supported interval from `mjw_data.xfrc_applied`.
+Set `eval.interval=0` for an HOI training run whose exact-zero FULL checkpoint
+will be evaluated separately in nominal and perturbed modes.
 
 ## Project Structure
 

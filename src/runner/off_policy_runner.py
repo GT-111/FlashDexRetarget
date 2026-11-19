@@ -234,7 +234,7 @@ class OffPolicyRunner:
 
         final_step = env_step if solved_stop else (self._step_offset + n_steps * n_envs)
         # An all-solved stop has just evaluated and exported, so it skips the final sweep.
-        if self._eval_supported() and not solved_stop:
+        if not solved_stop and (self._hoi_curriculum is None or self._eval_stride > 0) and self._eval_supported():
             log_metrics({**self._run_eval(final_step), **self._cost_metrics(final_step)}, step=final_step)
         if self._stop_if_requested(final_step):
             return
