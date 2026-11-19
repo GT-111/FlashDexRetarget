@@ -216,12 +216,10 @@ class NativeRolloutRecord(RolloutRecord):
             native_provenance = getattr(self.cmd.motion_lib, "native_reference_provenance", None)
             if native_provenance is not None:
                 provenance = native_provenance[index]
-                # Prepared native references own placement separately from their
-                # canonical source mapping; neither is an achieved-state claim.
+                placement = clip["processing"]["scene_from_source_world"]
                 matches = (lineage == clip and provenance.get("source") == clip
                     and provenance.get("authority") == "requested_reference_not_achieved_state"
-                    and np.array_equal(provenance.get("scene_from_source_world"),
-                                       self.binding["scene_from_source_world"]))
+                    and np.array_equal(provenance.get("scene_from_source_world"), placement))
             else:
                 matches = (lineage.get("capture_id") == clip["source_unit_id"]
                     and np.array_equal(lineage["selected_source_frame_index"], clip["selected_source_frame_index"])

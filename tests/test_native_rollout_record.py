@@ -52,10 +52,14 @@ def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, se
     name, source = next(iter(binding["clips"].items()))
     library.motion_files = ["synthetic#" + name]
     if native:
+        binding = dict(binding)
+        placement = binding.pop("scene_from_source_world")
+        source = {**source, "processing": {**source["processing"], "scene_from_source_world": placement}}
+        binding["clips"] = {name: source}
         library.source_lineage = [dict(source)]
         library.native_reference_provenance = [dict(
             authority="requested_reference_not_achieved_state", source=dict(source),
-            scene_from_source_world=binding["scene_from_source_world"])]
+            scene_from_source_world=placement)]
     else:
         library.source_lineage = [{"capture_id": source["source_unit_id"],
             "selected_source_frame_index": source["selected_source_frame_index"],
@@ -341,6 +345,7 @@ def _prepared_native_recorder_fixture(tmp_path, *, hand_sides=("left", "right"),
         processing={"fixture": "recorder software admission, not physical execution"})
     placement = np.eye(4)
     placement[:3, 3] = (1., -2., .3)
+    source["processing"]["scene_from_source_world"] = placement.tolist()
     native = clip["native_reference"]
     physical_joints = {"left": ("left_a", "left_mimic"), "right": ("right_b",)}
     joint_names = tuple(name for side in ("left", "right") if side in hand_sides
@@ -397,8 +402,7 @@ def _prepared_native_recorder_fixture(tmp_path, *, hand_sides=("left", "right"),
     env = SimpleNamespace(step_dt=.02, num_envs=1, scene=scene,
         action_manager=SimpleNamespace(action=torch.zeros(1, len(joint_names)), active_terms=[]),
         command_manager=SimpleNamespace(get_term=lambda name: command))
-    binding = dict(scene_from_source_world=placement.tolist(),
-        hands={"left": dict(body_name="left_root", physical_joint_names={"driver": "left_a", "mimic": "left_mimic"}),
+    binding = dict(hands={"left": dict(body_name="left_root", physical_joint_names={"driver": "left_a", "mimic": "left_mimic"}),
                "right": dict(body_name="right_root", physical_joint_names={"driver": "right_b"})},
         object_part_names=["lid", "base"], object_parts={name: dict(entity_name="articulated_object", body_name=name)
             for name in ("lid", "base")}, clips={"synthetic-stage": source})
@@ -457,6 +461,37 @@ def test_prepared_native_input_pack_library_recorder_keeps_canonical_source_and_
     arrays = recorder.rollout_arrays([recorder.collect_state()], 0)
     np.testing.assert_array_equal(arrays["recorded_motion_steps"], [0])
     assert json.loads(str(arrays["native_binding_json"])) == binding
+
+
+def test_native_recorder_selects_clip_placement_within_a_shared_scene(tmp_path):
+    env, binding = _prepared_native_recorder_fixture(tmp_path)
+    command = env.command_manager.get_term("motion")
+    library = command.motion_lib
+    first = binding["clips"]["synthetic-stage"]
+    placement = np.eye(4)
+    placement[:3, 3] = (-0.2, 0.4, 0.8)
+    second = {**first, "source_unit_id": "second-fixture",
+              "processing": {**first["processing"], "scene_from_source_world": placement.tolist()}}
+    binding["clips"]["second-stage"] = second
+    library.motion_files.append("motion.pt#second-stage")
+    library._motion_num_frames = library._motion_num_frames.repeat(2)
+    library.source_lineage.append(second)
+    library.source_query_ordinal.append(library.source_query_ordinal[0])
+    library.source_import_elapsed_ns.append(library.source_import_elapsed_ns[0])
+    library.native_reference_provenance.append({
+        **library.native_reference_provenance[0], "source": second,
+        "scene_from_source_world": placement.tolist(),
+    })
+    command.motion_ids[:] = 1
+    command.reference_phase["motion_ids"][:] = 1
+
+    recorder = NativeRolloutRecord(binding=binding)
+    recorder.on_start(env)
+    arrays = recorder.rollout_arrays([recorder.collect_state()], 0)
+    recorded = json.loads(str(arrays["native_binding_json"]))
+    assert "scene_from_source_world" not in recorded
+    assert int(arrays["motion_id"]) == 1
+    assert recorded["clips"] == {"second-stage": second}
 
 
 @pytest.mark.parametrize("mismatch", ["source", "placement", "authority"])

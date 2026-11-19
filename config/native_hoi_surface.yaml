@@ -138,12 +138,12 @@ rewards:
   reward_weights:
     native_object_part_pose: 0.5
     native_part_surface_displacement: 1.0
-    native_object_articulation: 0.3
+    native_object_articulation: 0.8
     native_source_hand_part_contact: 0.5
     native_source_tip_object_bound: 0.25
     native_source_tip_position: 0.2
     native_root_pose: 0.3
-    native_command_bc: 0.2
+    native_command_bc: 0.35
     native_contact_overload: -0.15
     action_penalty: -0.003
     termination_penalty: -50.0
