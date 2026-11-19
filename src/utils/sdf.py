@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import pickle
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -70,9 +72,22 @@ def bake_object_sdf_grid(mesh_path: str, mesh_scale: float, extent: float, N: in
     """(4, N, N, N) grid over [-extent, extent]^3 in the object frame: signed distance (negative inside)
     and its gradient, cached in <mesh dir>/.sdf_cache/; built on bake_device (default: device)."""
     cache_file = _cache_path(mesh_path, extent, N, mesh_scale)
-    if cache_file.exists():
-        return torch.load(cache_file, map_location=device, weights_only=True).to(device=device, dtype=torch.float32)
-    grid = _build_object_sdf(_preprocess_mesh(mesh_path, mesh_scale), extent, N, str(bake_device or device))
+    try:
+        grid = torch.load(cache_file, map_location="cpu", weights_only=True)
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+        pass
+    except RuntimeError as error:
+        if not str(error).startswith("PytorchStreamReader failed reading "):
+            raise
+    else:
+        return grid.to(device=device, dtype=torch.float32)
+
+    grid = torch.from_numpy(_build_object_sdf(
+        _preprocess_mesh(mesh_path, mesh_scale), extent, N, str(bake_device or device),
+    ))
     cache_file.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(torch.from_numpy(grid), cache_file)
-    return torch.from_numpy(grid).to(device=device, dtype=torch.float32)
+    with TemporaryDirectory(dir=cache_file.parent, prefix=".sdf-") as staging:
+        temporary = Path(staging) / cache_file.name
+        torch.save(grid, temporary)
+        temporary.replace(cache_file)
+    return grid.to(device=device, dtype=torch.float32)
