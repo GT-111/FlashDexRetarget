@@ -1844,12 +1844,16 @@ def test_source_approach_rewards_two_digit_groups_on_the_same_supported_part():
     distances[0, finger, 1] = .005
     support = geometry["live_part_query_support"]
     support.fill_(True)
+    desired = geometry["desired_part_distance_m"]
+    desired.fill_(.09)
+    desired[0, [thumb, finger]] = .004
+    geometry["desired_part_query_support"].fill_(True)
 
     proximity = NativeMotionTrackingRewards.native_source_hand_part_proximity
     contact = NativeMotionTrackingRewards.native_source_hand_part_contact
-    approach = dict(distance_scale_m=.04, require_thumb_opposition=True)
-    solved = dict(force_scale_n=.5, separation_bound_m=.02, require_thumb_opposition=True,
-                  opposition_distance_m=.02, non_opposed_scale=.15)
+    approach = dict(distance_scale_m=.04, source_digit_distance_m=.042)
+    solved = dict(force_scale_n=.5, separation_bound_m=.02, source_digit_distance_m=.042,
+                  digit_contact_distance_m=.02, unmatched_digit_scale=.15)
     assert proximity(env, "motion", **approach).item() == pytest.approx(math.exp(-.09 / .04))
     assert contact(env, "motion", **solved).item() == pytest.approx(.875 * .15)
 
@@ -1863,6 +1867,16 @@ def test_source_approach_rewards_two_digit_groups_on_the_same_supported_part():
     support[0, finger, 0] = False
     assert proximity(env, "motion", **approach).item() == pytest.approx(math.exp(-.09 / .04))
     assert contact(env, "motion", **solved).item() == pytest.approx(.875 * .15)
+    # A source push only asks for its represented digit group on that part.
+    command.motion_lib.native_source_hand_part_intent["active"][1, 0, 1] = False
+    support[0, finger, 0] = True
+    desired[0, thumb, 0] = distances[0, thumb, 0] = .09
+    assert proximity(env, "motion", **approach).item() == pytest.approx(math.exp(-.015 / .04))
+    assert contact(env, "motion", **solved).item() == pytest.approx(.875)
+    geometry["desired_part_query_support"][0, thumb, 0] = False
+    assert proximity(env, "motion", **approach).item() == 0.0
+    assert contact(env, "motion", **solved).item() == 0.0
+    geometry["desired_part_query_support"][0, thumb, 0] = True
     support.zero_()
     assert proximity(env, "motion", **approach).item() == 0.0
 

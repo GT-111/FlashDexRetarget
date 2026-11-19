@@ -63,7 +63,8 @@ def test_six_hand_hoi_surface_hydra_configs_compose(robot_cfg: str, tmp_path: Pa
         assert list(cfg.robot.site_names.contact[hand["side"]]) == hand["tip_site_names"]
 
     assert cfg.rewards.reward_weights.native_source_hand_part_contact > 0.0
-    assert cfg.rewards.reward_params.native_source_hand_part_contact.require_thumb_opposition is True
+    assert cfg.rewards.reward_params.native_source_hand_part_contact.source_digit_distance_m == 0.042
+    assert cfg.rewards.reward_params.native_source_hand_part_proximity.source_digit_distance_m == 0.042
     assert cfg.rewards.reward_params.native_part_surface_displacement.part_reduce == "worst"
     assert 0.0 < float(cfg.commands.object.xfrc.contact_scale) < 1.0
     assert cfg.commands.object.perturb.enabled is True
@@ -138,6 +139,9 @@ def test_opposing_thumb_finger_contact_credit_suppresses_single_digit_brushing()
         "active": torch.tensor([[[True], [False]], [[True], [False]]]),
         "known": torch.ones((2, 2, 1), dtype=torch.bool),
         "execution_valid": torch.tensor([True, True]),
+        "reference_motion_ids": torch.zeros(2, dtype=torch.long),
+        "reference_motion_steps": torch.ones(2, dtype=torch.long),
+        "reference_time_ns": torch.full((2,), 20_000_000, dtype=torch.long),
     }
     geom_facts = {
         "metadata": {
@@ -151,7 +155,10 @@ def test_opposing_thumb_finger_contact_credit_suppresses_single_digit_brushing()
             [[0.065], [0.005], [0.009], [0.050], [0.050], [0.050]],
         ]),
         "live_part_query_support": torch.ones((2, 6, 1), dtype=torch.bool),
-        "achieved_position_support": torch.ones((2, 6), dtype=torch.bool),
+        "desired_part_distance_m": torch.full((2, 6, 1), .01),
+        "desired_part_query_support": torch.ones((2, 6, 1), dtype=torch.bool),
+        **{key: intent_facts[key] for key in ("execution_valid", "reference_motion_ids",
+                                           "reference_motion_steps", "reference_time_ns")},
     }
     interval_facts = {
         "addresses": {
@@ -212,9 +219,9 @@ def test_opposing_thumb_finger_contact_credit_suppresses_single_digit_brushing()
         "motion",
         force_scale_n=1.5,
         separation_bound_m=0.02,
-        require_thumb_opposition=True,
-        opposition_distance_m=0.030,
-        non_opposed_scale=0.15,
+        source_digit_distance_m=0.042,
+        digit_contact_distance_m=0.030,
+        unmatched_digit_scale=0.15,
     )
     assert float(rew[0]) > 0.80
     assert pytest.approx(float(rew[1]), rel=1e-5) == 0.15 * float(rew[0])

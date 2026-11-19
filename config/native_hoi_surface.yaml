@@ -6,6 +6,7 @@ defaults:
 native_surface:
   n_points: 128
   n_obj_verts: 2048
+  source_digit_distance_m: 0.042
 
 native_tracking_tolerances:
   root_position_error_m: 0.12
@@ -167,13 +168,13 @@ rewards:
       part_reduce: worst
     native_source_hand_part_proximity:
       distance_scale_m: 0.04
-      require_thumb_opposition: true
+      source_digit_distance_m: ${native_surface.source_digit_distance_m}
     native_source_hand_part_contact:
       force_scale_n: 1.5
       separation_bound_m: 0.02
-      require_thumb_opposition: true
-      opposition_distance_m: 0.035
-      non_opposed_scale: 0.15
+      source_digit_distance_m: ${native_surface.source_digit_distance_m}
+      digit_contact_distance_m: 0.035
+      unmatched_digit_scale: 0.15
     native_source_tip_object_bound:
       sigma_m: 0.025
     native_root_pose:

@@ -514,11 +514,13 @@ intent observation or changing the actor/critic graph.
 For each source-known required hand, proximity takes the closest supported
 achieved site to any of that hand's active candidate parts and returns
 `exp(-distance_m / distance_scale_m)`, using the absolute signed distance.
-The `native_hoi_surface` recipe enables `require_thumb_opposition`. For each
-candidate part with both named digit groups, the farther of the closest thumb
-and closest other fingertip sets its distance. The reward uses the closest
-candidate under that metric. This gives approach credit before the first
-measured contact and keeps both groups on the same source-intended part.
+The `native_hoi_surface` recipe selects source digit groups within
+`source_digit_distance_m` of each candidate part. When only one group is near
+in the source, the reward uses that group's achieved distance. When both the
+thumb and other fingertips are near, the farther of the two achieved group
+distances sets the candidate's reward. Both source group distances need
+support. This gives approach credit before the first measured contact and
+keeps the required groups on the same source-intended part.
 The baked grid, pose and point-query support bound the calculation. The force
 term below supplies separate solver contact credit.
 
@@ -526,7 +528,9 @@ Contact reads the completed native control interval, matched to the current
 solver endpoint. For each actual named hand/body and active candidate part,
 positive-force samples contribute `min(normal_force_n / force_scale_n, 1)` only
 when an actual force-bearing contact has supported separation no greater than
-`separation_bound_m`. The best candidate part is used for each hand/substep;
+`separation_bound_m`. The HOI recipe discounts credit if the achieved source
+groups exceed `digit_contact_distance_m`. Missing source group evidence earns
+zero credit. The best candidate part is used for each hand/substep;
 substeps are weighted by their supported solver durations. Extra force above
 the configured physical scale earns no extra credit. Named addresses, not part
 ordinals or fixed asset names, bind the measurements.
