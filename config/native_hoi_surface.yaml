@@ -27,6 +27,10 @@ runner:
 save_checkpoint_per_env_step: 1_000_000
 
 terminations:
+  native_reference_diverged:
+    params:
+      part_position_m: ${native_tracking_tolerances.part_position_error_m}
+      part_rotation_rad: ${native_tracking_tolerances.part_rotation_error_rad}
   native_velocity_diverged:
     params:
       linear_m_per_s: 100.0

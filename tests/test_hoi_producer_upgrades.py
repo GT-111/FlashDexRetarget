@@ -111,6 +111,25 @@ def test_bind_native_scene_config_admits_contact_scale_and_post_decay_perturb(tm
         bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=(0.0, 0.0, -9.81))
 
 
+def test_hoi_collection_treats_outside_pose_tolerance_as_a_failed_take(tmp_path: Path) -> None:
+    from test_native_task_contract import _command
+
+    from envs.terminations.native import NativeMotionTrackingTerminations
+
+    cfg = _native_hoi_config(tmp_path / "motion.pt")
+    bounds = OmegaConf.to_container(cfg.terminations.native_reference_diverged.params, resolve=True)
+    command, env, _ = _command(rigid=True)
+    object_position = next(iter(command.native_objects.values())).data.body_link_pos_w
+    diverged = NativeMotionTrackingTerminations.native_reference_diverged
+    object_position[..., 2] = -0.025
+    assert not diverged(env, "motion", **bounds).item()
+    object_position[..., 2] = -0.075
+    assert diverged(env, "motion", **bounds).item()
+    command.motion_lib.native_object_part_pose_support[:] = False
+    assert not diverged(env, "motion", **bounds).item()
+    assert bounds["part_rotation_rad"] == cfg.native_tracking_tolerances.part_rotation_error_rad
+
+
 def test_opposing_thumb_finger_contact_credit_suppresses_single_digit_brushing() -> None:
     # World 0: thumb (5mm) + index (8mm) both near object -> full 1.0x credit
     # World 1: index (5mm) near object, thumb (65mm) far away -> scaled down by non_opposed_scale (0.15x)
