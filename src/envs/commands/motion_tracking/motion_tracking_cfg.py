@@ -71,7 +71,7 @@ class ObjectPerturbCfg:
     enabled: bool = False
     force_scale: float = 0.0
     torque_scale: float = 0.0
-    max_angular_acceleration_rad_s2: float | None = None
+    max_angular_acceleration_rad_s2: float = 1000.0
     start_prob: float = 0.05
     continue_prob: float = 0.95
     gate_lag_s: float = 0.5

@@ -76,7 +76,7 @@ commands:
       enabled: false
       force_scale: 0.0
       torque_scale: 0.0
-      max_angular_acceleration_rad_s2: null
+      max_angular_acceleration_rad_s2: 1000.0
       start_prob: 0.05
       continue_prob: 0.95
       gate_lag_s: 0.5
