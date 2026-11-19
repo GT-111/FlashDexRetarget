@@ -129,6 +129,25 @@ class XfrcAssistCurriculum:
         """Replace physical episodes without counting their old lengths as completions."""
         self._prev_ep_len = None
 
+    def has_zero_gains(self) -> bool:
+        return all(
+            bounds[key] == 0.0
+            for bounds in (self.curr_gains, self.curr_gains_lower)
+            for key in self.decay_terms
+        )
+
+    def hoi_zero_receipt(self) -> dict | None:
+        required_epochs = 15
+        if (self.zero_epoch >= 0 or not self.gain_history or not self.has_zero_gains()
+                or self.num_epoch_since_last_decay < required_epochs):
+            return None
+        return {
+            "upper": dict(self.curr_gains),
+            "lower": dict(self.curr_gains_lower),
+            "continuous_zero_epochs": self.num_epoch_since_last_decay,
+            "required_zero_epochs": required_epochs,
+        }
+
     def state_dict(self, common_step_counter: int | None = None) -> dict:
         """Global adaptive state; physical episode lengths are not resumed."""
         return copy.deepcopy({
@@ -346,7 +365,7 @@ class XfrcAssistCurriculum:
         self._last_decayed = False
 
         learning_stabilized = self._determine_decay(epoch_num)
-        zero_gains = all(self.curr_gains[k] <= 0.0 for k in self.decay_terms)
+        zero_gains = self.has_zero_gains()
         if self.zero_epoch >= 0 and epoch_num > self.zero_epoch and not zero_gains:
             for k in self.decay_terms:
                 self.curr_gains[k] = 0.0

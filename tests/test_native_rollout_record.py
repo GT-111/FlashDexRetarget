@@ -368,7 +368,7 @@ def _prepared_native_recorder_fixture(tmp_path, *, hand_sides=("left", "right"),
         _with_source_hand_part_intent(clip)
     C.save_clip(dataset / "native_reference/synthetic-stage.npz", clip)
     cfg = _pipeline_config(dataset)
-    prepared = PreparedNativeInput(dataset, cfg, workers=1, manifest="native-reference.json")
+    prepared = PreparedNativeInput(dataset, cfg, workers=1)
     prepared.pack()
 
     robot = SimpleNamespace(num_joints=len(joint_names), joint_names=joint_names,
@@ -837,6 +837,15 @@ def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assista
         _add_loose_object(command, env, [])
         # A type does not rename, convert, or reorder observed coordinates.
         next(iter(command.native_objects.values())).data.joint_pos[:] = torch.tensor([[.023, -.4]])
+        def applied_interval():
+            step = int(command.reference_phase["motion_steps"][0])
+            return dict(entity_names=("loose_prop", "object", "object"),
+                        part_body_names=("prop_root", "object_lid", "object_root"), num_substeps=4,
+                        authority="post_solve_mjw_xfrc_applied_WORLD_body_COM_wrench",
+                        peak_force_n=step * torch.tensor([[3., 2., 1.]]),
+                        peak_torque_nm=step * torch.tensor([[.3, .2, .1]]),
+                        measurement_support=torch.tensor([step > 0]))
+        env.scene.applied_object_wrench_interval_facts = applied_interval
 
     manifest = record_reference_phase_fixture(tmp_path, binding, native=True, setup_scene=setup)
     recorded = load_flashdex_rollout(manifest, motion_id=0)
@@ -868,3 +877,10 @@ def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assista
     assert assistance["entity_names"] == ["object", "object", "loose_prop"]
     assert assistance["body_names"] == ["object_root", "object_lid", "prop_root"]
     np.testing.assert_array_equal(recorded.arrays["object_assist_force_w"], np.zeros((3, 3, 3), np.float32))
+    prefix = "applied_object_wrench_interval_"
+    interval = json.loads(str(recorded.arrays[prefix + "metadata_json"]))
+    assert interval["part_body_names"] == ["object_root", "object_lid", "prop_root"]
+    assert interval["num_substeps"] == 4
+    np.testing.assert_array_equal(recorded.arrays[prefix + "measurement_support"], [False, True, True])
+    np.testing.assert_array_equal(recorded.arrays[prefix + "peak_force_n"], [[0, 0, 0], [1, 2, 3], [2, 4, 6]])
+    np.testing.assert_allclose(recorded.arrays[prefix + "peak_torque_nm"], [[0, 0, 0], [.1, .2, .3], [.2, .4, .6]])

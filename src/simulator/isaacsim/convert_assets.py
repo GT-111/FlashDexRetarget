@@ -39,8 +39,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true", help="reconvert even if USD is up to date")
     parser.add_argument(
-        "--native-scene-config",
-        help="resolved run yaml with robot.native_scene and sim.native_assets: split its named MJCF assets",
+        "--native-motion-file",
+        help="motion.pt beside native-reference.json: split the declared native MJCF into USD assets",
     )
     parser.add_argument(
         "--collision-visual", action="store_true",
@@ -482,7 +482,7 @@ def write_native_mjcf_assets(layout, assets) -> dict[str, str]:
     return outputs
 
 
-def convert_native_scene(config_path: str) -> None:
+def convert_native_scene(motion_file: str) -> None:
     """Use the pinned Isaac Lab MJCF converter, never the rigid density path."""
     from pathlib import Path
 
@@ -492,18 +492,19 @@ def convert_native_scene(config_path: str) -> None:
         raise RuntimeError("Isaac native conversion could not enable isaacsim.asset.importer.mjcf")
 
     from isaaclab.sim.converters import MjcfConverter, MjcfConverterCfg
-    from omegaconf import OmegaConf
 
+    from common.native_reference import load_native_reference, native_usd_paths
     from envs.scene.native import NativeSceneCfg
     from simulator.mjcf_meta import load_robot_mjcf_meta
 
-    config = OmegaConf.load(config_path)
-    layout = NativeSceneCfg.from_mapping(config.robot.native_scene)
-    assets = config.sim.native_assets
+    declaration = load_native_reference(motion_file)
+    scene = declaration["native_scene"]
+    layout = NativeSceneCfg.from_mapping(scene)
+    assets = native_usd_paths(motion_file, scene)
     inputs = write_native_mjcf_assets(layout, assets)
     metadata = load_robot_mjcf_meta(layout.scene_xml_path)
-    selected = [(b.entity_name, assets.articulations[b.entity_name], False) for b in layout.articulations]
-    selected.append(("static", assets.static, True))
+    selected = [(b.entity_name, assets["articulations"][b.entity_name], False) for b in layout.articulations]
+    selected.append(("static", assets["static"], True))
     for name, usd, fixed in selected:
         destination = Path(usd)
         MjcfConverter(
@@ -829,8 +830,8 @@ def main() -> None:
         convert_object(obj_dir, force=args.force, collision_visual=args.collision_visual)
     if args.robot_config:
         convert_robot(args.robot_config, force=args.force, collision_visual=args.collision_visual)
-    if args.native_scene_config:
-        convert_native_scene(args.native_scene_config)
+    if args.native_motion_file:
+        convert_native_scene(args.native_motion_file)
 
     _log("all conversions done")
     sys.stdout.flush()

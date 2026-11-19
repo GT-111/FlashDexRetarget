@@ -345,9 +345,7 @@ def test_native_surface_profile_selects_semantic_terms_and_one_shared_reward(tmp
 
     from envs.rewards import build_rewards
 
-    environment = {"FDR_NATIVE_SCENE_XML": str(tmp_path / "scene.xml"), "FDR_NATIVE_USD_DIR": str(tmp_path),
-                   "FDR_NATIVE_BOX_BASE_MESH": "base.obj", "FDR_NATIVE_BOX_LID_MESH": "lid.obj"}
-    with patch.dict("os.environ", environment), initialize_config_dir(
+    with initialize_config_dir(
         config_dir=str(Path(__file__).parents[1] / "config"), version_base=None):
         cfg = compose(config_name="native_surface", overrides=["commands.motion_file=synthetic.pt",
             "native_surface.n_points=12", "native_surface.n_obj_verts=48"])

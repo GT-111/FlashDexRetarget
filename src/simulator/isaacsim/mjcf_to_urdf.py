@@ -43,14 +43,14 @@ def _inertial_xml(model, bid, indent="    "):
     diag = model.body_inertia[bid]
     mass = model.body_mass[bid]
     R = Rotation.from_quat([iq[1], iq[2], iq[3], iq[0]]).as_matrix()
-    I = R @ np.diag(diag) @ R.T
+    inertia = R @ np.diag(diag) @ R.T
     return (
         f"{indent}<inertial>\n"
         f"{indent}  <origin xyz=\"{_vec(ipos)}\" rpy=\"0 0 0\"/>\n"
         f"{indent}  <mass value=\"{_fmt(mass)}\"/>\n"
-        f"{indent}  <inertia ixx=\"{_fmt(I[0, 0])}\" ixy=\"{_fmt(I[0, 1])}\" "
-        f"ixz=\"{_fmt(I[0, 2])}\" iyy=\"{_fmt(I[1, 1])}\" iyz=\"{_fmt(I[1, 2])}\" "
-        f"izz=\"{_fmt(I[2, 2])}\"/>\n"
+        f"{indent}  <inertia ixx=\"{_fmt(inertia[0, 0])}\" ixy=\"{_fmt(inertia[0, 1])}\" "
+        f"ixz=\"{_fmt(inertia[0, 2])}\" iyy=\"{_fmt(inertia[1, 1])}\" iyz=\"{_fmt(inertia[1, 2])}\" "
+        f"izz=\"{_fmt(inertia[2, 2])}\"/>\n"
         f"{indent}</inertial>\n"
     )
 

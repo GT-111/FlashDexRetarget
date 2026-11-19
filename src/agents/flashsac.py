@@ -552,21 +552,12 @@ class FlashSACAgent(Agent):
                 raise ValueError(f"actor input extension requires unchanged reward-head ownership: {key}")
         from envs.scene.native import NativeSceneCfg
 
-        def parent_scene(config: dict) -> NativeSceneCfg:
-            # Archived actors used one real object under "object". Only this
-            # explicit initializer reads that archive form; runtime and FULL
-            # still require the current collection configuration.
-            config = dict(config)
-            if "objects" not in config and "object" in config:
-                config["objects"] = [config.pop("object")]
-            return NativeSceneCfg.from_mapping(config)
-
-        scene = parent_scene(parent["robot"]["native_scene"])
+        scene = NativeSceneCfg.from_mapping(parent["robot"]["native_scene"])
         current_scene = NativeSceneCfg.from_mapping(current["robot"]["native_scene"])
         old_action = {key: value for key, value in parent["actions"].items() if key != "native_scene"}
         new_action = {key: value for key, value in current["actions"].items() if key != "native_scene"}
         if (scene != current_scene
-                or parent_scene(parent["actions"]["native_scene"]) != scene
+                or NativeSceneCfg.from_mapping(parent["actions"]["native_scene"]) != scene
                 or NativeSceneCfg.from_mapping(current["actions"]["native_scene"]) != current_scene
                 or old_action != new_action):
             raise ValueError("actor input extension requires the unchanged named native action/scene contract")
@@ -662,7 +653,6 @@ class FlashSACAgent(Agent):
             "actor_only": True, "renormalized_at_initialization": False,
             "native_scene_validation": {
                 "owner": "envs.scene.native.NativeSceneCfg",
-                "archived_singleton_parent": "objects" not in parent["robot"]["native_scene"],
                 "scene_xml_path": scene.scene_xml_path,
                 "hand_sides": sides,
                 "command_actuator_names": [name for hand in scene.hands for name in hand.command_actuator_names],

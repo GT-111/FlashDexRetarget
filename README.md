@@ -87,11 +87,10 @@ measured-zero force, in exports. These software interfaces do not establish succ
 
 The native Isaac interface uses `NativeSceneCfg` to select actual floating hand
 articulations and the ordered `robot.native_scene.objects` collection from an authored MJCF. Each hand keeps
-its FREE root and declared independent actuators; an articulated object keeps
-its passive joints. `convert_assets.py --native-scene-config <resolved-run.yaml>`
-reads the resolved run configuration: `robot.native_scene` owns mechanics and
-`sim.native_assets` owns named USD destinations. It splits those named assets
-for conversion. Select
+its FREE root and declared independent actuators. An articulated object keeps
+its passive joints. `convert_assets.py --native-motion-file <dataset>/motion.pt`
+reads the sibling `native-reference.json` and splits its named MJCF subtrees
+into `<dataset>/native-usd`. Select
 `envs.actions.native.NativeResidualActionCfg` for world-frame wrist residuals
 and absolute or reference-relative fingers. Action dimensions and side ownership
 come from the named bindings. The root PD law recomputes mass, inertia and the
@@ -129,19 +128,16 @@ and leaves native scene support with the authored mechanics. The default
 See [prepared native input](docs/guide/kinematic_retargeting.md#prepared-native-input)
 for the command, manifest and qualification boundary.
 
-Select the existing trainer's native task with `--config_name native`. Supply
-`native_recording_binding` and all six `native_tracking_tolerances` explicitly;
-the latter select reference-tracking archives, independently of contact or task
-success. The profile uses named hand roots and object-part SDFs, independent
-finger-command BC, supported future references and native state terminations.
-It disables object pinning, perturbations and adaptive assistance. BOX keeps
-one free base and its passive hinge. For a real zero-joint rigid object, pass
-`--overrides 'envs/native_object@native_object=rigid'` and the declared scene
-bindings; no artificial hinge is added. The native software cases cover Hydra
-composition, command clocks, part/joint ordering, action and support routing,
-reset, wrench cleanup, complete endpoint selection and finite-state admission.
-Offline reference generation, USD/PhysX import and physical response remain
-unqualified.
+The native trainer and evaluator read `native_scene` and `recording_binding`
+from the `native-reference.json` beside `commands.motion_file`. Scene and
+surface mesh paths resolve relative to that manifest. A scene can contain
+rigid objects and articulated objects together, with genuinely absent joints
+omitted. Each hand can declare `tip_site_names` in terminal order. Robot
+profiles supply anatomical mappings, and simulator profiles select the plant.
+
+Select `--config_name native_hoi_surface` for the six-hand HOI producer.
+Its tracking tolerances control reference-tracking evaluation and the
+prepared manifest retains source, scene and command correspondence.
 
 The native task also has config-selected direct MuJoCo Warp and Newton ports.
 Select `envs/simulator@simulator=mjwarp` or `envs/simulator@simulator=newton` with the native profile;
@@ -234,8 +230,8 @@ does not maintain a second robot roster:
 ```sh
 bash scripts/setup.sh --profile isaac \
     --robot-config config/envs/robot/sharpa_bimanual.yaml
-# Repeat --robot-config for multiple stock assets, or use a resolved native run:
-bash scripts/setup.sh --profile isaac --native-scene-config /path/to/native-run.yaml
+# Repeat --robot-config for multiple stock assets, or use a prepared native dataset.
+bash scripts/setup.sh --profile isaac --native-motion-file /path/to/dataset/motion.pt
 ```
 
 Direct MuJoCo Warp and Newton select the separate Python 3.12 environment
@@ -358,10 +354,10 @@ python src/simulator/isaacsim/convert_assets.py \
     --robot-config config/envs/robot/xhand_bimanual.yaml
 ```
 
-The same option accepts a resolved run YAML. The separate native route keeps
-`robot.native_scene` and its named `sim.native_assets` bindings; it does not use
-the stock robot binding. See [asset configuration](docs/guide/flashdexretarget.md#robot-assets)
-for registering another asset and the collision-visual debug variant.
+The same option accepts a resolved stock run YAML. Prepared native datasets
+use the `--native-motion-file` conversion described above. See
+[asset configuration](docs/guide/flashdexretarget.md#robot-assets) for
+registering another asset and the collision-visual debug variant.
 
 > [!CAUTION]
 > The author Isaac freeze and local Flash/SAC packages use `--no-deps`; a plain
@@ -430,25 +426,21 @@ MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget
     logger.wandb.run_name=my_run runner.agent.buffer_device_type=cpu
 ```
 
-Select another robot through the normal Hydra config, for example
-`envs/robot@robot=sharpa_bimanual` with its `sharpa/motion.pt`; no robot name is
-guessed from the motion path. Native profiles select the existing native task
-and configured plant, while all task/scene/asset parameters remain Hydra inputs:
+Select another stock robot through Hydra, for example
+`envs/robot@robot=sharpa_bimanual` with its `sharpa/motion.pt`.
+For a prepared native dataset, choose the matching robot anatomy and backend.
+Training and evaluation bind the same scene and recording facts from the
+dataset manifest.
 
 ```sh
 MOTION=<prepared_dataset>/motion.pt bash scripts/train_flashdexretarget.sh \
-    --profile newton envs/robot@robot=inspire_rh56f1_bimanual \
-    native_recording_binding=/path/to/binding.json \
-    native_tracking_tolerances.root_position_error_m=0.03
+    --profile newton --config_name native_hoi_surface \
+    envs/robot@robot=inspire_rh56f1_bimanual
 ```
 
-Supply the complete native recording binding, scene/mesh environment variables
-and all declared tracking tolerances described above; the single tolerance shown
-here illustrates an override, not a complete runnable task recipe. Use
-`--profile mjwarp` for direct MuJoCo Warp and `--profile isaac` for the author
-environment (the default). `--profile isaac --config_name native` selects the
-same native task on Isaac; `--config_name` also accepts another registered run
-configuration. The defaults live in `config/`
+Use `--profile mjwarp` for direct MuJoCo Warp. For Isaac, convert the named USD
+assets first, then use `--profile isaac --config_name native_hoi_surface`.
+The defaults live in `config/`
 (learner: `config/runner/flashsac.yaml`). The policy is evaluated on every clip each 20M env steps, and
 all outputs share the configured `run_dir` (default `logs/flashsac/<run>/`).
 Set `run_dir=/absolute/node-local/path/new-run` for campaign placement; the entry
@@ -474,7 +466,7 @@ Open the printed URL (`PORT=8080` by default) in a browser. With a saved run the
 drawn solid over the reference (translucent blue); a run trained on another `motion.pt` is tagged `[other reference]`.
 Native FREE-wrist datasets (`native-reference.json`) automatically render all six dexterous hands (`inspire_rh56f1`,
 `inspire_rh56dftp`, `wuji_hand`, `sharpa_wave`, `unitree_dex3_1`, `wonik_allegro_v5`), multi-part articulated objects,
-object tracking error, bilateral contact forces, and post-solve applied wrench verification (`MEASURED_ZERO_POST_SOLVE`).
+object tracking error, per-hand contact forces and supported interval peaks of applied force.
 
 ### Six-hand grasp-hardened native HOI recipe (`native_hoi_surface`)
 
@@ -484,8 +476,8 @@ object tracking error, bilateral contact forces, and post-solve applied wrench v
 perturbations (`require_assist_decayed: true`), and fast adaptive `xfrc -> 0` decay across all six registered FREE-wrist
 robot configs (`config/envs/robot/{inspire_rh56f1,inspire_rh56dftp,wuji_hand,sharpa_wave_native,unitree_dex3_1,wonik_allegro_v5}_bimanual.yaml`).
 Pairing `envs/simulator@simulator=newton` with CoACD convex hulls capped at `<= 16` hulls and `<= 32` vertices/hull runs
-native `SolverMuJoCo` contacts without `newton-bvh` narrow-phase overhead, while `NativeRolloutRecord` verifies post-solve
-`applied_object_wrench_{force_w,torque_w}` directly from `mjw_data.xfrc_applied`.
+native `SolverMuJoCo` contacts. `NativeRolloutRecord` measures the post-solve force and torque peaks
+over each supported interval from `mjw_data.xfrc_applied`.
 
 ## Project Structure
 

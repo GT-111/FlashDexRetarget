@@ -22,6 +22,10 @@ def run(args: argparse.Namespace) -> None:
     config_dir = (Path(__file__).resolve().parent / args.config_path).resolve()
     with hydra.initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         cfg = hydra.compose(config_name=args.config_name, overrides=args.overrides)
+
+    from common.native_reference import bind_prepared_native_reference
+
+    bind_prepared_native_reference(cfg)
     run_dir = Path(cfg.run_dir).expanduser().resolve()
     cfg.run_dir = str(run_dir)
     OmegaConf.resolve(cfg)

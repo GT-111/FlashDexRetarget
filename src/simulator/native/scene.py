@@ -290,6 +290,10 @@ class NativeScene:
             f"{obj.entity_name}/{p.name}": {"entity_name": obj.entity_name, "body_name": p.body_name}
             for obj, p in layout.part_bindings
         }
+        self._object_part_body_ids = torch.tensor(
+            [sim.plant.model.body(part.body_name).id for _, part in layout.part_bindings],
+            device=sim.device, dtype=torch.long,
+        )
 
     def capture_control_context(self) -> NativeSceneControlContext:
         return NativeSceneControlContext(
@@ -369,23 +373,20 @@ class NativeScene:
             "distance_authority": last["distance_authority"],
         }
 
-    def applied_object_wrench_facts(self):
-        readback = self.sim.plant.applied_external_body_wrench()
-        if readback is None or not self.native_layout.part_bindings:
+    def applied_object_wrench_interval_facts(self):
+        interval = self.sim.plant.contact_interval
+        if interval is None or not self.object_parts:
             return None
-        model = self.sim.plant.model
-        body_ids = torch.tensor(
-            [model.body(part.body_name).id for _, part in self.native_layout.part_bindings],
-            device=self.sim.device, dtype=torch.long,
-        )
-        selected = readback["wrench_w"].index_select(1, body_ids)
+        readback = interval.applied_wrench_facts()
+        if readback is None:
+            return None
+        peaks = readback["peaks"].index_select(1, self._object_part_body_ids)
         return {
             "entity_names": tuple(obj.entity_name for obj, _ in self.native_layout.part_bindings),
-            "body_names": tuple(part.body_name for _, part in self.native_layout.part_bindings),
-            "force_w": selected[..., :3],
-            "torque_w": selected[..., 3:],
-            "measurement_support": readback["support"],
+            "part_body_names": tuple(part.body_name for _, part in self.native_layout.part_bindings),
+            "peak_force_n": peaks[..., 0],
+            "peak_torque_nm": peaks[..., 1],
+            "measurement_support": readback["measurement_support"],
+            "num_substeps": readback["num_substeps"],
             "authority": readback["authority"],
-            "force_unit": "N",
-            "torque_unit": "N m",
         }

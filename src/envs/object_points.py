@@ -8,7 +8,6 @@ import os
 import torch
 from mjlab.utils.lab_api.math import matrix_from_quat
 
-
 # Candidate pool for the object-surface obs terms. "verts" restores the pre-2026-08-31 mesh-vertex
 # pool, whose coverage followed the tessellation.
 _OBJ_POOL = os.environ.get("FDR_OBJ_PCD_POOL", "surface")

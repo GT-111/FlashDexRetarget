@@ -78,7 +78,7 @@ class Source(Base):
             link_dist = np.full((len(verts), 16), np.inf)
             for k, u in enumerate(uids, 1):
                 rot, pos = poses[u][:, :3, :3], poses[u][:, :3, 3]
-                local = lambda x: np.matmul(x - pos[:, None], rot).reshape(-1, 3)  # noqa: E731
+                local = lambda x, pos=pos, rot=rot: np.matmul(x - pos[:, None], rot).reshape(-1, 3)  # noqa: E731
                 tip_dist = np.minimum(tip_dist, self.near(u, local(tips), cfg.tip_contact).reshape(tip_dist.shape))
                 d = self.near(u, local(verts), cfg.link_contact).reshape(verts.shape[:2])
                 for link in range(16):

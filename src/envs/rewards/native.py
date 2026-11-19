@@ -190,6 +190,18 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         return _source_geometry_mean(value, support, facts["metadata"], side)
 
     @staticmethod
+    def native_contact_overload(env, command_name, threshold_n):
+        del command_name
+        interval = env.scene.hand_part_contact_interval_facts()
+        if interval is None or not interval["pairs"]:
+            return torch.zeros(env.num_envs, device=env.device)
+        force = torch.stack([pair["normal_force_n"] for pair in interval["pairs"].values()], dim=-1)
+        support = interval["sample_recorded"] & interval["clock_support"] & interval["measurement_support"]
+        support &= interval["interval_complete"][:, None]
+        peak = torch.where(support[..., None] & torch.isfinite(force), force, 0.0).amax(dim=(1, 2))
+        return ((peak - threshold_n).clamp_min(0.0) / threshold_n).square()
+
+    @staticmethod
     def native_source_tip_object_bound(env, command_name, sigma_m, side=None):
         """Declared part-SDF proximity mechanism; never paired contact/penetration."""
         command = env.command_manager.get_term(command_name)

@@ -188,11 +188,12 @@ elif name == "python" and "load_robot_asset" in body:
         self.assertIn("isaacsim==5.1.0.0", freeze[0])
         self.assertNotIn("tensordict==0.9.0", freeze[0])
         self.log.unlink()
-        result = self.invoke("setup.sh", "--profile", "isaac", "--native-scene-config", configs[0], python="3.11")
+        motion = self.root / "native" / "motion.pt"
+        result = self.invoke("setup.sh", "--profile", "isaac", "--native-motion-file", motion, python="3.11")
         self.assert_success(result)
         conversions = [event["args"] for event in self.events() if event["command"] == "python"
                        and event["args"][:1] == ["src/simulator/isaacsim/convert_assets.py"]]
-        self.assertEqual(conversions, [["src/simulator/isaacsim/convert_assets.py", "--native-scene-config", str(configs[0])]])
+        self.assertEqual(conversions, [["src/simulator/isaacsim/convert_assets.py", "--native-motion-file", str(motion)]])
 
     def test_train_uses_profile_activation_and_passes_real_hydra_selection(self):
         result = self.invoke("train_flashdexretarget.sh", ROBOT="sharpa")

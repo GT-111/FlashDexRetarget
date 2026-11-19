@@ -8,7 +8,6 @@ from mjlab.managers.reward_manager import RewardTermCfg
 
 from .._common import auto_inject, materialize, shape_checked
 
-
 # rewards.split_sides: every term whose function takes `side=None` becomes one term per hand
 # (tracking_X -> tracking_{r,l}_X, others -> X_{r,l}) at half the weight; termination_penalty
 # keeps the full weight since it is charged to the side at fault.

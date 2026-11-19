@@ -169,15 +169,15 @@ class TrackingPerformance:
         if self.num_sides == 1:
             return perr[:, 0], rerr[:, 0]
         static = (self.spider_drift_sum / n[:, None]) < 1e-3
-        r = self.side_prefixes.index("r") if "r" in self.side_prefixes else 0
-        l = 1 - r
+        right = self.side_prefixes.index("r") if "r" in self.side_prefixes else 0
+        left = 1 - right
         pos = torch.where(
-            static[:, l], perr[:, r],
-            torch.where(static[:, r], perr[:, l], 0.5 * (perr[:, r] + perr[:, l])),
+            static[:, left], perr[:, right],
+            torch.where(static[:, right], perr[:, left], 0.5 * (perr[:, right] + perr[:, left])),
         )
         rot = torch.where(
-            static[:, l], rerr[:, r],
-            torch.where(static[:, r], rerr[:, l], 0.5 * (rerr[:, r] + rerr[:, l])),
+            static[:, left], rerr[:, right],
+            torch.where(static[:, right], rerr[:, left], 0.5 * (rerr[:, right] + rerr[:, left])),
         )
         return pos, rot
 

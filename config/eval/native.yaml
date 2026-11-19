@@ -34,5 +34,6 @@ eval:
       normal_force_threshold_n: 0.5
       separation_bound_m: 0.02
     - _target_: evaluation.callbacks.rollout_record.NativeRolloutRecord
+      _convert_: all
       command_name: ${commands.name}
       binding: ${native_recording_binding}

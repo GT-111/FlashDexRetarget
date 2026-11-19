@@ -209,7 +209,7 @@ class MotionLibrary:
 
         for side in self.hand_sides:
             prefix = f"mano_{side}_"
-            concat = lambda key: _concat(
+            concat = lambda key, prefix=prefix: _concat(
                 [d[prefix + key] for d in motion_dicts], self.device
             )
             self.mano_wrist_trans[side] = concat("wrist_pos")

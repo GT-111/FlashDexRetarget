@@ -98,9 +98,9 @@ class HumanDemoInput(MotionInput):
 class PreparedNativeInput(MotionInput):
     """Pack explicitly selected native carriers without changing their source facts."""
 
-    def __init__(self, dataset: Path, cfg: DictConfig, workers: int, manifest: str):
+    def __init__(self, dataset: Path, cfg: DictConfig, workers: int):
         super().__init__(dataset, cfg, workers)
-        declaration = json.loads((dataset / manifest).read_text())
+        declaration = json.loads((dataset / "native-reference.json").read_text())
         self.clip_directory = dataset / declaration["clip_directory"]
         self.clip_names = set(declaration["clips"])
         if not self.clip_names:

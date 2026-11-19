@@ -35,6 +35,14 @@ class ControlIntervalContacts:
         self.interval_complete = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._discarded = torch.zeros_like(self.interval_complete)
         self._active, self._count = False, 0
+        self.wrench_peaks = None
+        wrench_reader = getattr(plant, "applied_external_body_wrench", None)
+        readback = None if wrench_reader is None else wrench_reader()
+        if readback is not None:
+            self.wrench_authority = readback["authority"]
+            shape_wrench = (*readback["wrench_w"].shape[:2], 2)
+            self.wrench_peaks = readback["wrench_w"].new_zeros(shape_wrench)
+            self.wrench_sample_support = torch.zeros_like(self.sample_recorded)
         clock = plant.execution_clock()
         self.execution_clock_metadata = None if clock is None else clock["metadata"]
         if clock is not None:
@@ -52,6 +60,9 @@ class ControlIntervalContacts:
             field[rows] = False
         self.sample_begin_time_s[rows] = float("nan")
         self.sample_end_time_s[rows] = float("nan")
+        if self.wrench_peaks is not None:
+            self.wrench_peaks[rows] = 0.0
+            self.wrench_sample_support[rows] = False
         if self.execution_clock_metadata is not None:
             self.execution_sample_begin_step[rows] = -1
             self.execution_sample_end_step[rows] = -1
@@ -91,6 +102,15 @@ class ControlIntervalContacts:
         if slot:
             clock &= begin == self.sample_end_time_s[:, slot - 1]
         self.clock_support[:, slot].copy_(clock)
+        if self.wrench_peaks is not None:
+            readback = plant.applied_external_body_wrench()
+            if readback is not None:
+                wrench = readback["wrench_w"].detach()
+                peak = torch.linalg.vector_norm(wrench.reshape(*self.wrench_peaks.shape, 3), dim=-1)
+                known = valid & readback["support"] & torch.isfinite(peak).all(dim=(1, 2))
+                self.wrench_sample_support[:, slot].copy_(known)
+                torch.maximum(self.wrench_peaks, torch.where(known[:, None, None], peak, 0.0),
+                              out=self.wrench_peaks)
         if self.execution_clock_metadata is not None:
             first = plant.contact_sample_execution_step.detach()
             last = plant.execution_clock()["steps"].detach()
@@ -131,3 +151,16 @@ class ControlIntervalContacts:
                 execution_clock_support=self.execution_clock_support,
                 execution_interval_complete=self.execution_interval_complete)
         return result
+
+    def applied_wrench_facts(self):
+        if self.wrench_peaks is None:
+            return None
+        supported = self.interval_complete & self.wrench_sample_support.all(-1)
+        if self.execution_clock_metadata is not None:
+            supported &= self.execution_interval_complete
+        return {
+            "peaks": self.wrench_peaks,
+            "measurement_support": supported,
+            "num_substeps": self.num_substeps,
+            "authority": self.wrench_authority,
+        }

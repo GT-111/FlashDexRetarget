@@ -113,7 +113,7 @@ def prune(disks: list, objects: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
     out = []
     for d in disks:
         x, y, z_top, r, _ = d
-        over = lambda p: np.hypot(p[:, 0] - x, p[:, 1] - y) <= r  # noqa: E731
+        over = lambda p, x=x, y=y, r=r: np.hypot(p[:, 0] - x, p[:, 1] - y) <= r  # noqa: E731
         if any((over(com) & (bottom < z_top + lo)).any() for _, com, bottom in objects):
             continue
         if contact_z is None:

@@ -6,7 +6,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE=isaac
 CONDA_ENV=""
 DEXFORGE_ROOT=""
-NATIVE_SCENE_CONFIG=""
+NATIVE_MOTION_FILE=""
 ROBOT_CONFIGS=()
 SKIP_ASSETS=0
 REQUIREMENTS_LOCK=""
@@ -15,13 +15,13 @@ PACKAGE_WHEELS=()
 usage() {
     cat <<EOF
 Usage: bash scripts/setup.sh [--profile isaac|mjwarp|newton] [--env NAME]
-       [--robot-config YAML ... | --native-scene-config YAML] [--skip_assets]
+       [--robot-config YAML ... | --native-motion-file PATH] [--skip_assets]
        [--dexforge-root PATH] [--requirements-lock FILE] [--package-wheel FILE ...]
 
   --profile             isaac (Python 3.11, default) or native mjwarp/newton (3.12)
   --env NAME            conda env (default: FlashDexRetarget or FlashDexRetargetNative)
   --robot-config YAML   stock robot/resolved run config to convert; repeat for several
-  --native-scene-config YAML  resolved native Isaac scene to convert
+  --native-motion-file PATH  motion.pt beside the native scene manifest
   --skip_assets         skip Isaac asset conversion
   --dexforge-root PATH  required for Newton's public DexForge core/tracking packages
   --requirements-lock FILE  native-only complete third-party closure; install --no-deps
@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
         --env) CONDA_ENV="${2:?--env requires a value}"; shift 2 ;;
         --env=*) CONDA_ENV="${1#*=}"; shift ;;
         --robot-config) ROBOT_CONFIGS+=("${2:?--robot-config requires a path}"); shift 2 ;;
-        --native-scene-config) NATIVE_SCENE_CONFIG="${2:?--native-scene-config requires a path}"; shift 2 ;;
+        --native-motion-file) NATIVE_MOTION_FILE="${2:?--native-motion-file requires a path}"; shift 2 ;;
         --dexforge-root) DEXFORGE_ROOT="${2:?--dexforge-root requires a path}"; shift 2 ;;
         --skip_assets) SKIP_ASSETS=1; shift ;;
         --requirements-lock) REQUIREMENTS_LOCK="${2:?--requirements-lock requires a path}"; shift 2 ;;
@@ -53,7 +53,7 @@ case "$PROFILE" in
         PYTHON_VERSION=3.12
         CONDA_ENV="${CONDA_ENV:-FlashDexRetargetNative}"
         ENV_FILE="$PROJECT_DIR/env/native.sh"
-        if [[ ${#ROBOT_CONFIGS[@]} -gt 0 || -n "$NATIVE_SCENE_CONFIG" ]]; then
+        if [[ ${#ROBOT_CONFIGS[@]} -gt 0 || -n "$NATIVE_MOTION_FILE" ]]; then
             echo "[setup] native profiles use authored MJCF assets; Isaac conversion options require --profile isaac" >&2
             exit 1
         fi
@@ -73,7 +73,7 @@ for index in "${!PACKAGE_WHEELS[@]}"; do
     [[ -f "$wheel" ]] || { echo "[setup] missing package wheel: $wheel" >&2; exit 1; }
     PACKAGE_WHEELS[$index]="$(cd "$(dirname "$wheel")" && pwd)/$(basename "$wheel")"
 done
-if [[ -n "$NATIVE_SCENE_CONFIG" && ${#ROBOT_CONFIGS[@]} -gt 0 ]]; then
+if [[ -n "$NATIVE_MOTION_FILE" && ${#ROBOT_CONFIGS[@]} -gt 0 ]]; then
     echo "[setup] select stock robot configs or one resolved native scene" >&2
     exit 1
 fi
@@ -172,9 +172,9 @@ PY
 } > "$ENV_FILE"
 
 if [[ "$PROFILE" == isaac && "$SKIP_ASSETS" == 0 ]]; then
-    if [[ -n "$NATIVE_SCENE_CONFIG" ]]; then
+    if [[ -n "$NATIVE_MOTION_FILE" ]]; then
         MUJOCO_GL=disabled python src/simulator/isaacsim/convert_assets.py \
-            --native-scene-config "$NATIVE_SCENE_CONFIG"
+            --native-motion-file "$NATIVE_MOTION_FILE"
     else
         if [[ ${#ROBOT_CONFIGS[@]} == 0 ]]; then
             ROBOT_CONFIGS=(config/envs/robot/xhand_bimanual.yaml)

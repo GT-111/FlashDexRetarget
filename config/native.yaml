@@ -5,9 +5,8 @@ defaults:
   - override eval: native
   - _self_
 
-# The operator supplies the actual scene/source/command recording binding and
-# declares tracking tolerances. Passing them is not contact/task qualification.
-native_recording_binding: ???
+# The dataset manifest supplies the scene and recording binding.
+# The operator declares tracking tolerances.
 native_tracking_tolerances:
   root_position_error_m: ???
   root_rotation_error_rad: ???

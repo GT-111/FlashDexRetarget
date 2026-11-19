@@ -40,14 +40,14 @@ def hull_mass_props(obj_dir, scale: float, density: float):
     total = float(masses.sum())
     coms = np.stack([m.center_mass for m in meshes])
     com = (coms * masses[:, None]).sum(0) / total
-    I = np.zeros((3, 3))
+    inertia = np.zeros((3, 3))
     for m, mm, c in zip(meshes, masses, coms):
         I_own = np.asarray(m.moment_inertia) * density  # about own com
         r = c - com
-        I += I_own + mm * ((r @ r) * np.eye(3) - np.outer(r, r))
+        inertia += I_own + mm * ((r @ r) * np.eye(3) - np.outer(r, r))
     mass = float(np.clip(total, 0.05, 0.5))
-    I = I * (mass / max(total, 1e-9))
-    return mass, com, I
+    inertia *= mass / max(total, 1e-9)
+    return mass, com, inertia
 
 
 class IsaacSimAdapter:

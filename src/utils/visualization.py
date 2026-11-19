@@ -4,6 +4,7 @@ import argparse
 import csv
 import glob
 import json
+import sys
 import threading
 import time
 import urllib.parse
@@ -16,6 +17,9 @@ import trimesh
 import viser
 
 REPO = Path(__file__).resolve().parents[2]
+if __name__ == "__main__":
+    sys.path.insert(0, str(REPO / "src"))
+
 SIDES = ("right", "left")
 
 
@@ -223,17 +227,15 @@ def dataset_of(name, info):
 
 def run_native_viewer(args, sets):
     """Viser viewer + --check validator for all 6 native FREE-wrist hands and multi-part objects."""
+    from common.native_reference import load_native_reference
+
     class NativeRobot:
         def __init__(self, name, pt_path):
             self.name, self.dir = name, Path(pt_path).parent
             self.pt = torch.load(pt_path, map_location="cpu", weights_only=False)
-            self.nat_ref = json.loads((self.dir / "native-reference.json").read_text())
+            self.nat_ref = load_native_reference(pt_path)
             scene_cfg = self.nat_ref["native_scene"]
-            import os as _os
-            xml_cand = Path(_os.environ.get("FDR_NATIVE_SCENE_XML") or scene_cfg["scene_xml_path"])
-            if not xml_cand.is_file() and (self.dir.parent / "scene/scene.xml").is_file():
-                xml_cand = self.dir.parent / "scene/scene.xml"
-            self.model = mujoco.MjModel.from_xml_path(str(xml_cand))
+            self.model = mujoco.MjModel.from_xml_path(scene_cfg["scene_xml_path"])
             self.data = mujoco.MjData(self.model)
             self.hand_free_qadr = {
                 h["side"]: int(self.model.joint(h["root_joint_name"]).qposadr[0])
@@ -333,17 +335,11 @@ def run_native_viewer(args, sets):
     for i, n in enumerate(names):
         alias.setdefault(urllib.parse.unquote(n), i)
 
-    # Load object part meshes from native_scene (with relocatable fallback)
-    import os as _os
+    # Load the declared part-local surface meshes.
     part_meshes = []
     for obj in ref.nat_ref["native_scene"]["objects"]:
         for part in obj["parts"]:
-            mp = Path(part["mesh_path"])
-            if not mp.is_file():
-                env_m = _os.environ.get("FDR_NATIVE_OBJECT_MESH")
-                if env_m and Path(env_m).is_file():
-                    mp = Path(env_m)
-            mesh = trimesh.load(str(mp), force="mesh", process=False, skip_materials=True)
+            mesh = trimesh.load(part["mesh_path"], force="mesh", process=False, skip_materials=True)
             part_meshes.append((f"{obj['entity_name']}/{part['name']}", np.asarray(mesh.vertices, np.float32), np.asarray(mesh.faces, np.int32)))
 
     # Discover native rollouts (either success/manifest.json or current-policy-*/*.npz)
@@ -416,8 +412,19 @@ def run_native_viewer(args, sets):
         if a is None or m not in a["clips"]:
             return None
         d = np.load(a["clips"][m])
-        fn = d["hand_part_interval_normal_force_n"].max(axis=1) if "hand_part_interval_normal_force_n" in d else np.zeros((len(d["joint_pos"]), 2))
-        wf = float(np.abs(d["applied_object_wrench_force_w"]).max()) if "applied_object_wrench_force_w" in d else float("nan")
+        wrench_support = "applied_object_wrench_interval_measurement_support"
+        wf = None
+        if wrench_support in d and d[wrench_support].any():
+            wf = float(d["applied_object_wrench_interval_peak_force_n"][d[wrench_support]].max())
+
+        mean_force = {}
+        if "hand_part_interval_metadata_json" in d:
+            pairs = json.loads(str(d["hand_part_interval_metadata_json"]))["pairs"]
+            samples = d["hand_part_interval_normal_force_n"][d["hand_part_interval_measurement_support"]]
+            for side in SIDES:
+                columns = [i for i, pair in enumerate(pairs) if pair["hand_side"] == side]
+                if columns and len(samples):
+                    mean_force[side] = float(samples[:, columns].max(axis=-1).mean())
         return {
             "robot": a["robot"],
             "hand_sides": [str(x) for x in d["native_hand_sides"]],
@@ -425,7 +432,7 @@ def run_native_viewer(args, sets):
             "joint_names": [str(x) for x in d["joint_names"]],
             "joint_pos": np.asarray(d["joint_pos"]),
             "part_pose": np.asarray(d["native_object_part_pose"]),
-            "force_n": fn,
+            "mean_contact_force_n": mean_force,
             "max_wrench_n": wf,
         }
 
@@ -479,11 +486,15 @@ def run_native_viewer(args, sets):
                 T = min(len(ro["part_pose"]), int(nframes[m]))
                 ref_p = np.asarray(ref.refs[m]["object_part_state_w"][:T, 0, :3])
                 err_cm = float(np.linalg.norm(ro["part_pose"][:T, 0, :3] - ref_p, axis=-1).mean() * 100.0)
-                f_l, f_r = float(ro["force_n"][:, 0].mean()), float(ro["force_n"][:, 1].mean())
+                force = ro["mean_contact_force_n"]
+                f_l, f_r = (f"{force[side]:.2f} N" if side in force else "unmeasured" for side in ("left", "right"))
+                wrench = ro["max_wrench_n"]
+                wrench_label = "unmeasured" if wrench is None else f"{wrench:.4f} N"
                 g_info.content = (
                     f"**{names[m]}** ({ro['robot'].name})  \n"
-                    f"obj err: **{err_cm:.2f} cm** · mean force L/R: **{f_l:.2f} / {f_r:.2f} N** · "
-                    f"max xfrc: **{ro['max_wrench_n']:.4f} N**"
+                    f"first part position error: **{err_cm:.2f} cm** · "
+                    f"mean peak contact L/R: **{f_l} / {f_r}** · "
+                    f"peak applied force: **{wrench_label}**"
                 )
             else:
                 g_info.content = f"**{names[m]}** · {nframes[m]} frames (kinematic/preloaded-IK reference)"

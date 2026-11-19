@@ -134,6 +134,32 @@ def _advance_control(sim, substeps):
     sim.end_control_step()
 
 
+def test_applied_wrench_interval_retains_an_early_peak_and_requires_every_solve():
+    plant = _Plant(substeps=3)
+    plant.has_applied_wrench_readback = True
+    plant.configure_control_interval(3)
+    sim = NativeSim(plant)
+    readback = plant.contact_interval.applied_wrench_facts
+    assert not readback()["measurement_support"].any()
+
+    sim.begin_control_step()
+    plant.applied_body_wrench_support[:] = True
+    plant.applied_body_wrench_w[:, 0] = torch.tensor([3.0, 4.0, 0.0, 0.0, 0.0, 2.0])
+    sim.step()
+    plant.applied_body_wrench_w.zero_()
+    plant.applied_body_wrench_support[1] = False
+    sim.step()
+    plant.applied_body_wrench_support[:] = True
+    sim.step()
+    sim.end_control_step()
+
+    assert readback()["measurement_support"].tolist() == [True, False]
+    torch.testing.assert_close(readback()["peaks"][:, 0], torch.tensor([[5.0, 2.0], [5.0, 2.0]]))
+    plant.invalidate_contacts(torch.tensor([0]))
+    assert not readback()["measurement_support"].any()
+    assert not readback()["peaks"][0].any()
+
+
 def _tensors(interval):
     facts = interval.facts()
     return [value for value in facts.values() if isinstance(value, torch.Tensor)] + [
@@ -208,7 +234,7 @@ def test_partial_reset_state_write_and_stopped_interval_discard_old_samples():
 def test_real_backend_advance_methods_feed_the_same_interval_contact_owner(engine):
     """Only the external numerical calls are protocol stubs; run the real adapter method."""
     clock = torch.tensor([8.0, 12.0], dtype=torch.float64)
-    model = SimpleNamespace(nu=1, nv=1, nbody=9)
+    model = SimpleNamespace(nu=1, nv=1, nbody=9, opt=SimpleNamespace(timestep=.005))
     state = SimpleNamespace(qpos=torch.zeros(2, 1), qvel=torch.zeros(2, 1))
     index = 0
 
@@ -228,9 +254,11 @@ def test_real_backend_advance_methods_feed_the_same_interval_contact_owner(engin
             self._init_buffers(model, 2, "cpu", {"renamed/panel": ([3], [8])})
             self.effort = torch.zeros(2, 1)
             self._world_ids, self._body_ids = torch.arange(2), torch.arange(1, model.nbody)
-            self.backend = SimpleNamespace(get_physics_time_torch=lambda: clock.clone(),
+            self.backend = SimpleNamespace(model=model, get_physics_time_torch=lambda: clock.clone(),
                 step_torch=step, get_body_pair_contact_facts=read_contacts,
                 set_body_wrench_w_torch=lambda *args, **kwargs: None)
+            self.identity = {"backend": "synthetic actual-Newton-method fixture"}
+            self._bind_execution_clock(.005)
 
     class WarpFixture(MjWarpPlant):
         def __init__(self):
@@ -268,11 +296,8 @@ def test_real_backend_advance_methods_feed_the_same_interval_contact_owner(engin
                                torch.tensor([[1.0, 2.0, 3.0]] * 2), rtol=0, atol=0)
     assert plant.contact_interval.interval_complete.all()
     assert plant.contact_interval.sample_recorded.all()
-    if engine == "newton":
-        assert plant.execution_clock() is None
-    else:
-        assert plant.execution_clock()["steps"].tolist() == [3, 3]
-        assert plant.contact_interval.facts()["execution_interval_complete"].all()
+    assert plant.execution_clock()["steps"].tolist() == [3, 3]
+    assert plant.contact_interval.facts()["execution_interval_complete"].all()
 
 
 def test_normal_manager_brackets_all_substeps_before_partial_auto_reset():
@@ -293,7 +318,8 @@ def test_normal_manager_brackets_all_substeps_before_partial_auto_reset():
             self.action_manager = SimpleNamespace(
                 process_action=lambda action: events.append("process_action"),
                 apply_action=lambda: events.append("apply_action"), reset=reset)
-            self.command_manager = SimpleNamespace(compute=lambda dt: events.append("compute"), reset=reset)
+            self.command_manager = SimpleNamespace(compute=lambda dt: events.append("compute"),
+                                                   compute_substep=lambda: None, reset=reset)
             self.observation_manager = SimpleNamespace(compute=lambda **kwargs: {}, reset=reset)
             self.reward_manager = SimpleNamespace(compute=lambda dt: torch.zeros(2), reset=reset)
             self.termination_manager = SimpleNamespace(compute=lambda: torch.tensor([True, False]),

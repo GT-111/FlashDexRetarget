@@ -657,7 +657,7 @@ def build_isaac_scene(
         for _si, spec in enumerate(object_slots):
             for side in _slot_sides(spec):
                 _side_slot[(_si, side)] = len(hull_mass[side])
-                m, c, I = hull_mass_props(
+                m, c, inertia = hull_mass_props(
                     _P(_slot_val(spec, "mesh_path", side)).parent,
                     _slot_val(spec, "scale", side) if "scale" in spec else 1.0,
                     800.0,
@@ -665,10 +665,10 @@ def build_isaac_scene(
                 # Measured mass wins over the density estimate, clamp included.
                 _tgt = float(_slot_val(spec, "mass", side)) if "mass" in spec else 0.0
                 if _tgt > 0.0 and m > 0.0:
-                    I, m = I * (_tgt / m), _tgt
+                    inertia, m = inertia * (_tgt / m), _tgt
                 hull_mass[side].append(m)
                 hull_com[side].append(c)
-                hull_I[side].append(I)
+                hull_I[side].append(inertia)
 
     def _write_hull_props(view, slot_of_row: np.ndarray, side: str) -> None:
         """Overwrite PhysX mass/com/inertia with the hull-parity values (CPU)."""

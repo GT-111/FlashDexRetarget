@@ -1,5 +1,6 @@
 """Native topology/action contracts; no Isaac app, MjData, FK or simulation."""
 
+import json
 import xml.etree.ElementTree as ET
 from dataclasses import asdict
 from pathlib import Path
@@ -110,6 +111,17 @@ def _two_object_scene(tmp_path):
     return NativeSceneCfg.from_mapping(mapping), mapping
 
 
+
+def write_native_scene_manifest(dataset: Path, scene: dict) -> Path:
+    path = dataset / "native-reference.json"
+    declaration = json.loads(path.read_text()) if path.exists() else {}
+    declaration.update(native_scene=scene, recording_binding={
+        "fixture": "native scene", "scene_identity": {"native_scene": scene},
+    })
+    path.write_text(json.dumps(declaration))
+    return dataset / "motion.pt"
+
+
 def test_native_metadata_keeps_free_roots_passive_mimics_and_real_effort_bounds(
     tmp_path,
 ):
@@ -139,26 +151,15 @@ def test_native_metadata_keeps_free_roots_passive_mimics_and_real_effort_bounds(
 def test_native_conversion_inputs_keep_multiple_actual_object_trees(
     tmp_path,
 ):
-    from unittest.mock import patch
+    from common.native_reference import load_native_reference, native_usd_paths
 
-    from hydra import compose, initialize_config_dir
-
-    with (patch.dict("os.environ", {"FDR_NATIVE_OBJECT_ROOT_BODY": "prop_root",
-                                   "FDR_NATIVE_OBJECT_ROOT_JOINT": "prop_free"}),
-          initialize_config_dir(config_dir=str(Path(__file__).parents[1] / "config"), version_base=None)):
-        for overrides, expected in (([], "object_0"),
-                                    (["envs/native_object@native_object=rigid"], "prop_root")):
-            cfg = compose(config_name="native", overrides=overrides)
-            assert len(cfg.robot.native_scene.objects) == 1
-            assert cfg.robot.native_scene.objects[0].root_body_name == expected
-
-    layout, _ = _two_object_scene(tmp_path)
+    _, mapping = _two_object_scene(tmp_path)
+    mapping["scene_xml_path"] = "source.xml"
+    motion_file = write_native_scene_manifest(tmp_path, mapping)
+    scene = load_native_reference(motion_file)["native_scene"]
+    layout = NativeSceneCfg.from_mapping(scene)
     original = load_robot_mjcf_meta(layout.scene_xml_path)
-    paths = write_native_mjcf_assets(layout, {
-        "static": str(tmp_path / "static.usd"),
-        "articulations": {b.entity_name: str(tmp_path / (b.entity_name + ".usd"))
-                          for b in layout.articulations},
-    })
+    paths = write_native_mjcf_assets(layout, native_usd_paths(motion_file, scene))
     for binding in layout.articulations:
         saved = load_robot_mjcf_meta(paths[binding.entity_name])
         expected = original.subtree(binding.root_body_name)
@@ -331,7 +332,6 @@ def test_native_affine_import_units_admission_and_normal_conversion_caller(monke
 
     import mujoco
     import pytest
-    from omegaconf import OmegaConf
 
     from simulator.isaacsim import convert_assets
 
@@ -365,14 +365,7 @@ def test_native_affine_import_units_admission_and_normal_conversion_caller(monke
     model.eq_obj2id[0] = model.joint("right_joint").id
     with pytest.raises(ValueError, match="same FREE articulation"):
         validate_native_mjcf_import(model)
-    assets = {
-        "static": str(tmp_path / "static.usd"),
-        "articulations": {b.entity_name: str(tmp_path / (b.entity_name + ".usd"))
-                          for b in layout.articulations},
-    }
-    config = tmp_path / "run.yaml"
-    OmegaConf.save(OmegaConf.create({"robot": {"native_scene": mapping},
-                                    "sim": {"native_assets": assets}}), config)
+    motion_file = write_native_scene_manifest(tmp_path, mapping)
     events = []
     extensions = ModuleType("isaacsim.core.utils.extensions")
     extensions.enable_extension = Mock(
@@ -389,13 +382,14 @@ def test_native_affine_import_units_admission_and_normal_conversion_caller(monke
     monkeypatch.setitem(sys.modules, "isaaclab.sim.converters", converters)
     complete = Mock(side_effect=lambda path, meta: events.append(("complete", meta)))
     monkeypatch.setattr(convert_assets, "complete_native_usd", complete)
-    convert_assets.convert_native_scene(str(config))
+    convert_assets.convert_native_scene(str(motion_file))
     assert events[0] == ("enable", "isaacsim.asset.importer.mjcf")
     assert [kind for kind, _ in events[1:]] == ["convert", "complete"] * 3 + ["convert"]
     assert [meta.free_roots[0].body_name for kind, meta in events if kind == "complete"] == [
         b.root_body_name for b in layout.articulations
     ]
     configs = [cfg for kind, cfg in events if kind == "convert"]
+    assert {Path(cfg.usd_dir) for cfg in configs} == {tmp_path / "native-usd"}
     assert [cfg.fix_base for cfg in configs] == [False, False, False, True]
     assert all(cfg.import_inertia_tensor and not cfg.make_instanceable for cfg in configs)
     # Failed activation is a conversion capability failure, never a retry with
@@ -404,7 +398,7 @@ def test_native_affine_import_units_admission_and_normal_conversion_caller(monke
     extensions.enable_extension.side_effect = None
     extensions.enable_extension.return_value = False
     with pytest.raises(RuntimeError, match="could not enable isaacsim.asset.importer.mjcf"):
-        convert_assets.convert_native_scene(str(config))
+        convert_assets.convert_native_scene(str(motion_file))
     assert events == []
     # This CPU case proves connected dispatch and units, not USD/PhysX response.
 

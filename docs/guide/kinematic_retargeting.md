@@ -58,9 +58,8 @@ bash scripts/retarget/kinematic_retargeting.sh --profile mjwarp dataset=<prepare
 `--profile newton` uses the same native activation with its selected public
 DexForge packages. Neither profile silently enables native input or skips steps.
 
-The default manifest is `<prepared_dataset>/native-reference.json`; select a
-different dataset-relative manifest with `input.manifest=...`. It declares the
-actual selection and cadence:
+The manifest is `<prepared_dataset>/native-reference.json`. Its clip selection
+and cadence use the following fields:
 
 ```json
 {
@@ -70,6 +69,10 @@ actual selection and cadence:
   "control_period_ns": 20000000
 }
 ```
+
+For training and evaluation, the same manifest supplies `native_scene` and
+`recording_binding`. Resolve the MJCF scene and each named part mesh relative
+to the dataset directory. The manifest can also use absolute materialized paths.
 
 `clip_directory` is relative to the dataset. `clips` contains NPZ stems without
 the suffix; only those clips enter `motion.pt`, even if the directory contains

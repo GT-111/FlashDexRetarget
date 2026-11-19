@@ -12,7 +12,11 @@ from mjlab.utils.lab_api.math import (
 )
 
 from .._common import action_term
-from ..object_points import native_part_reference, native_part_surface_cloud, pack_native_part_surface
+from ..object_points import (
+    native_part_reference,
+    native_part_surface_cloud,
+    pack_native_part_surface,
+)
 from .motion_tracking import MotionTrackingObs
 
 

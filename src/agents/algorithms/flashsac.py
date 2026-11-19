@@ -11,8 +11,13 @@ import torch.optim as optim
 from rsl_rl_flashsac.algorithms import FlashSAC
 from tensordict import TensorDict
 
+from ..modules.actor_critic import (
+    ActorTower,
+    MultiHeadCritic,
+    SideFactoredActor,
+    SideTemperature,
+)
 from ..storage.replay_buffer import ReplayBuffer, ReplayObsLayout
-from ..modules.actor_critic import ActorTower, MultiHeadCritic, SideTemperature, SideFactoredActor
 from ..utils.reward_norm import MultiHeadRewardNormalizer
 
 

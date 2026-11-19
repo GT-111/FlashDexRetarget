@@ -83,11 +83,10 @@ representation, not the declared collider recipe. Objects keep their existing
 `.isaac_usd_colvis` route. Neither converted files nor named-link validation
 qualifies physical contact or task success.
 
-Native FREE-root scenes instead use `robot.native_scene` and named
-`sim.native_assets.static` / `sim.native_assets.articulations` USDs with
-`--native-scene-config <resolved-run.yaml>`. Keep that per-entity route for
-floating hands and passive articulated objects; the stock fixed-root URDF
-binding does not replace it.
+Native FREE-root scenes bind their MJCF and named parts from the
+`native-reference.json` beside `commands.motion_file`. For Isaac,
+`--native-motion-file <dataset>/motion.pt` converts the static scene and
+each named articulation into `<dataset>/native-usd`.
 
 The native scene declares an ordered `objects` collection of actual FREE-base
 articulations. Each owns its original passive joints and named part surfaces.
@@ -100,7 +99,10 @@ does not establish that a trained policy generalizes across layouts or tasks.
 
 ### Native Isaac articulated assets
 
-The native Isaac profile converts the configured MJCF subtrees through the existing `convert_assets.py --native-scene-config <resolved-native-config>` entry. It retains separate FREE hand articulations and one FREE object articulation with its original passive hinge. The scene's named body, actuator and part bindings remain the source of the dimensions and addresses.
+The native Isaac profile uses MJCF subtrees converted by
+`convert_assets.py --native-motion-file <dataset>/motion.pt`. Hands and
+objects each retain their own FREE root. Articulated objects retain their
+passive joints. The manifest supplies named bodies, command actuators and parts.
 
 After the normal Isaac launch, the native converter enables
 `isaacsim.asset.importer.mjcf` through the public extension manager before using
@@ -707,7 +709,11 @@ with weight1, bias0, running mean0 and variance1, while mapped parent columns
 retain their actual values. This initializes the actor function; it does not
 restore a physical episode, curriculum, exploration carry or replay history.
 
-The explicit actor initializer resolves both robot and action scene bindings through `NativeSceneCfg` before comparing their physical meaning. It can read an archived parent's single `object` as one real entry in `objects`; the live child and ordinary runtime/FULL configuration remain collection-only. The scene path, ordered hands, actuators, object roots and parts, root-control law, every other action setting and existing tensor/layout checks must still match. This does not permit adding a hand/object, changing mechanics, remapping unknown action coordinates, or resuming old replay under a changed assistance condition. The initialization receipt records the resolved named scene and whether that archived parent representation was used.
+The explicit actor initializer compares the parent and child resolved
+`NativeSceneCfg` for robot and action. Both configurations use an ordered
+`objects` collection. The scene path, hands, actuators, object roots and parts,
+root-control law, other action settings and tensor layout must match. The
+initialization receipt records the resolved named scene.
 
 Physical worlds and episodes start fresh. Per-world return carry, correlated exploration noise and
 pending n-step transitions are cleared, while learned and running statistics are retained. The replay
@@ -968,13 +974,21 @@ No partial metric callback is promoted to successful task evidence.
 
 Native source phases, exact source clocks, physical clocks, raw interval contacts
 and their support retain the recorder's arrays and dtypes. When the underlying
-`NewtonPlant` exposes post-solve `mjw_data.xfrc_applied` readback, `NativeRolloutRecord`
-also exports `applied_object_wrench_{force_w,torque_w,measurement_support}` and
-`evaluate.py` reports `MEASURED_ZERO_POST_SOLVE` (or `MEASURED_NONZERO_POST_SOLVE`)
-in `evaluation-entry.json`. First-success archives
-keep their existing selection meaning and share the NPZ serializer. Ordinary
-training omits `recording_dir` and continues to write scalar attempt reports
-without automatically storing every rollout.
+plant exposes post-solve `mjw_data.xfrc_applied`, the recorder stores per-part
+force and torque peaks across each control interval with independent solved
+substep support. Reset rows have false interval support. `evaluate.py` reports
+`MEASURED_ZERO_POST_SOLVE` only when every selected attempt has complete
+post-reset interval support and zero force and torque.
+
+The native HOI runner writes `hoi-zero-ready.json` when a FULL checkpoint has
+held exact zero training assistance for 15 curriculum epochs. Run
+`evaluate.py --hoi_qualification nominal` and
+`evaluate.py --hoi_qualification perturbed` with that same `--checkpoint` and
+separate `--recording_dir` and run directories. Both restore the saved
+curriculum for the qualification receipt. The perturbation run applies an
+external disturbance per free object and keeps pose assistance off. Production
+compilation consumes selected nominal attempts paired with their disturbance
+witnesses. Periodic training evaluations write scalar attempt reports.
 
 ## Outputs
 

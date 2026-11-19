@@ -16,6 +16,53 @@ import hydra  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
 
 
+def _restore_hoi_zero_curriculum(command, checkpoint, env_step, source_revision, control_step):
+    import torch
+
+    from agents.flashsac import REPLAY_BUFFER_FILE
+    from runner.off_policy_runner import LEARNING_STATE_FILE
+
+    if not (checkpoint / REPLAY_BUFFER_FILE).is_file():
+        raise ValueError("HOI qualification requires a FULL checkpoint including replay")
+    state = torch.load(checkpoint / LEARNING_STATE_FILE, map_location="cpu", weights_only=False)
+    ctrl = command._xfrc_curr_ctrl
+    saved = state.get("native_hoi_zero")
+    if (ctrl is None or not saved or state["env_step"] != env_step
+            or state.get("native_hoi_source_revision") != source_revision):
+        raise ValueError("FULL checkpoint does not bind a continuous zero-hold receipt and this executable source")
+    ctrl.load_state_dict(state["curriculum"], control_step)
+    if ctrl.hoi_zero_receipt() != saved:
+        raise ValueError("actual restored FULL curriculum disagrees with its zero-hold receipt")
+    return {**saved, "restored": True}
+
+
+def _recorded_wrench_summary(outcome_dir):
+    report, = outcome_dir.glob("current-policy-*.json")
+    outcome = json.loads(report.read_text())
+    manifest = (outcome_dir / outcome["factual_recording_manifest"]).resolve()
+    records = [
+        attempt["recording"].get("applied_wrench_interval")
+        for motion in json.loads(manifest.read_text())["motions"] for attempt in motion["attempts"]
+    ]
+    measured = [record for record in records if record is not None]
+    complete = bool(records and len(measured) == len(records) and all(record["complete"] for record in measured))
+    measured_intervals = sum(record["measured_intervals"] for record in measured)
+    force = max((record["peak_force_n"] for record in measured), default=0.0)
+    torque = max((record["peak_torque_nm"] for record in measured), default=0.0)
+    if not complete:
+        status = "MEASURED_PARTIAL_POST_SOLVE" if measured_intervals else "MEASURED_NO_SUPPORTED_STEPS"
+    else:
+        status = "MEASURED_ZERO_POST_SOLVE" if force == 0.0 and torque == 0.0 else "MEASURED_NONZERO_POST_SOLVE"
+    return status, {
+        "manifest": str(manifest),
+        "attempts": len(records),
+        "complete_attempts": sum(record["complete"] for record in measured),
+        "measured_intervals": measured_intervals,
+        "max_force_n": force,
+        "max_torque_nm": torque,
+    }
+
+
 def run(args: argparse.Namespace) -> None:
     source_revision = os.environ.get("FLASH_SOURCE_REF")
     recording_dir = (None if args.recording_dir is None
@@ -26,10 +73,21 @@ def run(args: argparse.Namespace) -> None:
     config_dir = (Path(__file__).resolve().parent / args.config_path).resolve()
     with hydra.initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         cfg = hydra.compose(config_name=args.config_name, overrides=args.overrides)
+
+    from common.native_reference import bind_prepared_native_reference
+
+    bind_prepared_native_reference(cfg)
     policy_cfg = cfg.eval.get("policy")
     if (args.checkpoint is None) == (policy_cfg is None):
         raise ValueError("select exactly one --checkpoint or configured eval.policy")
     checkpoint = None if args.checkpoint is None else Path(args.checkpoint).expanduser().resolve()
+    qualification_mode = getattr(args, "hoi_qualification", None)
+    if qualification_mode is not None:
+        if checkpoint is None or recording_dir is None:
+            raise ValueError("HOI qualification requires --checkpoint and --recording_dir")
+        if (cfg.eval.command.sampling_mode != "start" or int(cfg.eval.command.start_frame) != 0
+                or float(cfg.eval.command.noise_to_initial_level) != 0.0):
+            raise ValueError("HOI qualification requires the whole reference from its exact reset")
     resume = None if checkpoint is None else json.loads((checkpoint / "resume_state.json").read_text())
     env_step = 0 if resume is None else int(resume["env_step"])
     run_dir = Path(cfg.run_dir).expanduser().resolve()
@@ -47,7 +105,7 @@ def run(args: argparse.Namespace) -> None:
         "executable_source": str(Path(__file__).resolve()),
         "executable_source_revision": source_revision,
         "factual_recording_dir": None if recording_dir is None else str(recording_dir),
-        "training_resume_fields": "Not consumed: this entry does not construct a runner or load learning/replay state.",
+        "training_resume_fields": "HOI qualification restores the FULL curriculum; evaluation consumes no training replay.",
         "assistance_scope": "Saved training curriculum and evaluation pin authority are separate.",
         "wrench_measurement": "UNKNOWN: no accepted/applied object-wrench readback is exposed by the ordinary evaluation interface.",
     }
@@ -98,9 +156,17 @@ def run(args: argparse.Namespace) -> None:
                 authority["layout"] = {"action_shape": list(raw_eval.action_space.shape),
                                        "observation_consumption": "configured analytic Policy; no learned observation encoder"}
             OmegaConf.save(cfg, str(run_dir / "config.yaml"))
+            if qualification_mode is not None:
+                if not hasattr(command, "native_layout"):
+                    raise ValueError("HOI qualification requires a prepared native scene")
+                zero = _restore_hoi_zero_curriculum(command, checkpoint, env_step, source_revision,
+                                                    raw_eval.common_step_counter)
+                authority["hoi_qualification"] = {"mode": qualification_mode, "zero_curriculum": zero}
             authority["configured_disable_object_pin"] = bool(cfg.eval.env.disable_object_pin)
             authority["pin_before_eval"] = bool(command.cfg.object.pin_objects)
             eval_env.enter_eval()
+            if qualification_mode == "perturbed":
+                command.enable_hoi_evaluation_perturbation()
             authority["pin_during_eval"] = bool(command.cfg.object.pin_objects)
             authority["shared_eval_wrench_clear"] = "Ordinary enter_eval called its existing object-wrench clear; this is a submitted clear, not force measurement."
             authority["evaluation_plan"] = {
@@ -115,46 +181,25 @@ def run(args: argparse.Namespace) -> None:
             }
             authority["status"] = "ENTERED_EVAL_NOT_COMPLETED"
             receipt.write_text(json.dumps(authority, indent=2) + "\n")
+            frozen_authority = None if recording_dir is None else {
+                "checkpoint": None if checkpoint is None else str(checkpoint),
+                "source_revision": source_revision,
+                "training_env_step": None if resume is None else env_step, "policy": authority["policy"],
+            }
+            if qualification_mode is not None:
+                frozen_authority["hoi_qualification"] = authority["hoi_qualification"]
             metrics = evaluate(
                 policy, eval_env, cfg.eval, cfg.device,
                 ever_state=None, success_dir=None, env_step=env_step,
                 outcome_dir=run_dir / "evaluation",
                 recording_dir=recording_dir,
-                frozen_authority=(None if recording_dir is None else {
-                    "checkpoint": None if checkpoint is None else str(checkpoint), "source_revision": source_revision,
-                    "training_env_step": None if resume is None else env_step, "policy": authority["policy"],
-                }),
+                frozen_authority=frozen_authority,
             )
             print(f"[evaluation] training_env_step={env_step} {metrics}", flush=True)
-            scene_owner = getattr(raw_eval, "scene", None)
-            applied_reader = getattr(scene_owner, "applied_object_wrench_facts", None)
-            applied_last = None if applied_reader is None else applied_reader()
-            if applied_last is not None:
-                # Inspect recorded NPZs when recording_dir is present for full-sweep max, else last post-eval readback
-                max_f = float(applied_last["force_w"].abs().max().item())
-                max_t = float(applied_last["torque_w"].abs().max().item())
-                measured_frames = int(applied_last["measurement_support"].sum().item())
-                if recording_dir is not None:
-                    import numpy as np
-                    for npz_p in Path(recording_dir).rglob("*.npz"):
-                        with np.load(npz_p, allow_pickle=False) as z:
-                            if "applied_object_wrench_force_w" in z and "applied_object_wrench_measurement_support" in z:
-                                sup = z["applied_object_wrench_measurement_support"].astype(bool)
-                                if sup.any():
-                                    max_f = max(max_f, float(np.abs(z["applied_object_wrench_force_w"][sup]).max()))
-                                    max_t = max(max_t, float(np.abs(z["applied_object_wrench_torque_w"][sup]).max()))
-                                    measured_frames += int(sup.sum())
-                authority["wrench_measurement"] = (
-                    "MEASURED_ZERO_POST_SOLVE" if (max_f == 0.0 and max_t == 0.0 and measured_frames > 0)
-                    else "MEASURED_NONZERO_POST_SOLVE" if measured_frames > 0
-                    else "MEASURED_NO_SUPPORTED_STEPS"
+            if recording_dir is not None:
+                authority["wrench_measurement"], authority["applied_object_wrench_summary"] = (
+                    _recorded_wrench_summary(run_dir / "evaluation")
                 )
-                authority["applied_object_wrench_summary"] = {
-                    "authority": applied_last["authority"],
-                    "max_abs_force_n": max_f,
-                    "max_abs_torque_nm": max_t,
-                    "measured_endpoint_samples": measured_frames,
-                }
             authority["status"] = "COMPLETED_CURRENT_POLICY_EVALUATION"
             authority["pin_after_eval"] = bool(command.cfg.object.pin_objects)
             authority["success_ever_or_archive_selection"] = "Not loaded or selected; ordinary current-policy outcomes retain all attempted/failed/unscored motions."
@@ -180,6 +225,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--checkpoint", help="Frozen learned policy; omit when eval.policy selects an analytic Policy")
     parser.add_argument("--recording_dir", help="Retain every attempt with the configured rollout recorder")
+    parser.add_argument("--hoi_qualification", choices=("nominal", "perturbed"),
+                        help="Record an exact zero-hold FULL checkpoint under the selected HOI test condition")
     parser.add_argument("--config_path", default="config")
     parser.add_argument("--config_name", default="flashdexretarget")
     parser.add_argument("--overrides", action="append", default=[])

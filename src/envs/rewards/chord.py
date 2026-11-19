@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 import torch
 from mjlab.utils.lab_api.math import matrix_from_quat
 
-from ..observations.motion_tracking import _chord_tips_cmd_w, _chord_wrist_cmd_w, _load_obj_verts
+from ..observations.motion_tracking import (
+    _chord_tips_cmd_w,
+    _chord_wrist_cmd_w,
+    _load_obj_verts,
+)
 from .base import _cmd, _mean_over_sides, _side_idx
 
 if TYPE_CHECKING:

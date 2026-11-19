@@ -270,39 +270,22 @@ def test_multiple_object_reset_and_assistance_follow_actual_tree_ownership():
 def test_native_profile_builds_real_box_and_rigid_managers(tmp_path):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
+    from test_native_contract import _scene, write_native_scene_manifest
 
+    from common.native_reference import bind_prepared_native_reference
     from envs import build_manager_cfgs
     from envs.scene.native import bind_native_scene_config
 
-    environment = {
-        "FDR_NATIVE_SCENE_XML": str(tmp_path / "synthetic.xml"),
-        "FDR_NATIVE_USD_DIR": str(tmp_path),
-        "FDR_NATIVE_BOX_BASE_MESH": "base.obj",
-        "FDR_NATIVE_BOX_LID_MESH": "lid.obj",
-        "FDR_NATIVE_OBJECT_ROOT_BODY": "rigid_root",
-        "FDR_NATIVE_OBJECT_ROOT_JOINT": "rigid_free",
-        "FDR_NATIVE_OBJECT_MESH": "rigid.obj",
-    }
-    with (
-        patch.dict("os.environ", environment),
-        initialize_config_dir(
-            config_dir=str(Path(__file__).resolve().parents[1] / "config"),
-            version_base=None,
-        ),
+    with initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "config"), version_base=None,
     ):
-        OmegaConf.register_new_resolver(
-            "eval", lambda expression: eval(expression), replace=True
-        )
-        for family, count in (("box", 2), ("rigid", 1)):
-            cfg = compose(
-                config_name="native",
-                overrides=[
-                    f"envs/native_object@native_object={family}",
-                    "commands.motion_file=synthetic.pt",
-                ],
-            )
-            assert OmegaConf.is_missing(cfg, "native_recording_binding")
-            cfg.native_recording_binding = "synthetic-recording-binding.json"
+        OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
+        for count in (2, 1):
+            _, mapping = _scene(tmp_path)
+            del mapping["objects"][0]["parts"][count:]
+            motion_file = write_native_scene_manifest(tmp_path, mapping)
+            cfg = compose(config_name="native", overrides=[f"commands.motion_file={motion_file}"])
+            bind_prepared_native_reference(cfg)
             cfg.native_tracking_tolerances = {
                 "root_position_error_m": 0.03,
                 "root_rotation_error_rad": 0.1,
@@ -691,7 +674,7 @@ def _configured_native_runner(tmp_path, monkeypatch, command_name):
     import numpy as np
     from hydra import compose, initialize_config_dir
     from mjlab.managers import ActionManager, CommandManager, RewardManager
-    from omegaconf import OmegaConf, open_dict
+    from omegaconf import OmegaConf
     from test_native_reference import _pipeline_config, _prepared_native_dataset
 
     import runner.off_policy_runner as runner_module
@@ -700,36 +683,36 @@ def _configured_native_runner(tmp_path, monkeypatch, command_name):
     from retarget.kinematic_retargeting import PreparedNativeInput
 
     dataset, clip = _prepared_native_dataset(tmp_path)
-    PreparedNativeInput(dataset, _pipeline_config(dataset), 1, "native-reference.json").pack()
+    PreparedNativeInput(dataset, _pipeline_config(dataset), 1).pack()
     native = clip["native_reference"]
     mesh = str(dataset / "objects/synthetic-mesh/visual.obj")
-    environment = {"FDR_NATIVE_SCENE_XML": "synthetic-not-read.xml",
-                   "FDR_NATIVE_USD_DIR": str(tmp_path),
-                   "FDR_NATIVE_BOX_BASE_MESH": mesh, "FDR_NATIVE_BOX_LID_MESH": mesh}
-    with patch.dict("os.environ", environment), initialize_config_dir(
+    from test_native_contract import write_native_scene_manifest
+
+    from common.native_reference import bind_prepared_native_reference
+
+    mapping = dict(
+        scene_xml_path="synthetic-not-read.xml",
+        hands=[dict(side=side, entity_name=side, root_body_name=body,
+            root_joint_name=side + "_free", command_actuator_names=["command_" + side],
+            tip_site_names=[side + "_tip"], root_control=dict(position_stiffness=0,
+                position_damping=0, rotation_stiffness=0, rotation_damping=0,
+                force_limit_n=None, torque_limit_nm=None))
+            for side, body in native["root_body_names"].items()],
+        objects=(dict(entity_name=next(iter(native["object_root_body_names"])), root_body_name="base",
+            root_joint_name="object_free", parts=[dict(name=body, body_name=body, mesh_path=mesh)
+                for body in native["object_part_body_names"]]),),
+    )
+    motion_file = write_native_scene_manifest(dataset, mapping)
+    with initialize_config_dir(
         config_dir=str(Path(__file__).resolve().parents[1] / "config"), version_base=None,
     ):
         OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
         cfg = compose(config_name="native", overrides=[f"commands.name={command_name}",
-            f"commands.motion_file={dataset / 'motion.pt'}", "device=cpu", "num_envs=1",
+            f"commands.motion_file={motion_file}", "device=cpu", "num_envs=1",
             f"run_dir={tmp_path / 'run'}"])
-        cfg.native_recording_binding = "synthetic-not-read-binding.json"
         cfg.native_tracking_tolerances = {name: .1 for name in cfg.native_tracking_tolerances}
-        with open_dict(cfg.robot):
-            cfg.robot.native_scene = dict(
-                scene_xml_path="synthetic-not-read.xml",
-                hands=[dict(side=side, entity_name=side, root_body_name=body,
-                    root_joint_name=side + "_free", command_actuator_names=["command_" + side],
-                    root_control=dict(position_stiffness=0, position_damping=0,
-                        rotation_stiffness=0, rotation_damping=0,
-                        force_limit_n=None, torque_limit_nm=None))
-                    for side, body in native["root_body_names"].items()],
-                objects=(dict(entity_name=next(iter(native["object_root_body_names"])), root_body_name="base",
-                    root_joint_name="object_free", parts=[dict(name=body, body_name=body, mesh_path=mesh)
-                        for body in native["object_part_body_names"]]),))
-            cfg.robot.site_names = {kind: {side: [side + "_tip"] for side in ("left", "right")}
-                                    for kind in ("tip", "contact")}
-            cfg.robot.body_mapping = dict(all=[], level1={}, level2={})
+        cfg.robot.body_mapping = dict(all=[], level1={}, level2={})
+        bind_prepared_native_reference(cfg)
         bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=(0., 0., -9.81))
         OmegaConf.resolve(cfg)
     assert cfg.per_hand_actor_critic and cfg.runner.agent.reward_heads.enable

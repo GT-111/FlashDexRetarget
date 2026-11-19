@@ -37,11 +37,13 @@ terminations:
 eval:
   interval: 500_000
   num_per_motion: 1
-  save_success_data: true
+  save_success_data: false
   success_criterion: full
-  stop_when_all_solved: true
+  stop_when_all_solved: false
 
 actions:
+  translation_residual_m: 0.04
+  rotation_residual_rad: 0.35
   finger_residual_rad: 0.55
   wrist_target_twist: filtered_correction_feedforward
   cutoff_hz:
@@ -94,8 +96,8 @@ curriculum:
         imi: [native_root_pose]
         bc: [native_command_bc]
       rew_thresholds: {task: 0.38, imi: 0.005, bc: 0.005}
-      upper_ratios: {kp: 0.72, kv: 0.75, fr: 1.0}
-      lower_ratios: {kp: 0.55, kv: 0.60, fr: 1.0}
+      upper_ratios: {kp: 0.72, kv: 0.75, fr: 0.78}
+      lower_ratios: {kp: 0.55, kv: 0.60, fr: 0.78}
       dialback_ratios: {kp: 0.98, kv: 0.98, fr: 0.98}
 
 obs:
@@ -132,9 +134,9 @@ obs:
       n_obj_verts: ${native_surface.n_obj_verts}
 
 rewards:
-  shared_terms: [native_object_part_pose, native_part_surface_displacement, native_object_articulation, termination_penalty]
+  shared_terms: [native_object_part_pose, native_part_surface_displacement, native_object_articulation, native_contact_overload, termination_penalty]
   reward_weights:
-    native_object_part_pose: 0.0
+    native_object_part_pose: 0.5
     native_part_surface_displacement: 1.0
     native_object_articulation: 0.3
     native_source_hand_part_contact: 0.5
@@ -142,12 +144,14 @@ rewards:
     native_source_tip_position: 0.2
     native_root_pose: 0.3
     native_command_bc: 0.2
+    native_contact_overload: -0.15
     action_penalty: -0.003
     termination_penalty: -50.0
   reward_scales:
     native_command_bc: 500.0
     native_source_tip_position: 20.0
   reward_params:
+    native_contact_overload: {threshold_n: 35.0}
     native_part_surface_displacement:
       scale: 10.0
       n_points: ${native_surface.n_points}

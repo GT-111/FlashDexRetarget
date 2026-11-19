@@ -7,7 +7,6 @@ defaults:
   - actions: native
   - commands: motion_tracking
   - simulator: native_isaacsim
-  - native_object: box
   - _self_
 
 num_envs: 2048

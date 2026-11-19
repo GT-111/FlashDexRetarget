@@ -163,47 +163,28 @@ def test_actor_input_extension_preserves_equal_named_layout_with_fresh_learning_
             )
 
 
-def _archive_single_object_scene(config):
-    """Write the actual archived parent schema; never used for the live child."""
-    payload = OmegaConf.to_container(config, resolve=True)
-    for scene in (payload["robot"]["native_scene"], payload["actions"]["native_scene"]):
-        scene["object"] = scene.pop("objects")[0]
-    return OmegaConf.create(payload)
-
-
-def test_actor_input_extension_preserves_archived_singleton_actor_in_collection_scene(tmp_path):
+def test_actor_input_extension_rejects_archived_single_object_scene(tmp_path, monkeypatch):
     parent, info = _input_extension_agent()
-    checkpoint, parent_run = tmp_path / "parent-checkpoint", tmp_path / "parent-run"
-    parent.save(str(checkpoint))
-    old_config = _archive_single_object_scene(_input_extension_config(parent, info, parent_run))
-    OmegaConf.save(old_config, parent_run / "config.yaml", resolve=True)
-    child, new_info = _input_extension_agent()
-    child_run = tmp_path / "child-run"
-    _input_extension_config(child, new_info, child_run)
-    fresh = deepcopy(child._alg.save())
-
-    authority = child.initialize_actor_input_extension(
-        str(checkpoint), str(parent_run / "config.yaml"), str(child_run / "config.yaml"),
-    )
-    after = child._alg.save()
-    _tree_equal(after["actor_state_dict"], parent._alg.actor.state_dict())
-    for key in fresh.keys() - {"actor_state_dict"}:
-        _tree_equal(after[key], fresh[key])
-    observations = torch.linspace(-.9, 1.1, 5 * parent._layout.full_dim).reshape(5, -1)
-    torch.testing.assert_close(torch.from_numpy(child.act(observations, deterministic=True)),
-                               torch.from_numpy(parent.act(observations, deterministic=True)), rtol=0, atol=0)
-    assert authority["native_scene_validation"]["archived_singleton_parent"]
-    assert authority["native_scene_validation"]["object_entities"] == ["fixture_object"]
-    assert authority["added_flat_terms"] == []
-    assert not child._alg.replay_buffer._num_in_buffer
-    assert not child._alg.actor_optimizer.state and not child._alg.critic_optimizer.state
+    parent_run, child_run = tmp_path / "parent-run", tmp_path / "child-run"
+    old = _input_extension_config(parent, info, parent_run)
+    payload = OmegaConf.to_container(old, resolve=True)
+    scene = payload["robot"]["native_scene"]
+    scene["object"] = scene.pop("objects")[0]
+    OmegaConf.save(OmegaConf.create(payload), parent_run / "config.yaml")
+    child, child_info = _input_extension_agent()
+    _input_extension_config(child, child_info, child_run)
+    monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: pytest.fail("check the scene before model read"))
+    with pytest.raises(ValueError, match="declared object articulations"):
+        child.initialize_actor_input_extension(
+            str(tmp_path / "not-opened-checkpoint"), str(parent_run / "config.yaml"), str(child_run / "config.yaml"),
+        )
 
 
 @pytest.mark.parametrize("mismatch", ["root_law", "actuator", "part", "object_count", "action", "parent_action"])
 def test_actor_input_extension_rejects_changed_native_semantics_before_model_read(tmp_path, monkeypatch, mismatch):
     parent, info = _input_extension_agent()
     parent_run, child_run = tmp_path / "parent-run", tmp_path / "child-run"
-    old = _archive_single_object_scene(_input_extension_config(parent, info, parent_run))
+    old = _input_extension_config(parent, info, parent_run)
     child, current_info = _input_extension_agent()
     current = OmegaConf.to_container(_input_extension_config(child, current_info, child_run), resolve=True)
     if mismatch == "root_law":
@@ -220,7 +201,7 @@ def test_actor_input_extension_rejects_changed_native_semantics_before_model_rea
     elif mismatch == "action":
         current["actions"]["translation_residual_m"] = .2
     else:
-        old.actions.native_scene.object.parts[0].body_name = "different_parent_action_part"
+        old.actions.native_scene.objects[0].parts[0].body_name = "different_parent_action_part"
     OmegaConf.save(old, parent_run / "config.yaml", resolve=True)
     OmegaConf.save(OmegaConf.create(current), child_run / "config.yaml", resolve=True)
     monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: pytest.fail("native semantics must be checked before model read"))
@@ -776,6 +757,59 @@ def test_curriculum_restores_histories_and_partial_epoch_on_fresh_control_clock(
         _curriculum_step(restored, fresh_env, fresh_step)
     # Physical episode lengths differ; global history, phase, gains and decisions agree.
     assert restored.state_dict() == original.state_dict()
+
+
+def test_hoi_zero_hold_requires_fifteen_actual_epochs_after_adaptive_decay():
+    curriculum, env = _curriculum()
+    curriculum.upper_ratios = dict.fromkeys(curriculum.decay_terms, 0.01)
+    curriculum.kp_zero_thres = 1.0
+    for step in range(1, 17):
+        _curriculum_step(curriculum, env, step)
+        if curriculum.has_zero_gains():
+            break
+    assert curriculum.has_zero_gains()
+    assert curriculum.hoi_zero_receipt() is None
+    first_zero_step = step
+    for step in range(first_zero_step + 1, first_zero_step + 14 * 4 + 1):
+        _curriculum_step(curriculum, env, step)
+    assert curriculum.num_epoch_since_last_decay == 14
+    assert curriculum.hoi_zero_receipt() is None
+
+    restored, fresh = _curriculum()
+    restored.load_state_dict(curriculum.state_dict(), fresh.common_step_counter)
+    for step in range(1, 5):
+        _curriculum_step(restored, fresh, step)
+    assert restored.hoi_zero_receipt() == {
+        "upper": dict.fromkeys(restored.decay_terms, 0.0),
+        "lower": dict.fromkeys(restored.decay_terms, 0.0),
+        "continuous_zero_epochs": 15,
+        "required_zero_epochs": 15,
+    }
+    restored.curr_gains_lower["fr"] = 1e-15
+    assert restored.hoi_zero_receipt() is None
+
+
+def test_hoi_frozen_evaluation_checks_actual_restored_full_curriculum(tmp_path):
+    from evaluate import _restore_hoi_zero_curriculum
+
+    trained, _ = _curriculum()
+    trained.gain_history.append({"gains": trained.curr_gains.copy(), "lower": trained.curr_gains_lower.copy()})
+    trained.curr_gains = dict.fromkeys(trained.decay_terms, 0.0)
+    trained.curr_gains_lower = dict.fromkeys(trained.decay_terms, 0.0)
+    trained.num_epoch_since_last_decay = 15
+    state = {"env_step": 512, "curriculum": trained.state_dict(),
+             "native_hoi_zero": trained.hoi_zero_receipt(), "native_hoi_source_revision": "test-source"}
+    (tmp_path / "replay_buffer.pt").touch()
+    torch.save(state, tmp_path / LEARNING_STATE_FILE)
+    restored, _ = _curriculum()
+    command = SimpleNamespace(_xfrc_curr_ctrl=restored)
+    receipt = _restore_hoi_zero_curriculum(command, tmp_path, 512, "test-source", 0)
+    assert receipt == {**state["native_hoi_zero"], "restored": True}
+
+    state["curriculum"]["curr_gains_lower"]["fr"] = 1e-15
+    torch.save(state, tmp_path / LEARNING_STATE_FILE)
+    with pytest.raises(ValueError, match="restored FULL curriculum disagrees"):
+        _restore_hoi_zero_curriculum(command, tmp_path, 512, "test-source", 0)
 
 
 def test_shared_env_runner_reset_does_not_count_old_physical_episode_as_completed():
@@ -1477,6 +1511,7 @@ def test_frozen_evaluation_entry_routes_public_policy_and_ordinary_evaluator(tmp
     run_dir = tmp_path / "run"
     cfg = OmegaConf.create({
         "run_dir": str(run_dir), "seed": 42, "device": "cpu", "headless": True,
+        "commands": {"_target_": "envs.commands.motion_tracking.motion_tracking_cfg.MotionTrackingCommandCfg"},
         "runner": {"share_actor_critic_obs": True,
                    "agent": {"class_name": "agents.flashsac.FlashSACAgent"}},
         "eval": {"command_name": "native_reference", "num_per_motion": 1,
@@ -1536,6 +1571,14 @@ def test_frozen_evaluation_entry_routes_public_policy_and_ordinary_evaluator(tmp
                           "outcome_dir": run_dir / "evaluation", "recording_dir": recording_dir,
                           "frozen_authority": frozen_authority}
         assert not command.cfg.object.pin_objects
+        if recording_dir is not None:
+            outcome_dir = kwargs["outcome_dir"]
+            outcome_dir.mkdir()
+            recording_dir.mkdir()
+            (recording_dir / "manifest.json").write_text(json.dumps({"motions": []}))
+            (outcome_dir / "current-policy-fixture.json").write_text(
+                json.dumps({"factual_recording_manifest": "../recordings/manifest.json"})
+            )
         events.append("ordinary_evaluate")
         return {"eval/SR": 0.}
 
@@ -1555,5 +1598,9 @@ def test_frozen_evaluation_entry_routes_public_policy_and_ordinary_evaluator(tmp
     result = json.loads((run_dir / "evaluation-entry.json").read_text())
     assert result["status"] == "COMPLETED_CURRENT_POLICY_EVALUATION"
     assert result["training_env_step"] == 39_290_880 and result["pin_during_eval"] is False
-    assert result["wrench_measurement"].startswith("UNKNOWN")
+    if recording:
+        assert result["wrench_measurement"] == "MEASURED_NO_SUPPORTED_STEPS"
+        assert result["applied_object_wrench_summary"]["manifest"] == str(recording_dir / "manifest.json")
+    else:
+        assert result["wrench_measurement"].startswith("UNKNOWN")
     assert result["factual_recording_dir"] == (None if recording_dir is None else str(recording_dir))

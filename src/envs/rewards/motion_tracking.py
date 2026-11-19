@@ -7,12 +7,12 @@ import torch
 from mjlab.sensor import ContactSensor
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_error_magnitude
 
+from .._common import action_term
 from ..observations.motion_tracking import (
     _keypoints_per_env,
     _obj_keypoints,
     _obj_surface_keypoints,
 )
-from .._common import action_term
 from .base import BaseRewards, _cmd, _mean_over_sides, _side_idx
 from .chord import ChordRewards
 

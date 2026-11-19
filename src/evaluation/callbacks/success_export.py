@@ -31,9 +31,23 @@ def _write_rollout(path: Path, arrays: dict[str, Any]) -> dict[str, Any]:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
-    return {"frames": int(arrays["joint_pos"].shape[0]),
-            "recording": str(arrays.get("recording", "author-post-step-recording")),
-            "fields": sorted(arrays)}
+    record = {
+        "frames": int(arrays["joint_pos"].shape[0]),
+        "recording": str(arrays.get("recording", "author-post-step-recording")),
+        "fields": sorted(arrays),
+    }
+    prefix = "applied_object_wrench_interval_"
+    if prefix + "measurement_support" in arrays:
+        support = arrays[prefix + "measurement_support"]
+        force = arrays[prefix + "peak_force_n"]
+        torque = arrays[prefix + "peak_torque_nm"]
+        record["applied_wrench_interval"] = {
+            "complete": bool(len(support) > 1 and not support[0] and support[1:].all()),
+            "measured_intervals": int(support.sum()),
+            "peak_force_n": float(force[support].max(initial=0.0)),
+            "peak_torque_nm": float(torque[support].max(initial=0.0)),
+        }
+    return record
 
 
 def export_current_attempts(

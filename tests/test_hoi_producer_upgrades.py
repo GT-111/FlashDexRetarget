@@ -9,7 +9,9 @@ import hydra
 import pytest
 import torch
 from omegaconf import OmegaConf, open_dict
+from test_native_contract import _scene, write_native_scene_manifest
 
+from common.native_reference import bind_prepared_native_reference
 from envs.rewards.native import NativeMotionTrackingRewards
 from envs.scene.native import bind_native_scene_config
 
@@ -25,59 +27,82 @@ SIX_HAND_ROBOT_CONFIGS = (
 )
 
 
-@pytest.mark.parametrize("robot_cfg", SIX_HAND_ROBOT_CONFIGS)
-def test_six_hand_hoi_surface_hydra_configs_compose(robot_cfg: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FDR_NATIVE_SCENE_XML", "/tmp/dummy_scene.xml")
-    monkeypatch.setenv("FDR_NATIVE_OBJECT_ROOT_BODY", "oakink_obj_body")
-    monkeypatch.setenv("FDR_NATIVE_OBJECT_ROOT_JOINT", "oakink_obj_free")
-    monkeypatch.setenv("FDR_NATIVE_OBJECT_MESH", "/tmp/dummy.obj")
+def _native_hoi_config(motion_file, robot_cfg="inspire_rh56f1_bimanual"):
     OmegaConf.register_new_resolver("eval", lambda s: eval(s), replace=True)
     with hydra.initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
-        cfg = hydra.compose(
+        return hydra.compose(
             config_name="native_hoi_surface",
             overrides=[
                 f"envs/robot@robot={robot_cfg}",
                 "envs/simulator@simulator=newton",
-                "envs/native_object@native_object=rigid",
-                "commands.motion_file=/tmp/dummy_motion.pt",
-                "native_recording_binding={}",
+                f"commands.motion_file={motion_file}",
             ],
         )
+
+
+@pytest.mark.parametrize("robot_cfg", SIX_HAND_ROBOT_CONFIGS)
+def test_six_hand_hoi_surface_hydra_configs_compose(robot_cfg: str, tmp_path: Path) -> None:
+    _, mapping = _scene(tmp_path)
+    cfg = _native_hoi_config(tmp_path / "motion.pt", robot_cfg)
+    for hand in mapping["hands"]:
+        side = hand["side"]
+        hand["tip_site_names"] = [f"{side}_{digit}_pad" for digit in cfg.robot.body_names.fingers]
+    write_native_scene_manifest(tmp_path, mapping)
+    bind_prepared_native_reference(cfg)
+    OmegaConf.resolve(cfg)
+
+    assert cfg.robot.xml_path == mapping["scene_xml_path"]
+    assert cfg.actions.native_scene == cfg.robot.native_scene
+    assert cfg.native_recording_binding.fixture == "native scene"
+    recorder = hydra.utils.instantiate(cfg.eval.callbacks[-1])
+    assert recorder.binding["scene_identity"]["native_scene"]["scene_xml_path"] == cfg.robot.xml_path
+    assert isinstance(recorder.binding["scene_identity"]["native_scene"]["hands"], list)
+    assert not cfg.sim.get("native_assets")
+    for hand in mapping["hands"]:
+        assert list(cfg.robot.site_names.tip[hand["side"]]) == hand["tip_site_names"]
+        assert list(cfg.robot.site_names.contact[hand["side"]]) == hand["tip_site_names"]
+
     assert cfg.rewards.reward_weights.native_source_hand_part_contact > 0.0
     assert cfg.rewards.reward_params.native_source_hand_part_contact.require_thumb_opposition is True
     assert 0.0 < float(cfg.commands.object.xfrc.contact_scale) < 1.0
     assert cfg.commands.object.perturb.enabled is True
     assert cfg.commands.object.perturb.require_assist_decayed is True
-    hands = cfg.robot.native_scene.hands
-    assert len(hands) == 2 and {h.side for h in hands} == {"left", "right"}
-    # Strict anatomy check for 3-finger Dex3 and 4-finger Wonik
+    assert cfg.actions.translation_residual_m == 0.04
+    assert cfg.actions.rotation_residual_rad == 0.35
+    assert cfg.curriculum.xfrc_curriculum_adaptive.params.upper_ratios.fr == 0.78
+    assert cfg.rewards.reward_weights.native_contact_overload < 0.0
+    assert cfg.eval.stop_when_all_solved is False
     if robot_cfg == "unitree_dex3_1_bimanual":
         assert list(cfg.robot.body_names.fingers) == ["thumb", "index", "middle"]
-        assert len(cfg.robot.site_names.tip.left) == 3
+        left, right = (tuple(joint.removeprefix(side + "_") for joint in cfg.robot.joint_names.finger
+                             if joint.startswith(side + "_")) for side in ("left", "right"))
+        assert left == right
     elif robot_cfg == "wonik_allegro_v5_bimanual":
         assert list(cfg.robot.body_names.fingers) == ["thumb", "index", "middle", "ring"]
-        assert len(cfg.robot.site_names.tip.left) == 4
+    elif robot_cfg == "wuji_hand_bimanual":
+        body_by_role = {role: names for names, role in cfg.robot.body_mapping.all}
+        for finger, role in ((3, "middle"), (4, "ring"), (5, "pinky")):
+            assert body_by_role[role + "_proximal"] == {
+                side: f"{side}_finger{finger}_link1" for side in ("left", "right")
+            }
 
 
-def test_bind_native_scene_config_admits_contact_scale_and_post_decay_perturb(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FDR_NATIVE_SCENE_XML", "/tmp/dummy_scene.xml")
-    monkeypatch.setenv("FDR_NATIVE_OBJECT_ROOT_BODY", "oakink_obj_body")
-    monkeypatch.setenv("FDR_NATIVE_OBJECT_ROOT_JOINT", "oakink_obj_free")
-    monkeypatch.setenv("FDR_NATIVE_OBJECT_MESH", "/tmp/dummy.obj")
-    OmegaConf.register_new_resolver("eval", lambda s: eval(s), replace=True)
-    with hydra.initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
-        cfg = hydra.compose(
-            config_name="native_hoi_surface",
-            overrides=[
-                "envs/robot@robot=inspire_rh56f1_bimanual",
-                "envs/simulator@simulator=newton",
-                "envs/native_object@native_object=rigid",
-                "commands.motion_file=/tmp/dummy_motion.pt",
-                "native_recording_binding={}",
-            ],
-        )
+def test_native_reference_requires_an_embedded_binding(tmp_path: Path) -> None:
+    import json
+
+    _, mapping = _scene(tmp_path)
+    motion_file = tmp_path / "motion.pt"
+    motion_file.with_name("native-reference.json").write_text(json.dumps({"native_scene": mapping}))
+    with pytest.raises(ValueError, match="requires a recording_binding mapping"):
+        bind_prepared_native_reference(_native_hoi_config(motion_file))
+
+
+def test_bind_native_scene_config_admits_contact_scale_and_post_decay_perturb(tmp_path: Path) -> None:
+    _, mapping = _scene(tmp_path)
+    cfg = _native_hoi_config(write_native_scene_manifest(tmp_path, mapping))
+    bind_prepared_native_reference(cfg)
     layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=(0.0, 0.0, -9.81))
-    assert layout.objects[0].root_body_name == "oakink_obj_body"
+    assert layout.objects[0].root_body_name == "base"
 
     with open_dict(cfg.commands.object):
         cfg.commands.object.perturb.require_assist_decayed = False

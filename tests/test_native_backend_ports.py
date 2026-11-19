@@ -14,7 +14,7 @@ import mujoco
 import numpy as np
 import pytest
 import torch
-from test_native_contract import _scene, _two_object_scene
+from test_native_contract import _scene, _two_object_scene, write_native_scene_manifest
 
 from envs import create_envs
 from simulator.mjcf_meta import load_robot_mjcf_meta
@@ -53,17 +53,20 @@ def test_native_config_dispatch_and_runtime_do_not_boot_kit_or_require_usd(tmp_p
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
-    environment = {"FDR_NATIVE_SCENE_XML": str(tmp_path / "not-opened.xml"),
-                   "FDR_NATIVE_BOX_BASE_MESH": "base.obj", "FDR_NATIVE_BOX_LID_MESH": "lid.obj"}
+    from common.native_reference import bind_prepared_native_reference
+
+    _, mapping = _scene(tmp_path)
+    motion_file = write_native_scene_manifest(tmp_path, mapping)
     had = set(sys.modules)
-    with patch.dict("os.environ", environment, clear=True), initialize_config_dir(
+    with patch.dict("os.environ", {}, clear=True), initialize_config_dir(
         config_dir=str(Path(__file__).resolve().parents[1] / "config"), version_base=None,
     ):
         OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
         for backend in ("mjwarp", "newton"):
             cfg = compose(config_name="native", overrides=[f"envs/simulator@simulator={backend}",
-                "commands.motion_file=synthetic.pt", "native_recording_binding={}",
+                f"commands.motion_file={motion_file}",
                 "native_tracking_tolerances={root_position_error_m: 1, root_rotation_error_rad: 1, part_position_error_m: 1, part_rotation_error_rad: 1, joint_position_error_rad: 1, command_position_error_rad: 1}"])
+            bind_prepared_native_reference(cfg)
             OmegaConf.resolve(cfg)
             assert cfg.sim.backend == backend and cfg.sim.runtime_launcher is None
             assert "native_assets" not in cfg.sim

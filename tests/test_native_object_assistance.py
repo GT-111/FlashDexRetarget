@@ -19,8 +19,9 @@ from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 from omegaconf import OmegaConf, open_dict
 from test_installed_dynamics import _ObjectCommand, _rigid
 from test_native_backend_ports import _mechanics, _ProtocolPlant
-from test_native_contract import _scene
+from test_native_contract import _scene, write_native_scene_manifest
 
+from common.native_reference import bind_prepared_native_reference
 from envs import build_manager_cfgs
 from envs.commands.motion_tracking.motion_tracking import MotionTrackingCommand
 from envs.commands.motion_tracking.motion_tracking_cfg import ObjectCfg
@@ -39,13 +40,13 @@ from simulator.native.scene import NativeScene, NativeSim
 @pytest.mark.parametrize("backend", ("native_isaacsim", "mjwarp", "newton"))
 def test_native_assisted_config_uses_real_curriculum_and_keeps_static_gravity(tmp_path, backend):
     _, mapping = _scene(tmp_path)
+    motion_file = write_native_scene_manifest(tmp_path, mapping)
     with initialize_config_dir(config_dir=str(Path(__file__).parents[1] / "config"), version_base=None):
         OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
         cfg = compose(config_name="native_assisted", overrides=[f"envs/simulator@simulator={backend}",
-            "commands.motion_file=not-opened.pt", "native_recording_binding={}",
+            f"commands.motion_file={motion_file}",
             "native_tracking_tolerances={root_position_error_m: 1, root_rotation_error_rad: 1, part_position_error_m: 1, part_rotation_error_rad: 1, joint_position_error_rad: 1, command_position_error_rad: 1}"])
-    with open_dict(cfg.robot):
-        cfg.robot.native_scene = mapping
+    bind_prepared_native_reference(cfg)
     layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=(0., 0., -9.81))
     assert layout.objects[0].root_body_name == "base" and cfg.commands.object.pin_mode == "xfrc"
     built = build_manager_cfgs(cfg)
@@ -182,6 +183,40 @@ def test_native_assist_uses_named_parts_preserves_passive_hinge_and_clears_eval_
     assert not command.object_assist_facts()["force_w"].any()
     command.clear_object_wrenches(torch.tensor([0]))
     assert command._assist_submission_support.tolist() == [False, True]
+
+
+def test_native_eval_perturbs_only_free_root_and_resets_disturbance_carry(tmp_path):
+    command, _, plant, model = _native_assist(tmp_path)
+    command._object_root_columns = torch.tensor([0])
+    command._eval_mode = True
+    command.cfg.object.pin_objects = False
+    perturb = command.cfg.object.perturb
+    perturb.enabled, perturb.start_prob, perturb.height_thresh = True, 1.0, -1.0
+    perturb.force_scale, perturb.torque_scale = 1.5, 0.03
+    command.enable_hoi_evaluation_perturbation()
+    command.apply_substep()
+
+    root = model.body("base").id
+    torch.testing.assert_close(plant.external_body_wrench_w[:, root, :3].norm(dim=-1), torch.full((2,), 1.5))
+    torch.testing.assert_close(plant.external_body_wrench_w[:, root, 3:].norm(dim=-1), torch.full((2,), 0.03))
+    assert not plant.external_body_wrench_w[:, model.body("lid").id].any()
+    assert command._assist_perturb_active.tolist() == [True, True]
+    command.clear_object_wrenches(torch.tensor([0]))
+    assert command._assist_perturb_active.tolist() == [False, True]
+    assert not plant.external_body_wrench_w[0].any()
+
+
+def test_unsupported_object_rates_do_not_add_velocity_drag(tmp_path, monkeypatch):
+    command, _, plant, model = _native_assist(tmp_path)
+    ids = [model.body(part.body_name).id for part in command.native_layout.objects[0].parts]
+    command.apply_substep()
+    still_wrench = plant.external_body_wrench_w[:, ids].clone()
+    moving = command.sim_object_part_state_w.clone()
+    moving[..., 7:] = 3.0
+    monkeypatch.setattr(NativeMotionTrackingCommand, "sim_object_part_state_w", property(lambda _: moving))
+
+    command.apply_substep()
+    torch.testing.assert_close(plant.external_body_wrench_w[:, ids], still_wrench)
 
 
 def test_shared_pd_keeps_stock_omega_and_configured_world_mass_behavior():

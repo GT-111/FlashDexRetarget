@@ -704,30 +704,31 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         self._assist_submission_support = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._assist_sample_time_s = torch.full((self.num_envs,), float("nan"), dtype=torch.float64, device=self.device)
         self._assist_clock_support = torch.zeros_like(self._assist_submission_support)
+        self._assist_perturb_wrench = torch.zeros(
+            (self.num_envs, len(self.native_layout.objects), 6), device=self.device,
+        )
+        self._assist_perturb_active = torch.zeros_like(self._assist_submission_support)
+        self._eval_hoi_perturbed = False
 
-    def _apply_object_assist(self):
+    def enable_hoi_evaluation_perturbation(self):
+        if not self._eval_mode or self.cfg.object.pin_objects or not self.cfg.object.perturb.enabled:
+            raise ValueError("HOI perturbation evaluation needs unassisted eval with authored disturbances")
+        self._eval_hoi_perturbed = True
+
+    def _object_tracking_wrench(self, state, support):
         from .objects.assist import object_pose_pd_wrench
 
-        if not self.cfg.object.pin_objects:
-            self._assist_force_w.zero_()
-            self._assist_torque_w.zero_()
-            for obj in self.native_objects.values():
-                obj.clear_external_wrenches()
-            return
         if self.cfg.object.pin_mode != "xfrc":
             raise ValueError("native object assistance requires the explicit xfrc force mode")
         xfrc = self.cfg.object.xfrc
-        state = self.sim_object_part_state_w
         reference = self.ref_object_part_state_w
         ml, ids = self.motion_lib, self._motion_flat_ids
-        support = ml.native_object_part_pose_support[ids]
-        # Unknown poses never enter quaternion math. Unknown velocity targets
-        # mean zero feedforward, not an observed zero source rate.
+        # Unsupported derived rates contribute no derivative error.
         reference = torch.where(support[..., None], reference, state).clone()
         linear_support = ml.native_object_part_linear_velocity_support[ids] & support
         angular_support = ml.native_object_part_angular_velocity_support[ids] & support
-        reference[..., 7:10] = torch.where(linear_support[..., None], reference[..., 7:10], 0.0)
-        reference[..., 10:13] = torch.where(angular_support[..., None], reference[..., 10:13], 0.0)
+        reference[..., 7:10] = torch.where(linear_support[..., None], reference[..., 7:10], state[..., 7:10])
+        reference[..., 10:13] = torch.where(angular_support[..., None], reference[..., 10:13], state[..., 10:13])
         if not xfrc.vel_feedforward:
             reference[..., 7:] = 0.0
 
@@ -749,18 +750,20 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         if contact_scale < 1.0:
             contact_facts = getattr(self._env.scene, "hand_part_contact_facts", lambda: None)()
             if contact_facts is not None and contact_facts["pairs"]:
-                in_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-                for pair in contact_facts["pairs"].values():
-                    in_contact |= (
+                addresses = {
+                    (obj.entity_name, part.body_name): index
+                    for index, (obj, part) in enumerate(self.native_layout.part_bindings)
+                }
+                in_contact = torch.zeros(state.shape[:2], dtype=torch.bool, device=self.device)
+                for name, pair in contact_facts["pairs"].items():
+                    address = contact_facts["addresses"][name]
+                    column = addresses[address["part_entity_name"], address["part_body_name"]]
+                    in_contact[:, column] |= (
                         contact_facts["measurement_support"]
                         & pair["force_bearing_contact_present"]
                         & (pair["normal_force_n"] >= 0.5)
                     )
-                s_rot = torch.where(
-                    in_contact[:, None, None],
-                    torch.full((self.num_envs, 1, 1), contact_scale, device=self.device),
-                    torch.ones((self.num_envs, 1, 1), device=self.device),
-                )
+                s_rot = torch.where(in_contact[..., None], contact_scale, 1.0)
                 kp_rot = kp_rot * s_rot * s_rot
                 kd_rot = kd_rot * s_rot
         force, torque, _ = object_pose_pd_wrench(
@@ -772,33 +775,46 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         if self._xfrc_force_range is not None:
             force = force.clamp(-self._xfrc_force_range, self._xfrc_force_range)
             torque = torque.clamp(-self._xfrc_force_range, self._xfrc_force_range)
+        return force, torque
+
+    def _apply_object_assist(self):
+        pin = self.cfg.object.pin_objects
+        eval_perturbed = self._eval_hoi_perturbed and self._eval_mode
+        if not pin and not eval_perturbed:
+            self._assist_force_w.zero_()
+            self._assist_torque_w.zero_()
+            for obj in self.native_objects.values():
+                obj.clear_external_wrenches()
+            return
+        ctrl = self._xfrc_curr_ctrl
+        zero_gains = ctrl is not None and ctrl.has_zero_gains()
+        state = self.sim_object_part_state_w
+        support = self.motion_lib.native_object_part_pose_support[self._motion_flat_ids]
+        if pin and not zero_gains:
+            force, torque = self._object_tracking_wrench(state, support)
+        else:
+            force = torch.zeros_like(self._assist_force_w)
+            torque = torch.zeros_like(self._assist_torque_w)
         perturb = self.cfg.object.perturb
-        if perturb.enabled and (float(perturb.force_scale) > 0.0 or float(perturb.torque_scale) > 0.0):
-            ctrl = getattr(self, "_xfrc_curr_ctrl", None)
-            decayed = True
-            if perturb.require_assist_decayed and ctrl is not None:
-                decayed = float(ctrl.curr_gains.get("kp", 1.0)) <= float(ctrl.kp_zero_thres)
-            if decayed:
-                if not hasattr(self, "_native_perturb_wrench") or self._native_perturb_wrench.shape[:2] != force.shape[:2]:
-                    self._native_perturb_wrench = torch.zeros(
-                        (*force.shape[:2], 6), dtype=force.dtype, device=self.device
-                    )
-                    self._native_perturb_active = torch.zeros(force.shape[0], dtype=torch.bool, device=self.device)
-                u = torch.rand(self.num_envs, device=self.device)
-                start = (~self._native_perturb_active) & (u < float(perturb.start_prob))
-                keep = self._native_perturb_active & (u < float(perturb.continue_prob))
-                self._native_perturb_active = start | keep
-                if start.any():
-                    n_s = int(start.sum().item())
-                    f_dir = torch.randn((n_s, force.shape[1], 3), device=self.device, dtype=force.dtype)
-                    t_dir = torch.randn((n_s, force.shape[1], 3), device=self.device, dtype=force.dtype)
-                    f_dir = f_dir / f_dir.norm(dim=-1, keepdim=True).clamp_min(1e-6) * float(perturb.force_scale)
-                    t_dir = t_dir / t_dir.norm(dim=-1, keepdim=True).clamp_min(1e-6) * float(perturb.torque_scale)
-                    self._native_perturb_wrench[start] = torch.cat((f_dir, t_dir), dim=-1)
-                self._native_perturb_wrench[~self._native_perturb_active] = 0.0
-                above = state[..., 2:3] > float(perturb.height_thresh)
-                force = force + torch.where(above, self._native_perturb_wrench[..., :3], 0.0)
-                torque = torque + torch.where(above, self._native_perturb_wrench[..., 3:], 0.0)
+        if perturb.enabled and (zero_gains or eval_perturbed):
+            active = self._assist_perturb_active
+            u = torch.rand(self.num_envs, device=self.device)
+            start = ~active & (u < float(perturb.start_prob))
+            active.copy_(start | (active & (u < float(perturb.continue_prob))))
+            wrench = self._assist_perturb_wrench
+            if start.any():
+                count = int(start.sum().item())
+                direction = torch.randn((count, wrench.shape[1], 2, 3), device=self.device, dtype=force.dtype)
+                direction /= direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                direction[..., 0, :] *= float(perturb.force_scale)
+                direction[..., 1, :] *= float(perturb.torque_scale)
+                wrench[start] = direction.flatten(-2)
+            wrench[~active] = 0.0
+            # One independent wrench per FREE object, regardless of its passive part count.
+            columns = self._object_root_columns
+            above = state[:, columns, 2:3] > float(perturb.height_thresh)
+            force[:, columns] += torch.where(above, wrench[..., :3], 0.0)
+            torque[:, columns] += torch.where(above, wrench[..., 3:], 0.0)
         self._assist_force_w.copy_(torch.where(support[..., None], force, 0.0).detach())
         self._assist_torque_w.copy_(torch.where(support[..., None], torque, 0.0).detach())
         for entity, obj in self.native_objects.items():
@@ -836,7 +852,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             angular_rate_support=self._assist_angular_rate_support,
             sample_time_s=self._assist_sample_time_s, clock_support=self._assist_clock_support,
             authority="last_physics_substep_submitted_WORLD_body_COM_wrench_not_measured_force",
-            unsupported_velocity="zero feedforward target; independent source rate support remains false",
+            unsupported_velocity="no derivative error from unknown rates while source rate support remains false",
             force_unit="N", torque_unit="N m", clock="actual_solver_substep_begin_when_available",
         )
 
@@ -845,11 +861,11 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             obj.clear_external_wrenches(env_ids)
         rows = slice(None) if env_ids is None else env_ids
         for value in (self._assist_force_w, self._assist_torque_w,
-                      self._assist_last_force_w, self._assist_last_torque_w):
+                      self._assist_last_force_w, self._assist_last_torque_w, self._assist_perturb_wrench):
             value[rows] = 0
         for value in (self._assist_submission_support, self._assist_pose_support,
                       self._assist_linear_rate_support, self._assist_angular_rate_support,
-                      self._assist_clock_support):
+                      self._assist_clock_support, self._assist_perturb_active):
             value[rows] = False
         self._assist_sample_time_s[rows] = float("nan")
 

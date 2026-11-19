@@ -30,6 +30,8 @@ class OffPolicyRunner:
     """Off-policy training loop: steps the train envs, feeds the agent's replay buffer
     (``runner.agent.class_name``), and evaluates and checkpoints on absolute env-step grids."""
 
+    _hoi_curriculum = None
+
     def __init__(
         self,
         env: RslRlVecEnvWrapper,
@@ -136,6 +138,14 @@ class OffPolicyRunner:
             learning_state_path = runner_cfg.buffer_load_path
         if learning_state_path is not None:
             self._restore_learning_state((_BASE_DIR / learning_state_path).resolve())
+        self._hoi_curriculum = (
+            self._train_cmd._xfrc_curr_ctrl
+            if hasattr(self._train_cmd, "native_layout") and self._train_cmd.cfg.object.perturb.enabled
+            else None
+        )
+        self._started_at_hoi_zero = (
+            self._hoi_curriculum is not None and self._hoi_curriculum.hoi_zero_receipt() is not None
+        )
 
     # ─── training loop ───────────────────────────────────────────────────────────
 
@@ -192,6 +202,12 @@ class OffPolicyRunner:
                     return
                 if not ready:
                     continue
+
+                if self._hoi_curriculum is not None and not self._started_at_hoi_zero:
+                    if self._hoi_curriculum.hoi_zero_receipt() is not None:
+                        checkpoint = self._write_checkpoint(env_step, f"hoi-zero-{env_step}", full=True)
+                        self._write_hoi_zero_ready(checkpoint, env_step)
+                        return
 
                 if self._crossed(env_step, self._eval_stride) and self._eval_supported():
                     eval_metrics = self._run_eval(env_step)
@@ -314,7 +330,7 @@ class OffPolicyRunner:
 
     def _all_solved(self, eval_metrics: dict[str, float], env_step: int) -> bool:
         """eval.stop_when_all_solved: the success archive covers every clip."""
-        if not bool(self._eval_cfg.get("stop_when_all_solved", True)):
+        if self._hoi_curriculum is not None or not bool(self._eval_cfg.get("stop_when_all_solved", True)):
             return False
         archived_frac = eval_metrics.get("eval/archived_frac", eval_metrics.get("archived_frac", 0.0))
         if archived_frac < 1.0:
@@ -395,11 +411,17 @@ class OffPolicyRunner:
             return False
         print(f"[runner] stop request accepted at env_step={env_step}: {self._stop_request_path}", flush=True)
         ckpt = self._write_checkpoint(env_step, f"stop{env_step}", full=True)
+        self._write_hoi_zero_ready(ckpt, env_step)
         self._stop_request_path.replace(ckpt / "stop.request")
         print(f"[runner] graceful stop at env_step={env_step}: {ckpt}", flush=True)
         return True
 
     def _finish(self) -> None:
+        if self._hoi_curriculum is not None:
+            checkpoint = self._write_checkpoint(self._final_step, "final", full=True)
+            self._write_hoi_zero_ready(checkpoint, self._final_step)
+            self._prune_buffers(keep=checkpoint.name)
+            return
         final_dir = self._save_path_base / "final"
         self._agent.save(str(final_dir))
         final_step = getattr(self, "_final_step", None)
@@ -410,11 +432,26 @@ class OffPolicyRunner:
             self._prune_buffers(keep="")
             print(f"[runner] finished: dropped replay_buffer.pt under {self._save_path_base}", flush=True)
 
+    def _write_hoi_zero_ready(self, checkpoint: Path, env_step: int) -> None:
+        if self._hoi_curriculum is None:
+            return
+        zero = self._hoi_curriculum.hoi_zero_receipt()
+        if zero is None:
+            return
+        path = self._save_path_base / "hoi-zero-ready.json"
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({
+            "checkpoint": str(checkpoint.resolve()),
+            "training_env_step": env_step,
+            "zero_curriculum": zero,
+        }, indent=2) + "\n")
+        os.replace(temporary, path)
+
     # ─── resume state ────────────────────────────────────────────────────
 
     def _save_learning_state(self, ckpt: Path, env_step: int) -> None:
         xf = getattr(self._train_cmd, "_xfrc_curr_ctrl", None)
-        torch.save({
+        state = {
             "env_step": int(env_step),
             "num_envs": self._n_envs,
             "rng": capture_rng_state(self._train_env.action_space),
@@ -422,7 +459,11 @@ class OffPolicyRunner:
             "nonfinite_steps": self._nonfinite_steps,
             "loop_wall_clock_s": self._wall_offset + time.perf_counter() - self._loop_start,
             "collector_restart": "fresh physical worlds; seal replay frontier and reset episode returns/noise/pending tape",
-        }, ckpt / LEARNING_STATE_FILE)
+        }
+        if self._hoi_curriculum is not None:
+            state["native_hoi_zero"] = self._hoi_curriculum.hoi_zero_receipt()
+            state["native_hoi_source_revision"] = os.environ.get("FLASH_SOURCE_REF")
+        torch.save(state, ckpt / LEARNING_STATE_FILE)
 
     def _restore_learning_state(self, ckpt: Path) -> None:
         state = torch.load(ckpt / LEARNING_STATE_FILE, map_location="cpu", weights_only=False)

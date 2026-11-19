@@ -36,6 +36,7 @@ class NativeHandCfg(NativeArticulationCfg):
     side: str
     command_actuator_names: tuple[str, ...]
     root_control: NativeRootControlCfg
+    tip_site_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -76,6 +77,7 @@ class NativeSceneCfg:
                 },
                 command_actuator_names=tuple(h["command_actuator_names"]),
                 root_control=NativeRootControlCfg(**dict(h["root_control"])),
+                tip_site_names=tuple(h.get("tip_site_names", ())),
             )
             for h in config["hands"]
         )
@@ -86,7 +88,7 @@ class NativeSceneCfg:
                 )},
                 parts=tuple(NativeObjectPartCfg(**dict(p)) for p in obj["parts"]),
             )
-            for obj in config["objects"]
+            for obj in config.get("objects", ())
         )
         if not objects:
             raise ValueError("native scene requires its declared object articulations")
