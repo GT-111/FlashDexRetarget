@@ -31,6 +31,7 @@ def _case(widths):
     action._processed_actions = torch.zeros_like(action._raw_actions)
     action._filter_state = torch.zeros_like(action._raw_actions)
     action._filter_pending = torch.ones(2, dtype=torch.bool)
+    action._source_contact_guard = None
     action._alpha = torch.ones(action.action_dim)
     action._clip = torch.tensor([[-1., 1.]]).repeat(action.action_dim, 1)
     order = list(reversed(range(width)))
