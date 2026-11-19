@@ -160,7 +160,7 @@ rewards:
       topk_frac: 1.0
       deadband: 0.0
       norm_radius: 0.058
-      part_reduce: mean
+      part_reduce: worst
     native_source_hand_part_contact:
       force_scale_n: 1.5
       separation_bound_m: 0.02

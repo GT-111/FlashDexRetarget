@@ -64,6 +64,7 @@ def test_six_hand_hoi_surface_hydra_configs_compose(robot_cfg: str, tmp_path: Pa
 
     assert cfg.rewards.reward_weights.native_source_hand_part_contact > 0.0
     assert cfg.rewards.reward_params.native_source_hand_part_contact.require_thumb_opposition is True
+    assert cfg.rewards.reward_params.native_part_surface_displacement.part_reduce == "worst"
     assert 0.0 < float(cfg.commands.object.xfrc.contact_scale) < 1.0
     assert cfg.commands.object.perturb.enabled is True
     assert cfg.commands.object.perturb.require_assist_decayed is True
