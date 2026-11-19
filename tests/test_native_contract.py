@@ -1,4 +1,4 @@
-"""Native topology/action contracts; no Isaac app, MjData, FK or simulation."""
+"""Native topology, action and compiled actuator contracts without an Isaac app."""
 
 import json
 import xml.etree.ElementTree as ET
@@ -1076,12 +1076,47 @@ def test_native_metadata_rejects_motor_and_nonunit_gear_position_targets(tmp_pat
             load_robot_mjcf_meta(layout.scene_xml_path)
 
 
+def test_native_position_drive_keeps_compiled_constant_effort_bias(tmp_path):
+    import mujoco
+    from omegaconf import OmegaConf
+
+    from simulator.isaacsim.create import create_envs_isaac
+
+    layout, _ = _scene(tmp_path)
+    tree = ET.parse(layout.scene_xml_path)
+    actuator = tree.getroot().find("actuator")[0]
+    actuator.tag = "general"
+    actuator.attrib.clear()
+    actuator.attrib.update(name="command_A", joint="left_joint", gaintype="fixed",
+        biastype="affine", gainprm="2", biasprm=".75 -2 -1",
+        ctrlrange="0 1", forcerange="-.8 .8")
+    tree.write(layout.scene_xml_path)
+
+    meta = load_robot_mjcf_meta(layout.scene_xml_path)
+    np.testing.assert_array_equal(meta.actuator_force_bias, [.75, 0., 0.])
+    np.testing.assert_array_equal(meta.subtree("left_root").actuator_force_bias, [.75])
+    model = mujoco.MjModel.from_xml_path(layout.scene_xml_path)
+    data = mujoco.MjData(model)
+    data.qpos[model.joint("left_joint").qposadr] = .25
+    data.qvel[model.joint("left_joint").dofadr] = .1
+    drive = model.actuator("command_A").id
+    for target, effort in ((0., .15), (.25, .65), (-2., .15), (2., .8)):
+        data.ctrl[drive] = target
+        mujoco.mj_forward(model, data)
+        assert data.actuator_force[drive] == pytest.approx(effort)
+
+    with pytest.raises(ValueError, match="Isaac implicit drive 'command_A'.*constant actuator effort bias"):
+        validate_native_mjcf_import(model)
+    cfg = OmegaConf.create({"robot": {"native_scene": {"scene_xml_path": layout.scene_xml_path}}})
+    with pytest.raises(ValueError, match="Isaac implicit drive 'command_A'.*constant actuator effort bias"):
+        create_envs_isaac(cfg, device="cpu")
+
+
 def test_native_metadata_rejects_changed_bias_filtered_and_delayed_targets(tmp_path):
     import pytest
 
     for name, tag, attrs in (
         ("changed_gain_bias", "general", {"gainprm": "20", "biastype": "affine", "biasprm": "0 -10"}),
-        ("target_offset", "general", {"gainprm": "20", "biastype": "affine", "biasprm": "1 -20"}),
         ("filtered", "position", {"kp": "20", "timeconst": ".01"}),
         ("delayed", "position", {"kp": "20", "delay": ".01", "nsample": "8"}),
     ):

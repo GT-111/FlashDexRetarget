@@ -148,7 +148,9 @@ Select `envs/simulator@simulator=mjwarp` or `envs/simulator@simulator=newton` wi
 neither launches Kit nor requires USD conversion. These ports reuse the same
 manager loop, native actions, reference phase, observations, reward, evaluator,
 FlashSAC and recorder. Newton delegates to the installed DexForge native engine;
-direct MuJoCo Warp loads the authored MJCF itself. Newton's selected
+direct MuJoCo Warp loads the authored MJCF itself. Native scalar position drives
+can retain the authored constant effort bias alongside stiffness and damping.
+Isaac's implicit drives require zero constant effort bias. Newton's selected
 `SolverMuJoCo` also uses MuJoCo Warp: these are different import/contact routes,
 not two independent dynamics solvers. The default Newton contact route is
 MuJoCo; original-triangle BVH requires an explicit `collision_generation` recipe.

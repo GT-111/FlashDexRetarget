@@ -67,6 +67,15 @@ def _up_to_date(usd_path: str, sources: list[str]) -> bool:
     return all(os.path.getmtime(s) <= usd_mtime for s in sources if os.path.exists(s))
 
 
+def validate_implicit_position_drive_bias(actuator_names, force_bias) -> None:
+    """PhysX implicit position drives install stiffness and damping only."""
+    for name, bias in zip(actuator_names, force_bias, strict=True):
+        if bias != 0:
+            raise ValueError(
+                f"Isaac implicit drive {name!r} cannot preserve constant actuator effort bias {bias:g}"
+            )
+
+
 def validate_native_mjcf_import(model) -> None:
     """Admit the mechanics implemented by the pinned native Isaac importer.
 
@@ -89,10 +98,15 @@ def validate_native_mjcf_import(model) -> None:
         raise ValueError("native Isaac import requires scalar joints and declared FREE roots")
     if any(model.qpos0[int(model.jnt_qposadr[j])] != 0 for j in scalar):
         raise ValueError("native Isaac import requires zero scalar joint references")
-    driven = {
-        int(model.actuator_trnid[a, 0]) for a in range(model.nu)
+    scalar_drives = [
+        a for a in range(model.nu)
         if int(model.actuator_trntype[a]) == int(mujoco.mjtTrn.mjTRN_JOINT)
-    }
+        and int(model.actuator_trnid[a, 0]) in scalar
+    ]
+    validate_implicit_position_drive_bias(
+        (model.actuator(a).name for a in scalar_drives), model.actuator_biasprm[scalar_drives, 0],
+    )
+    driven = {int(model.actuator_trnid[a, 0]) for a in scalar_drives}
     if any(model.jnt_stiffness[j] != 0 for j in scalar - driven):
         raise ValueError("native Isaac passive joint springs are not implemented")
     free_bodies = {
@@ -695,6 +709,7 @@ def convert_robot(config_path: str, force: bool, collision_visual: bool = False)
     usd_path = str(asset.usd_path)
     out_dir = str(asset.usd_path.parent)
     meta = load_robot_mjcf_meta(asset.mjcf_path)
+    validate_implicit_position_drive_bias(meta.actuator_names, meta.actuator_force_bias)
     # The import also contains authored fixed frames (for example fingertip
     # sites materialized as URDF links), beyond the MJCF body view.
     expected_links = list(dict.fromkeys(

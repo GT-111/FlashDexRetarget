@@ -49,6 +49,7 @@ class RobotMjcfMeta:
     actuator_joint: dict[str, str]  # actuator name -> joint name
     actuator_kp: np.ndarray  # (n_act,) position-servo stiffness
     actuator_kv: np.ndarray  # (n_act,) position-servo damping
+    actuator_force_bias: np.ndarray  # (n_act,) constant actuator force or torque
     actuator_forcerange: np.ndarray  # (n_act, 2)
     sites: dict[str, SiteMeta] = field(default_factory=dict)
     body_bound: dict[str, float] = field(default_factory=dict)
@@ -124,6 +125,7 @@ class RobotMjcfMeta:
             actuator_joint={n: self.actuator_joint[n] for n in actuator_names},
             actuator_kp=self.actuator_kp[ai],
             actuator_kv=self.actuator_kv[ai],
+            actuator_force_bias=self.actuator_force_bias[ai],
             actuator_forcerange=self.actuator_forcerange[ai],
             actuator_ctrlrange=self.actuator_ctrlrange[ai],
             actuator_effort_limit=self.actuator_effort_limit[ai],
@@ -220,13 +222,13 @@ def load_robot_mjcf_meta(xml_path: str | Path) -> RobotMjcfMeta:
             and m.actuator_delay[a] == 0
             and m.actuator_gear[a, 0] == 1
             and np.isfinite(kp) and kp > 0
-            and bias[0] == 0 and bias[1] == -kp
+            and np.isfinite(bias[0]) and bias[1] == -kp
             and np.isfinite(bias[2]) and bias[2] <= 0
         ):
             raise ValueError(
                 f"actuator {_name(mujoco.mjtObj.mjOBJ_ACTUATOR, a)!r} requires "
                 "a memoryless unit-gear position servo: "
-                "force = kp * (target - q) - kv * qvel, kp > 0, kv >= 0, no delay"
+                "force = bias + kp * (target - q) - kv * qvel, kp > 0, kv >= 0, no delay"
             )
     actuator_names = [
         _name(mujoco.mjtObj.mjOBJ_ACTUATOR, i) for i in position_actuators
@@ -237,9 +239,10 @@ def load_robot_mjcf_meta(xml_path: str | Path) -> RobotMjcfMeta:
         )
         for i in position_actuators
     }
-    # MuJoCo position servo: gainprm[0] = kp, biasprm = [0, -kp, -kv].
+    # MuJoCo affine position servo: gainprm[0] = kp, biasprm = [force_bias, -kp, -kv].
     actuator_kp = m.actuator_gainprm[position_actuators, 0].copy()
     actuator_kv = -m.actuator_biasprm[position_actuators, 2].copy()
+    actuator_force_bias = m.actuator_biasprm[position_actuators, 0].copy()
     effort_limits = []
     for a in position_actuators:
         joint = int(m.actuator_trnid[a, 0])
@@ -311,6 +314,7 @@ def load_robot_mjcf_meta(xml_path: str | Path) -> RobotMjcfMeta:
         actuator_joint=actuator_joint,
         actuator_kp=actuator_kp,
         actuator_kv=actuator_kv,
+        actuator_force_bias=actuator_force_bias,
         actuator_forcerange=m.actuator_forcerange[position_actuators].copy(),
         sites=sites,
         body_bound=body_bound,

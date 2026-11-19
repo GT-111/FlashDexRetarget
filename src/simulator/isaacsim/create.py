@@ -14,7 +14,11 @@ from envs.scene.native import bind_native_scene_config
 from simulator.env import ManagerBasedRlEnv, ManagerEnvCfg
 from simulator.mjcf_meta import load_robot_mjcf_meta
 
-from .convert_assets import COLVIS_OBJ_DIRNAME, colvis_enabled
+from .convert_assets import (
+    COLVIS_OBJ_DIRNAME,
+    colvis_enabled,
+    validate_implicit_position_drive_bias,
+)
 
 _SIM_DIR = Path(__file__).resolve().parents[3]  # simulation/
 
@@ -248,6 +252,7 @@ def create_envs_isaac(cfg, device: str = "cuda"):
         per_env_mode, object_slots, assigned = False, [], None
         xml_path = Path(native.scene_xml_path)
     meta = load_robot_mjcf_meta(xml_path)
+    validate_implicit_position_drive_bias(meta.actuator_names, meta.actuator_force_bias)
     if native is not None:
         bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=meta.gravity)
 
