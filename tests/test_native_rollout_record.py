@@ -97,7 +97,10 @@ def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, se
             robot_all_joints_lin_vel_w=lambda side: torch.zeros((1, 1, 3)),
             ref_joint_pos=torch.zeros((1, 3)), sim_obj_trans_w=torch.zeros((1, 2, 3)),
             sim_obj_quat_w=quaternions)
+        command._record_reference_phase = MethodType(MetricsMixin._record_reference_phase, command)
+        command._set_metric = MethodType(MetricsMixin._set_metric, command)
         command._update_metrics = MethodType(MetricsMixin._update_metrics, command)
+        command._advance_reference = MethodType(MotionTrackingCommand._advance_reference, command)
         command._update_command = MethodType(MotionTrackingCommand._update_command, command)
         action_cfg = ResidualActionCfg(entity_name="robot", command_name="motion",
             actuator_names={"wrist_trans": (), "wrist_rot": (), "finger": tuple(correspondence)},
