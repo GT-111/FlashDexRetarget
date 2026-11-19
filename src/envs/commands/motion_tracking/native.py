@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import torch
 from mjlab.managers import CommandTerm
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from envs.scene.native import NativeSceneCfg
 
@@ -749,6 +750,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         )
         self._assist_perturb_active = torch.zeros_like(self._assist_perturb_wrench[..., 0], dtype=torch.bool)
         self._eval_hoi_perturbed = False
+        self._perturb_inverse_inertia_body = None
         perturb = getattr(self.cfg.object, "perturb", None)
         if perturb is not None and perturb.enabled:
             lag = float(perturb.gate_lag_s)
@@ -756,6 +758,18 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                 raise ValueError("native perturbation requires a finite nonnegative engagement lag")
             self._perturb_lag_ns = round(lag * 1e9)
             self._perturb_source_gate = self._source_perturbation_gate()
+            if perturb.torque_scale:
+                limit = perturb.max_angular_acceleration_rad_s2
+                if limit is None or not math.isfinite(limit) or limit <= 0.0:
+                    raise ValueError("native rotational perturbation requires a positive max_angular_acceleration_rad_s2")
+                self._perturb_max_angular_acceleration_rad_s2 = float(limit)
+                # The installed inertia of each struck FREE root is fixed in its body frame.
+                inertia = torch.stack([
+                    self._part_entities[column].body_inertial_properties().inertia_com_body_kg_m2[
+                        :, self._part_body_ids[column]]
+                    for column in self._object_root_columns.tolist()
+                ], dim=1)
+                self._perturb_inverse_inertia_body = torch.linalg.inv(inertia)
 
     def _source_perturbation_gate(self):
         """Arm each object after consecutive supported source engagement."""
@@ -881,7 +895,16 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             wrench[~active] = 0.0
             # One independent wrench per FREE object, regardless of its passive part count.
             force[:, columns] += wrench[..., :3]
-            torque[:, columns] += wrench[..., 3:]
+            disturbance_torque = wrench[..., 3:]
+            if self._perturb_inverse_inertia_body is not None:
+                body_torque = quat_apply_inverse(state[:, columns, 3:7], disturbance_torque)
+                body_acceleration = (self._perturb_inverse_inertia_body @ body_torque[..., None]).squeeze(-1)
+                limit = self._perturb_max_angular_acceleration_rad_s2
+                scale = limit / body_acceleration.norm(dim=-1, keepdim=True).clamp_min(limit)
+                # The body and WORLD acceleration norms agree. Scaling the WORLD torque
+                # preserves the sampled direction as the struck root changes orientation.
+                disturbance_torque = torch.where(active[..., None], disturbance_torque * scale, 0.0)
+            torque[:, columns] += disturbance_torque
         self._assist_force_w.copy_(torch.where(support[..., None], force, 0.0).detach())
         self._assist_torque_w.copy_(torch.where(support[..., None], torque, 0.0).detach())
         for entity, obj in self.native_objects.items():
@@ -952,7 +975,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         ]
 
     def sdf_query_parts(self, world_pts, *, part_state_w=None, env_ids=None, return_support=False):
-        from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, quat_mul
+        from mjlab.utils.lab_api.math import quat_apply, quat_mul
 
         state = self.sim_object_part_state_w if part_state_w is None else part_state_w
         if env_ids is not None:

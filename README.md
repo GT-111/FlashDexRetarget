@@ -483,6 +483,9 @@ Native object disturbances use known source hand-part engagement. An object's
 burst can start after its configured engagement lag and the same delay after
 reset. The wrench acts on its FREE root and clears when source engagement
 ends. This also covers objects manipulated on a support surface.
+Each burst applies 1.5 N of force and up to 0.03 N·m of directed torque. At
+each substep, the struck root's installed COM inertia and current orientation
+bound the torque's angular acceleration contribution to 1000 rad/s².
 The native wrist action approaches a source-engaged part within the ordinary
 wrist translation budget. The approach uses the achieved fingertip surface
 normal while that part remains within 20 mm and 20° of its reference pose.

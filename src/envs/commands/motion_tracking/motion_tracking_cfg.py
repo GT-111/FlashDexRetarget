@@ -66,11 +66,12 @@ class ObjectXfrcCfg:
 
 @dataclass(kw_only=True)
 class ObjectPerturbCfg:
-    """Markov-burst object wrench for grasp robustness; never in eval."""
+    """Markov-burst object wrench for grasp robustness."""
 
     enabled: bool = False
     force_scale: float = 0.0
     torque_scale: float = 0.0
+    max_angular_acceleration_rad_s2: float | None = None
     start_prob: float = 0.05
     continue_prob: float = 0.95
     gate_lag_s: float = 0.5

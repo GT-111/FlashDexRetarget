@@ -194,6 +194,7 @@ def test_native_eval_perturbs_only_free_root_and_resets_disturbance_carry(tmp_pa
     perturb = command.cfg.object.perturb
     perturb.enabled, perturb.start_prob, perturb.gate_lag_s = True, 1.0, 0.0
     perturb.force_scale, perturb.torque_scale = 1.5, 0.03
+    perturb.max_angular_acceleration_rad_s2 = 1e6
     env.episode_length_buf = torch.zeros(2, dtype=torch.long)
     ml = command.motion_lib
     ml.native_time_ns = torch.arange(2) * 20_000_000
@@ -221,6 +222,7 @@ def test_native_eval_disturbs_only_the_source_engaged_object_after_lag():
     perturb = command.cfg.object.perturb
     perturb.enabled, perturb.start_prob, perturb.continue_prob = True, 1.0, 1.0
     perturb.gate_lag_s, perturb.force_scale, perturb.torque_scale = .02, 1.5, .03
+    perturb.max_angular_acceleration_rad_s2 = 1000.
     ml = command.motion_lib
     active = torch.zeros(3, 2, 3, dtype=torch.bool)
     active[:2, 1, 1] = True   # Recorded contact is with the articulated part.
@@ -231,6 +233,8 @@ def test_native_eval_disturbs_only_the_source_engaged_object_after_lag():
     ml.native_source_hand_part_intent = dict(active=active, known=known)
     submitted = {}
     for name, obj in command.native_objects.items():
+        obj.body_inertial_properties = lambda obj=obj: SimpleNamespace(
+            inertia_com_body_kg_m2=torch.eye(3).expand(1, len(obj.body_names), 3, 3))
         obj.write_external_wrench_to_sim = lambda f, t, *, body_ids, name=name: submitted.update(
             {name: torch.cat((f, t), -1).clone()})
     command._init_native_object_assist()
@@ -251,6 +255,59 @@ def test_native_eval_disturbs_only_the_source_engaged_object_after_lag():
     env.episode_length_buf.zero_()
     command.apply_substep()
     assert not any(wrench.any() for wrench in submitted.values())
+
+
+def test_native_perturbation_preserves_linear_force_and_bounds_root_angular_acceleration(monkeypatch):
+    command, env, calls = _command()
+    heavy = _add_loose_object(command, env, calls)
+    light = env.scene["object"]
+    command.cfg.object = ObjectCfg(pin_objects=False)
+    command._init_object_assist()
+    command._eval_mode = True
+    perturb = command.cfg.object.perturb
+    perturb.enabled, perturb.start_prob, perturb.continue_prob, perturb.gate_lag_s = True, 1., 1., 0.
+    perturb.force_scale, perturb.torque_scale = 1.5, .03
+    perturb.max_angular_acceleration_rad_s2 = 60.
+    active = torch.zeros(3, 2, 3, dtype=torch.bool)
+    active[:, 0, 1] = True  # This contact with a passive part disturbs its FREE root.
+    active[:, 1, 2] = True
+    command.motion_lib.native_source_hand_part_intent = dict(active=active, known=active.clone())
+
+    light_inertia = torch.tensor([1e-5, .003, .006])
+    heavy_inertia = torch.tensor([.02, .03, .04])
+    light.body_inertial_properties = lambda: SimpleNamespace(
+        inertia_com_body_kg_m2=torch.diag_embed(torch.stack((light_inertia, heavy_inertia)))[None])
+    heavy.body_inertial_properties = lambda: SimpleNamespace(
+        inertia_com_body_kg_m2=torch.diag(heavy_inertia)[None, None])
+    light.data.body_link_quat_w[0, 0] = torch.tensor([2**-.5, 0., 0., 2**-.5])
+    submitted = {}
+    for name, obj in command.native_objects.items():
+        obj.write_external_wrench_to_sim = lambda f, t, *, body_ids, name=name: submitted.update(
+            {name: torch.cat((f, t), -1).clone()})
+    directions = torch.tensor([[1., -2., 3.], [0., 1., .5]])
+    monkeypatch.setattr(torch, "randn", lambda size, **kwargs: directions.expand(size).clone())
+    command._init_native_object_assist()
+    command.enable_hoi_evaluation_perturbation()
+    command.apply_substep()
+
+    expected_force = directions[0] * (1.5 / directions[0].norm())
+    full_torque = directions[1] * (.03 / directions[1].norm())
+    local_full_torque = full_torque[[1, 0, 2]]  # The y-world impulse acts on the thin local x-axis.
+    expected_torque = full_torque * (60. / (local_full_torque / light_inertia).norm())
+    light_wrench, heavy_wrench = submitted["object"][0, 0], submitted["loose_prop"][0, 0]
+    torch.testing.assert_close(light_wrench[:3], expected_force)
+    torch.testing.assert_close(heavy_wrench[:3], expected_force)
+    torch.testing.assert_close(light_wrench[3:], expected_torque)
+    torch.testing.assert_close((light_wrench[3:][[1, 0, 2]] / light_inertia).norm(), torch.tensor(60.))
+    torch.testing.assert_close(heavy_wrench[3:], full_torque)
+    torch.testing.assert_close(command.object_assist_facts()["torque_w"][0, 0], expected_torque)
+    assert not submitted["object"][0, 1].any()
+
+    # An unchanged burst recovers full torque when the struck body rotates.
+    light.data.body_link_quat_w[0, 0] = torch.tensor([1., 0., 0., 0.])
+    perturb.start_prob = 0.
+    command.apply_substep()
+    torch.testing.assert_close(submitted["object"][0, 0, 3:], full_torque)
 
 
 def test_unsupported_object_rates_do_not_add_velocity_drag(tmp_path, monkeypatch):
