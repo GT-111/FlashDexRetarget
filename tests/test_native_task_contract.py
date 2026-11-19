@@ -1257,7 +1257,7 @@ def _source_geometry_observations(env):
     return ObservationManager(build_observations(recipe, command_name="motion"), env)
 
 
-def _wrist_control_case(widths=(("left", 5), ("right", 5))):
+def _wrist_control_case(widths=(("left", 5), ("right", 5)), **action_options):
     """Real action/observation owners over fixed synthetic source/physical facts."""
     from dataclasses import asdict
 
@@ -1283,13 +1283,76 @@ def _wrist_control_case(widths=(("left", 5), ("right", 5))):
     for hand in command.native_layout.hands:
         robot.hands[hand.side].apply_root_pose_target = lambda target, support, control: (
             torch.zeros_like(target[:, :3]), torch.zeros_like(target[:, :3]))
-    action = NativeResidualAction(NativeResidualActionCfg(
+    options = dict(
         entity_name="robot", command_name="motion", native_scene=asdict(command.native_layout),
         translation_residual_m=.1, rotation_residual_rad=1.,
-        cutoff_hz={"wrist_trans": 5., "wrist_rot": 5.}, clip={".*": (-1., 1.)}), env)
+        cutoff_hz={"wrist_trans": 5., "wrist_rot": 5.}, clip={".*": (-1., 1.)})
+    action = NativeResidualAction(NativeResidualActionCfg(**{**options, **action_options}), env)
     command._finger_joint_ids = action._finger_ids.clone()
     env.action_manager = SimpleNamespace(_terms={"configured_action": action})
     return command, env, action
+
+
+def test_native_wrist_approach_clears_when_source_pose_or_engagement_ends():
+    command, _, action = _wrist_control_case((("right", 3), ("left", 5)), translation_residual_m=.04,
+        source_contact_approach=dict(translation_m=.024, max_part_position_error_m=.02,
+            max_part_rotation_error_rad=math.radians(20.), max_tip_distance_m=.042))
+    library = command.motion_lib
+    library.hand_sides = tuple(command._side_list)
+    active = torch.zeros(3, 2, 2, dtype=torch.bool)
+    active[1, 0, 1] = True
+    library.native_source_hand_part_intent = dict(active=active, known=torch.ones_like(active))
+    library.native_source_hand_part_intent_provenance = []
+    target = command.object_part_reference(command._motion_flat_ids)
+    object_data = next(iter(command.native_objects.values())).data
+    object_data.body_link_pos_w.copy_(target[..., :3])
+    object_data.body_link_quat_w.copy_(target[..., 3:7])
+
+    distance = torch.full((1, 8, 2), .01)
+    distance[:, :, 0] = .001
+    direction = torch.zeros(1, 8, 2, 3)
+    direction[..., 0, 1] = 1.
+    direction[..., 1, 0] = 1.
+    support = torch.ones_like(distance, dtype=torch.bool)
+    command.sdf_query_parts = lambda *args, **kwargs: (distance, direction, support)
+    raw = torch.zeros(1, action.action_dim)
+
+    def residual():
+        action.process_actions(raw)
+        action.apply_actions()
+        installed = action.installed_control
+        assert torch.equal(installed["reference_motion_steps"], command.motion_steps)
+        return installed["root_state_w"][..., :3] - command.ref_native_root_state_w[..., :3]
+
+    torch.testing.assert_close(residual()[0], torch.tensor([[-.0084, 0., 0.], [0., 0., 0.]]))
+    object_data.body_link_pos_w[0, 1, 2] -= .025
+    assert not residual().any()
+    object_data.body_link_pos_w.copy_(target[..., :3])
+    torch.testing.assert_close(residual()[0, 0], torch.tensor([-.0084, 0., 0.]))
+    object_data.body_link_quat_w[0, 1] = torch.tensor([math.cos(.2), 0., math.sin(.2), 0.])
+    assert not residual().any()
+    object_data.body_link_quat_w.copy_(target[..., 3:7])
+    assert residual().any()
+    distance[:, :, 1] = .05
+    assert not residual().any()
+    distance[:, :, 1] = .01
+    assert residual().any()
+    support[:, :, 1] = False
+    assert not residual().any()
+    support[:, :, 1] = True
+    assert residual().any()
+    active[1, 0, 1] = False
+    assert not residual().any()
+    active[1, 0, 1] = True
+    assert residual().any()
+    active[1, 0] = torch.tensor([True, False])
+    torch.testing.assert_close(residual()[0, 0], torch.tensor([0., -.0084, 0.]))
+    active[1, 0] = torch.tensor([False, True])
+    action.reset(torch.tensor([0]))
+    torch.testing.assert_close(residual()[0, 0], torch.tensor([-.0084, 0., 0.]))
+    action.reset(torch.tensor([0]))
+    raw[0, 0] = -1.0
+    torch.testing.assert_close(residual()[0, 0], torch.tensor([-.04, 0., 0.]))
 
 
 @pytest.mark.parametrize("widths", [(("right", 3), ("left", 5)), (("left", 3),)],

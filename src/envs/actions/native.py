@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
@@ -32,6 +33,7 @@ class NativeResidualActionCfg(ActionTermCfg):
     action_scale: float = 1.0
     action_offset: float = 0.0
     cutoff_hz: dict[str, float | None] = field(default_factory=dict)
+    source_contact_approach: dict[str, float] | None = None
     wrist_target_twist: Literal[
         "source_only", "filtered_correction_feedforward"
     ] = "source_only"
@@ -46,6 +48,8 @@ class NativeActionControlContext:
     processed_actions: torch.Tensor
     filter_state: torch.Tensor
     filter_pending: torch.Tensor
+    source_contact_translation: torch.Tensor
+    source_contact_part: torch.Tensor
     correction_twist: torch.Tensor
     correction_interval_valid: torch.Tensor
     finger_target: torch.Tensor
@@ -77,6 +81,14 @@ class NativeResidualAction(ActionTerm):
             "source_only", "filtered_correction_feedforward"
         ):
             raise ValueError("unsupported native wrist target-twist convention")
+        self._source_contact_scale = 0.
+        self._source_contact_guard = None
+        if cfg.source_contact_approach is not None:
+            self._source_contact_guard = dict(cfg.source_contact_approach)
+            self._source_contact_scale = self._source_contact_guard.pop("translation_m")
+            if (not 0. < self._source_contact_scale <= cfg.translation_residual_m
+                    or not all(math.isfinite(value) and value > 0. for value in self._source_contact_guard.values())):
+                raise ValueError("source contact approach requires positive pose and tip bounds within the wrist budget")
         self.layout = NativeSceneCfg.from_mapping(cfg.native_scene)
         self.hand_sides = tuple(h.side for h in self.layout.hands)
         self.hand_body_names = tuple(h.root_body_name for h in self.layout.hands)
@@ -118,6 +130,8 @@ class NativeResidualAction(ActionTerm):
         self._filter_pending = torch.ones(
             self.num_envs, dtype=torch.bool, device=self.device
         )
+        self._source_contact_translation = torch.zeros(self.num_envs, roots, 3, device=self.device)
+        self._source_contact_part = torch.full((self.num_envs, roots), -1, dtype=torch.long, device=self.device)
         self._control_dt = float(env.step_dt)
         self._correction_twist = torch.zeros(
             self.num_envs, roots, 6, device=self.device
@@ -195,6 +209,8 @@ class NativeResidualAction(ActionTerm):
             "condition": "external_native_producer_not_main_tracker_numeric_parity",
             "backend": getattr(env.scene, "backend_identity", None),
         }
+        if cfg.source_contact_approach is not None:
+            self._action_recipe["source_contact_approach"] = dict(cfg.source_contact_approach)
         self.ref_joint_pos_used = None
 
     @property
@@ -306,6 +322,13 @@ class NativeResidualAction(ActionTerm):
             self._correction_twist.masked_fill_(
                 ~self._correction_interval_valid[:, None, None], 0.0
             )
+        if self._source_contact_guard is not None:
+            command = self._env.command_manager.get_term(self.cfg.command_name)
+            direction, part = command.source_contact_approach_direction(
+                command._motion_flat_ids, **self._source_contact_guard)
+            self._source_contact_translation.masked_fill_((part != self._source_contact_part)[..., None], 0.0)
+            self._source_contact_translation.lerp_(direction * self._source_contact_scale, 0.35)
+            self._source_contact_part.copy_(part)
 
     def apply_actions(self) -> None:
         command = self._env.command_manager.get_term(self.cfg.command_name)
@@ -331,7 +354,10 @@ class NativeResidualAction(ActionTerm):
         self._entity.set_joint_position_target(self._finger_target, self._finger_ids)
         translation = self._processed_actions[:, self._translation_slice].reshape(
             self.num_envs, -1, 3
-        )
+        ) * self.cfg.translation_residual_m
+        if self._source_contact_guard is not None:
+            cap = self.cfg.translation_residual_m
+            translation = (translation + self._source_contact_translation).clamp(-cap, cap)
         rotation = self._processed_actions[:, self._rotation_slice].reshape(
             self.num_envs, -1, 3
         )
@@ -349,7 +375,7 @@ class NativeResidualAction(ActionTerm):
             angular_support = (
                 pose_support & ml.native_root_angular_velocity_support[hand.side][ids]
             )
-            target[:, :3] += translation[:, i] * self.cfg.translation_residual_m
+            target[:, :3] += translation[:, i]
             reference_quat = target[:, 3:7].clone()
             target[:, 3:7] = quat_box_plus(
                 reference_quat, rotation[:, i] * self.cfg.rotation_residual_rad
@@ -378,6 +404,8 @@ class NativeResidualAction(ActionTerm):
         rows = slice(None) if env_ids is None else env_ids
         self._raw_actions[rows] = 0.0
         self._filter_pending[rows] = True
+        self._source_contact_translation[rows] = 0.0
+        self._source_contact_part[rows] = -1
         self._correction_twist[rows] = 0.0
         self._correction_interval_valid[rows] = False
         self._installed_valid[rows] = False

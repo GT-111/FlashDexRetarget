@@ -51,6 +51,11 @@ actions:
   rotation_residual_rad: 0.35
   finger_residual_rad: 0.55
   wrist_target_twist: filtered_correction_feedforward
+  source_contact_approach:
+    translation_m: 0.024
+    max_part_position_error_m: 0.020
+    max_part_rotation_error_rad: 0.3490658503988659
+    max_tip_distance_m: ${native_surface.source_digit_distance_m}
   cutoff_hz:
     wrist_trans: 5.0
     wrist_rot: 5.0

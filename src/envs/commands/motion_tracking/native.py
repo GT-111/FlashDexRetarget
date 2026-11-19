@@ -383,6 +383,45 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             "reference_time_ns": ml.native_time_ns[ids],
         }
 
+    @torch.no_grad()
+    def source_contact_approach_direction(
+        self, ids, *, max_part_position_error_m, max_part_rotation_error_rad, max_tip_distance_m,
+    ):
+        """Closest supported fingertip-to-part direction from this action's source row."""
+        from mjlab.utils.lab_api.math import quat_error_magnitude
+
+        hands = self.native_layout.hands
+        directions = self.robot.data.site_pos_w.new_zeros((self.num_envs, len(hands), 3))
+        selected_part = torch.full_like(directions[..., 0], -1, dtype=torch.long)
+        intent = self.source_hand_part_intent(ids)
+        if intent is None:
+            return directions, selected_part
+        live, target = self.sim_object_part_state_w, self.object_part_reference(ids)
+        pose = (self.motion_lib.native_object_part_pose_support[ids]
+                & ((live[..., :3] - target[..., :3]).norm(dim=-1) <= max_part_position_error_m)
+                & (quat_error_magnitude(live[..., 3:7], target[..., 3:7]) <= max_part_rotation_error_rad))
+        sites = [self._tip_site_ids[hand.side] for hand in hands]
+        tips = self.robot.data.site_pos_w[:, [site for group in sites for site in group]]
+        distance, gradient, query = self.sdf_query_parts(tips, part_state_w=live, return_support=True)
+        active = intent["active"] & intent["known"] & pose[:, None]
+        start = 0
+        for h, (hand, group) in enumerate(zip(hands, sites, strict=True)):
+            end = start + len(group)
+            hand_index = intent["metadata"]["hand_sides"].index(hand.side)
+            rays = gradient[:, start:end]
+            supported = (query[:, start:end] & active[:, hand_index, None]
+                         & torch.isfinite(rays).all(-1) & (rays.square().sum(-1) > 0.0))
+            signed = distance[:, start:end].flatten(1)
+            nearest, index = torch.where(supported.flatten(1), signed.abs(), float("inf")).min(-1, keepdim=True)
+            valid = nearest[:, 0] <= max_tip_distance_m
+            selected_part[:, h] = torch.where(valid, index[:, 0] % distance.shape[-1], -1)
+            ray = rays.flatten(1, 2).gather(1, index[..., None].expand(-1, -1, 3))[:, 0]
+            # Scale the last millimetre toward zero, where the signed normal can flip.
+            fraction = (signed.gather(1, index) / 0.001).clamp(-1., 1.)
+            directions[:, h] = torch.where(valid[:, None], -ray * fraction, 0.)
+            start = end
+        return directions, selected_part
+
     def _consumed_reference_phase(self):
         from envs._common import action_term
 

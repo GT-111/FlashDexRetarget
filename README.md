@@ -483,6 +483,12 @@ Native object disturbances use known source hand-part engagement. An object's
 burst can start after its configured engagement lag and the same delay after
 reset. The wrench acts on its FREE root and clears when source engagement
 ends. This also covers objects manipulated on a support surface.
+The native wrist action approaches a source-engaged part within the ordinary
+wrist translation budget. The approach uses the achieved fingertip surface
+normal while that part remains within 20 mm and 20° of its reference pose.
+It clears as soon as the source engagement, pose tolerance, or nearby
+surface support fails at a control decision. The same action runs in training
+and evaluation.
 The HOI recipe treats a take that exceeds 5 cm of part translation or 20° of
 part rotation as a training failure. The part-position reward uses the same
 5 cm scale. Frozen evaluation still records the entire source take so the
