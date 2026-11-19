@@ -479,6 +479,10 @@ robot configs (`config/envs/robot/{inspire_rh56f1,inspire_rh56dftp,wuji_hand,sha
 Pairing `envs/simulator@simulator=newton` with CoACD convex hulls capped at `<= 16` hulls and `<= 32` vertices/hull runs
 native `SolverMuJoCo` contacts. `NativeRolloutRecord` measures the post-solve force and torque peaks
 over each supported interval from `mjw_data.xfrc_applied`.
+Native object disturbances use known source hand-part engagement. An object's
+burst can start after its configured engagement lag and the same delay after
+reset. The wrench acts on its FREE root and clears when source engagement
+ends. This also covers objects manipulated on a support surface.
 Set `eval.interval=0` for an HOI training run whose exact-zero FULL checkpoint
 will be evaluated separately in nominal and perturbed modes.
 

@@ -20,6 +20,7 @@ from omegaconf import OmegaConf, open_dict
 from test_installed_dynamics import _ObjectCommand, _rigid
 from test_native_backend_ports import _mechanics, _ProtocolPlant
 from test_native_contract import _scene, write_native_scene_manifest
+from test_native_task_contract import _add_loose_object, _command
 
 from common.native_reference import bind_prepared_native_reference
 from envs import build_manager_cfgs
@@ -186,13 +187,19 @@ def test_native_assist_uses_named_parts_preserves_passive_hinge_and_clears_eval_
 
 
 def test_native_eval_perturbs_only_free_root_and_resets_disturbance_carry(tmp_path):
-    command, _, plant, model = _native_assist(tmp_path)
+    command, env, plant, model = _native_assist(tmp_path)
     command._object_root_columns = torch.tensor([0])
     command._eval_mode = True
     command.cfg.object.pin_objects = False
     perturb = command.cfg.object.perturb
-    perturb.enabled, perturb.start_prob, perturb.height_thresh = True, 1.0, -1.0
+    perturb.enabled, perturb.start_prob, perturb.gate_lag_s = True, 1.0, 0.0
     perturb.force_scale, perturb.torque_scale = 1.5, 0.03
+    env.episode_length_buf = torch.zeros(2, dtype=torch.long)
+    ml = command.motion_lib
+    ml.native_time_ns = torch.arange(2) * 20_000_000
+    active = torch.ones(2, 2, 2, dtype=torch.bool)
+    ml.native_source_hand_part_intent = dict(active=active, known=active.clone())
+    command._init_native_object_assist()
     command.enable_hoi_evaluation_perturbation()
     command.apply_substep()
 
@@ -200,10 +207,50 @@ def test_native_eval_perturbs_only_free_root_and_resets_disturbance_carry(tmp_pa
     torch.testing.assert_close(plant.external_body_wrench_w[:, root, :3].norm(dim=-1), torch.full((2,), 1.5))
     torch.testing.assert_close(plant.external_body_wrench_w[:, root, 3:].norm(dim=-1), torch.full((2,), 0.03))
     assert not plant.external_body_wrench_w[:, model.body("lid").id].any()
-    assert command._assist_perturb_active.tolist() == [True, True]
     command.clear_object_wrenches(torch.tensor([0]))
-    assert command._assist_perturb_active.tolist() == [False, True]
     assert not plant.external_body_wrench_w[0].any()
+    assert plant.external_body_wrench_w[1, root].any()
+
+
+def test_native_eval_disturbs_only_the_source_engaged_object_after_lag():
+    command, env, calls = _command()
+    _add_loose_object(command, env, calls)
+    command.cfg.object = ObjectCfg(pin_objects=False)
+    command._init_object_assist()
+    command._eval_mode = True
+    perturb = command.cfg.object.perturb
+    perturb.enabled, perturb.start_prob, perturb.continue_prob = True, 1.0, 1.0
+    perturb.gate_lag_s, perturb.force_scale, perturb.torque_scale = .02, 1.5, .03
+    ml = command.motion_lib
+    active = torch.zeros(3, 2, 3, dtype=torch.bool)
+    active[:2, 1, 1] = True   # Recorded contact is with the articulated part.
+    active[1:, 0, 2] = True   # Another hand and object engage a frame later.
+    known = active.clone()
+    known[0, 0, 2] = False
+    active[0, 0, 2] = True    # Unavailable intent cannot start the lag.
+    ml.native_source_hand_part_intent = dict(active=active, known=known)
+    submitted = {}
+    for name, obj in command.native_objects.items():
+        obj.write_external_wrench_to_sim = lambda f, t, *, body_ids, name=name: submitted.update(
+            {name: torch.cat((f, t), -1).clone()})
+    command._init_native_object_assist()
+    command.enable_hoi_evaluation_perturbation()
+
+    for frame, expected in enumerate(((False, False), (True, False), (False, True))):
+        command.motion_steps[:] = frame
+        env.episode_length_buf[:] = frame
+        command.apply_substep()
+        assert tuple(bool(wrench.any()) for wrench in submitted.values()) == expected
+        assert not submitted["object"][:, 1].any()
+        for wrench, carries_disturbance in zip(submitted.values(), expected, strict=True):
+            norms = torch.stack((wrench[0, 0, :3].norm(), wrench[0, 0, 3:].norm()))
+            torch.testing.assert_close(norms, torch.tensor([1.5, .03] if carries_disturbance else [0., 0.]))
+
+    # Starting/resetting in the middle of an active source phase still waits.
+    command.clear_object_wrenches(torch.tensor([0]))
+    env.episode_length_buf.zero_()
+    command.apply_substep()
+    assert not any(wrench.any() for wrench in submitted.values())
 
 
 def test_unsupported_object_rates_do_not_add_velocity_drag(tmp_path, monkeypatch):

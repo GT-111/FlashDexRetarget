@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -707,8 +708,33 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         self._assist_perturb_wrench = torch.zeros(
             (self.num_envs, len(self.native_layout.objects), 6), device=self.device,
         )
-        self._assist_perturb_active = torch.zeros_like(self._assist_submission_support)
+        self._assist_perturb_active = torch.zeros_like(self._assist_perturb_wrench[..., 0], dtype=torch.bool)
         self._eval_hoi_perturbed = False
+        perturb = getattr(self.cfg.object, "perturb", None)
+        if perturb is not None and perturb.enabled:
+            lag = float(perturb.gate_lag_s)
+            if not math.isfinite(lag) or lag < 0:
+                raise ValueError("native perturbation requires a finite nonnegative engagement lag")
+            self._perturb_lag_ns = round(lag * 1e9)
+            self._perturb_source_gate = self._source_perturbation_gate()
+
+    def _source_perturbation_gate(self):
+        """Arm each object after consecutive supported source engagement."""
+        ml = self.motion_lib
+        intent = ml.native_source_hand_part_intent
+        if intent is None:
+            raise ValueError("native perturbation requires source hand-part intent")
+        part_active = (intent["active"] & intent["known"]).any(dim=1) & ml.native_object_part_pose_support
+        active = torch.stack([
+            part_active[:, self._object_part_columns[obj.entity_name]].any(dim=-1)
+            for obj in self.native_layout.objects
+        ], dim=-1)
+        entry = active & ~torch.roll(active, 1, dims=0)
+        entry[ml.length_starts] = True
+        row = torch.arange(len(active), device=self.device)[:, None]
+        start = torch.where(entry, row, 0).cummax(dim=0).values
+        elapsed_ns = ml.native_time_ns[:, None] - ml.native_time_ns[start]
+        return active & (elapsed_ns >= self._perturb_lag_ns)
 
     def enable_hoi_evaluation_perturbation(self):
         if not self._eval_mode or self.cfg.object.pin_objects or not self.cfg.object.perturb.enabled:
@@ -777,7 +803,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             torque = torque.clamp(-self._xfrc_force_range, self._xfrc_force_range)
         return force, torque
 
-    def _apply_object_assist(self):
+    def _apply_object_assist(self, *, advance_perturbation=False):
         pin = self.cfg.object.pin_objects
         eval_perturbed = self._eval_hoi_perturbed and self._eval_mode
         if not pin and not eval_perturbed:
@@ -796,25 +822,27 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             force = torch.zeros_like(self._assist_force_w)
             torque = torch.zeros_like(self._assist_torque_w)
         perturb = self.cfg.object.perturb
-        if perturb.enabled and (zero_gains or eval_perturbed):
+        if advance_perturbation and perturb.enabled and (zero_gains or eval_perturbed):
             active = self._assist_perturb_active
-            u = torch.rand(self.num_envs, device=self.device)
-            start = ~active & (u < float(perturb.start_prob))
-            active.copy_(start | (active & (u < float(perturb.continue_prob))))
+            columns = self._object_root_columns
+            reset_elapsed_ns = self._env.episode_length_buf * round(self._env.step_dt * 1e9)
+            eligible = (self._perturb_source_gate[self._motion_flat_ids] & support[:, columns]
+                        & (reset_elapsed_ns[:, None] >= self._perturb_lag_ns))
+            u = torch.rand(active.shape, device=self.device)
+            start = eligible & ~active & (u < float(perturb.start_prob))
+            active.copy_(start | (eligible & active & (u < float(perturb.continue_prob))))
             wrench = self._assist_perturb_wrench
             if start.any():
                 count = int(start.sum().item())
-                direction = torch.randn((count, wrench.shape[1], 2, 3), device=self.device, dtype=force.dtype)
+                direction = torch.randn((count, 2, 3), device=self.device, dtype=force.dtype)
                 direction /= direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
                 direction[..., 0, :] *= float(perturb.force_scale)
                 direction[..., 1, :] *= float(perturb.torque_scale)
                 wrench[start] = direction.flatten(-2)
             wrench[~active] = 0.0
             # One independent wrench per FREE object, regardless of its passive part count.
-            columns = self._object_root_columns
-            above = state[:, columns, 2:3] > float(perturb.height_thresh)
-            force[:, columns] += torch.where(above, wrench[..., :3], 0.0)
-            torque[:, columns] += torch.where(above, wrench[..., 3:], 0.0)
+            force[:, columns] += wrench[..., :3]
+            torque[:, columns] += wrench[..., 3:]
         self._assist_force_w.copy_(torch.where(support[..., None], force, 0.0).detach())
         self._assist_torque_w.copy_(torch.where(support[..., None], torque, 0.0).detach())
         for entity, obj in self.native_objects.items():
@@ -825,7 +853,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             )
 
     def apply_substep(self):
-        self._apply_object_assist()
+        self._apply_object_assist(advance_perturbation=True)
         # Bounded last-substep submitted-request evidence. This is neither a
         # measured force nor a whole-control-interval average.
         self._assist_last_force_w.copy_(self._assist_force_w)

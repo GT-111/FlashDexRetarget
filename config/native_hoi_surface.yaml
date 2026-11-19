@@ -68,7 +68,6 @@ commands:
       start_prob: 0.04
       continue_prob: 0.92
       gate_lag_s: 0.3
-      height_thresh: 0.02
       require_assist_decayed: true
 
 curriculum:
