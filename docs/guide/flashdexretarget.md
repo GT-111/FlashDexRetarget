@@ -387,6 +387,17 @@ does not certify source-required engagement, a BOX phase or task success.
 The device tape is bounded by worlds, configured substeps and actual pairs;
 the optional full-trajectory CPU recorder still needs its own memory budget.
 
+For a scene with multiple declared objects, Newton and direct MuJoCo Warp also
+record one pair per combination of object entities. The solver readback sums
+positive normal forces across the colliders in both complete object trees at
+each substep. `object_pair_interval_metadata_json` gives the ordered entity and
+FREE-root addresses. `object_pair_interval_normal_force_n` records the substep
+values and `object_pair_interval_peak_normal_force_n` gives each interval's peak.
+`object_pair_interval_measurement_support` requires a complete accepted solve
+interval and supported forces at every substep. Its values share the
+`hand_part_interval_*` solver clocks. Measured absence gives zero force. Reset
+and unsupported intervals carry false support and NaN forces.
+
 Isaac net-link forces and SDF association leave exact pair-force intervals
 unavailable. Derived target-force evidence does not replace original
 ARCTIC/OakInk source-contact support. Source roles, missing spans, phase

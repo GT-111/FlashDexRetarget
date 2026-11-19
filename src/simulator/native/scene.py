@@ -290,6 +290,11 @@ class NativeScene:
             f"{obj.entity_name}/{p.name}": {"entity_name": obj.entity_name, "body_name": p.body_name}
             for obj, p in layout.part_bindings
         }
+        self._object_pair_contact_addresses = {
+            key: dict(first_entity_name=first.entity_name, first_root_body_name=first.root_body_name,
+                      second_entity_name=second.entity_name, second_root_body_name=second.root_body_name)
+            for key, (first, second) in layout.object_pair_bindings.items()
+        }
         self._object_part_body_ids = torch.tensor(
             [sim.plant.model.body(part.body_name).id for _, part in layout.part_bindings],
             device=sim.device, dtype=torch.long,
@@ -346,16 +351,16 @@ class NativeScene:
         return self.sim.plant.execution_clock()
 
     def hand_part_contact_facts(self):
+        addresses = {
+            f"{hand.side}/{obj.entity_name}/{part.name}": {
+                "hand_side": hand.side, "hand_body_name": hand.root_body_name,
+                "part_entity_name": obj.entity_name, "part_body_name": part.body_name,
+            }
+            for hand in self.native_layout.hands for obj, part in self.native_layout.part_bindings
+        }
         return {
-            "pairs": self.sim.plant.contact_facts,
-            "addresses": {
-                f"{h.side}/{obj.entity_name}/{p.name}": {
-                    "hand_side": h.side, "hand_body_name": h.root_body_name,
-                    "part_entity_name": obj.entity_name,
-                    "part_body_name": p.body_name,
-                }
-                for h in self.native_layout.hands for obj, p in self.native_layout.part_bindings
-            },
+            "pairs": {key: pair for key, pair in self.sim.plant.contact_facts.items() if key in addresses},
+            "addresses": addresses,
             "measurement_support": self.sim.plant.contact_support,
             "sample_time_s": self.sim.plant.contact_sample_time_s,
             "clock": "actual_solver_time_at_last_integrated_substep_begin",
@@ -367,11 +372,30 @@ class NativeScene:
         if self.sim.plant.contact_interval is None:
             return None
         last = self.hand_part_contact_facts()
+        interval = self.sim.plant.contact_interval.facts()
         return {
-            **self.sim.plant.contact_interval.facts(), "addresses": last["addresses"],
+            **interval, "pairs": {key: interval["pairs"][key] for key in last["pairs"]},
+            "addresses": last["addresses"],
             "normal_force_authority": last["normal_force_authority"],
             "distance_authority": last["distance_authority"],
         }
+
+    def object_pair_contact_interval_facts(self):
+        """Named pairs of distinct complete object trees on the shared solver clock."""
+        interval = self.sim.plant.contact_interval
+        addresses = self._object_pair_contact_addresses
+        if interval is None or not addresses:
+            return None
+        facts = interval.facts()
+        if "execution_interval_complete" not in facts:
+            return None
+        force = torch.stack([facts["pairs"][key]["normal_force_n"] for key in addresses], dim=-1)
+        complete = (facts["interval_complete"] & facts["execution_interval_complete"]
+                    & facts["measurement_support"].all(-1))
+        support = complete[:, None] & torch.isfinite(force).all(dim=1)
+        force = torch.where(support[:, None, :], force, torch.nan)
+        return dict(pairs=list(addresses.values()), num_substeps=facts["num_substeps"],
+                    normal_force_n=force, peak_normal_force_n=force.amax(dim=1), measurement_support=support)
 
     def applied_object_wrench_interval_facts(self):
         interval = self.sim.plant.contact_interval

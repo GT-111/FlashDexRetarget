@@ -150,6 +150,7 @@ _CONTACT_INTERVAL_ARRAYS = (
     "sample_begin_time_s", "sample_end_time_s", "interval_complete",
 )
 _APPLIED_WRENCH_INTERVAL_ARRAYS = ("peak_force_n", "peak_torque_nm", "measurement_support")
+_OBJECT_PAIR_INTERVAL_ARRAYS = ("normal_force_n", "peak_normal_force_n", "measurement_support")
 _SOURCE_TIP_GEOMETRY_ARRAYS = (
     "reference_motion_ids", "reference_motion_steps", "reference_time_ns", "execution_valid",
     "source_position_w", "source_position_support", "achieved_position_w", "achieved_position_support",
@@ -337,6 +338,28 @@ class NativeRolloutRecord(RolloutRecord):
             )
             if "execution_clock" in interval:
                 self.contact_interval_metadata["execution_clock"] = dict(interval["execution_clock"])
+        self._object_pair_interval_reader = getattr(env.scene, "object_pair_contact_interval_facts", None)
+        self.object_pair_interval_metadata = None
+        object_pair_interval = (
+            None if self._object_pair_interval_reader is None else self._object_pair_interval_reader()
+        )
+        if object_pair_interval is not None:
+            parts = {(part["entity_name"], part["body_name"]) for part in self.binding["object_parts"].values()}
+            for pair in object_pair_interval["pairs"]:
+                if any((pair[f"{endpoint}_entity_name"], pair[f"{endpoint}_root_body_name"]) not in parts
+                       for endpoint in ("first", "second")):
+                    raise ValueError("object pair contact requires both actual root bodies in the recording binding")
+            self.object_pair_interval_metadata = dict(
+                schema="solver_object_pair_control_interval_v1", pairs=object_pair_interval["pairs"],
+                num_substeps=object_pair_interval["num_substeps"],
+                normal_force_authority="actual_solver_object_subtree_pair_positive_normal_force",
+                clock="shared hand_part_interval_* physical and accepted-step clock arrays",
+                sampling="sum positive collider normal forces at every configured substep; peak is the maximum substep sum",
+                normal_force_axes="recorded endpoint, configured substep, named pair",
+                peak_axes="recorded endpoint, named pair",
+                absent_contact="measured zero normal force",
+                unsupported="reset or incomplete solved interval returns NaN forces and false pair support",
+            )
         self._source_tip_geometry_reader = getattr(self.cmd, "source_tip_geometry_facts", None)
         self.source_tip_geometry_metadata_json = None
         self._source_hand_part_intent_reader = getattr(self.cmd, "source_hand_part_intent_facts", None)
@@ -431,6 +454,10 @@ class NativeRolloutRecord(RolloutRecord):
                 for key in ("execution_sample_begin_step", "execution_sample_end_step",
                             "execution_clock_support", "execution_interval_complete"):
                     frame["contact_interval"][key] = interval[key].detach().cpu().clone()
+        if self.object_pair_interval_metadata is not None:
+            pairs = self._object_pair_interval_reader()
+            frame["object_pair_interval"] = {field: pairs[field].detach().cpu().clone()
+                                               for field in _OBJECT_PAIR_INTERVAL_ARRAYS}
         if self._source_tip_geometry_reader is not None:
             facts = self._source_tip_geometry_reader()
             if facts is not None:
@@ -500,6 +527,9 @@ class NativeRolloutRecord(RolloutRecord):
                 selected["execution_steps"] = frame["execution_steps"][select]
             if "contact_interval" in frame:
                 selected["contact_interval"] = {key: value[select] for key, value in frame["contact_interval"].items()}
+            if "object_pair_interval" in frame:
+                selected["object_pair_interval"] = {field: value[select]
+                                                      for field, value in frame["object_pair_interval"].items()}
         return state
 
     def rollout_arrays(self, states, env_index):
@@ -610,6 +640,12 @@ class NativeRolloutRecord(RolloutRecord):
                                       "execution_clock_support", "execution_interval_complete"):
                             result["hand_part_interval_" + field] = np.stack([
                                 frame["contact_interval"][field][row].numpy() for frame in frames])
+                if self.object_pair_interval_metadata is not None:
+                    prefix = "object_pair_interval_"
+                    result[prefix + "metadata_json"] = np.asarray(json.dumps(self.object_pair_interval_metadata))
+                    for field in _OBJECT_PAIR_INTERVAL_ARRAYS:
+                        result[prefix + field] = np.stack([frame["object_pair_interval"][field][row].numpy()
+                                                           for frame in frames])
                 return result
             offset += size
         raise IndexError(env_index)

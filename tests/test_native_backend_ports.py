@@ -618,28 +618,31 @@ def test_native_views_stage_one_reset_then_install_without_teleporting(tmp_path)
 
 
 def test_direct_contact_reduction_uses_actual_body_pairs_and_worst_separation(tmp_path):
-    _layout, _mapping, model = _mechanics(tmp_path)
+    layout, _ = _two_object_scene(tmp_path)
+    model = mujoco.MjModel.from_xml_path(layout.scene_xml_path)
     plant = object.__new__(MjWarpPlant)
-    hand, base, lid, other = [model.body(n).id for n in ("left_root", "base", "lid", "right_root")]
-    plant._init_buffers(model, 2, "cpu", {"left/base": ([hand], [base]), "left/lid": ([hand], [lid])})
+    hand, base, lid, other, prop = [model.body(n).id for n in ("left_root", "base", "lid", "right_root", "prop_root")]
+    plant._init_buffers(model, 2, "cpu", {"left/base": ([hand], [base]), "left/lid": ([hand], [lid]),
+                                          "object_pair": ([base, lid], [prop])})
     # Synthetic solved-contact protocol: two contacts on the required part,
     # one different part, and a high-force unrelated hand that must be excluded.
-    geom_by_body = {body: int(np.flatnonzero(model.geom_bodyid == body)[0]) for body in (hand, base, lid, other)}
-    geoms = torch.tensor([[geom_by_body[a], geom_by_body[b]] for a, b in
-                          ((hand, base), (base, hand), (hand, lid), (other, base))] + [[-1, -1]])
-    data = SimpleNamespace(contact=SimpleNamespace(geom=geoms, worldid=torch.tensor([0, 0, 1, 1, -1]),
-                           dist=torch.tensor([.002, -.026, -.003, 0., 0.])), nacon=torch.tensor([4]))
+    geom_by_body = {body: int(np.flatnonzero(model.geom_bodyid == body)[0]) for body in (hand, base, lid, other, prop)}
+    body_pairs = ((hand, base), (base, hand), (hand, lid), (other, base), (prop, base), (lid, prop))
+    geoms = torch.tensor([[geom_by_body[a], geom_by_body[b]] for a, b in body_pairs] + [[-1, -1]])
+    data = SimpleNamespace(contact=SimpleNamespace(geom=geoms, worldid=torch.tensor([0, 0, 1, 1, 0, 0, -1]),
+                           dist=torch.tensor([.002, -.026, -.003, 0., -.008, -.019, 0.])), nacon=torch.tensor([6]))
     plant._wp = SimpleNamespace(to_torch=lambda value: value)
     plant._mjw = SimpleNamespace(contact_force=lambda *args: None)
     plant._model, plant._data = None, data
     plant._geom_body = torch.tensor(model.geom_bodyid)
-    plant._contact_ids = torch.arange(5)
-    plant._contact_forces = torch.zeros(5, 6)
-    plant._contact_forces[:, 0] = torch.tensor([1., 2., .7, 100., 0.])
+    plant._contact_ids = torch.arange(len(geoms))
+    plant._contact_forces = torch.zeros(len(geoms), 6)
+    plant._contact_forces[:, 0] = torch.tensor([1., 2., .7, 100., 0.1, 0.6, 0.])
     assert not plant.contact_support.any() and torch.isnan(plant.contact_facts["left/base"]["normal_force_n"]).all()
     plant._read_solved_contacts()
     torch.testing.assert_close(plant.contact_facts["left/base"]["normal_force_n"], torch.tensor([3., 0.]))
     torch.testing.assert_close(plant.contact_facts["left/lid"]["normal_force_n"], torch.tensor([0., .7]))
+    torch.testing.assert_close(plant.contact_facts["object_pair"]["normal_force_n"], torch.tensor([.7, 0.]))
     assert plant.contact_facts["left/base"]["force_bearing_distance_max_m"][0] == torch.tensor(.026)
     assert torch.isnan(plant.contact_facts["left/base"]["force_bearing_distance_max_m"][1])
     plant.invalidate_contacts(torch.tensor([0]))
@@ -653,6 +656,7 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
         load_flashdex_rollout,
     )
     from test_native_rollout_record import record_reference_phase_fixture
+    from test_native_task_contract import _add_loose_object
 
     source = flashdex_source_mapping(
         source_id="synthetic", source_revision="protocol-only", source_unit_id="capture",
@@ -668,13 +672,14 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
         assistance_receipt={"evaluation_external_wrenches_cleared": True, "evaluation_object_playback": False},
         hands={s: {"body_name": s + "_root", "command_joint_names": {"driver": s + "_driver"},
                    "physical_joint_names": {"driver": s + "_driver"}} for s in ("left", "right")},
-        object_part_names=["base", "lid"],
-        object_parts={n: {"entity_name": "object", "body_name": b} for n, b in
-                      (("base", "object_root"), ("lid", "object_lid"))},
+        object_part_names=["base", "lid", "prop"],
+        object_parts={name: {"entity_name": entity, "body_name": body} for name, entity, body in (
+            ("base", "object", "object_root"), ("lid", "object", "object_lid"), ("prop", "loose_prop", "prop_root"))},
         clips={"fixture": source},
     )
 
     def setup(env, command):
+        _add_loose_object(command, env, [])
         env.scene.backend_identity = {"backend": "synthetic_port_protocol_not_physics"}
         env.scene.physics_time_s = lambda: torch.tensor(
             [7.125 + int(command.reference_phase["motion_steps"].item()) * .02], dtype=torch.float64)
@@ -687,7 +692,7 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
             row = int(command.reference_phase["motion_steps"].item())
             known = row > 0
             addresses = {f"{s}/{n}": dict(hand_side=s, hand_body_name=s + "_root",
-                         part_entity_name="object", part_body_name=p["body_name"])
+                         part_entity_name=p["entity_name"], part_body_name=p["body_name"])
                          for s in ("left", "right") for n, p in binding["object_parts"].items()}
             return dict(addresses=addresses,
                 pairs={name: {"normal_force_n": torch.tensor([float(row) if known else float("nan")]),
@@ -720,13 +725,25 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
                 "execution_interval_complete": torch.tensor([known])}
 
         env.scene.hand_part_contact_interval_facts = interval
+        key = next(iter(command.native_layout.object_pair_bindings))
+
+        def object_interval():
+            row = int(command.reference_phase["motion_steps"].item())
+            forces = (0., 1.5, 0.25, 0.) if row == 1 else (0., 0., 0., 0.)
+            return {**interval(), "pairs": {key: {"normal_force_n": torch.tensor([forces])}}}
+
+        receiver = SimpleNamespace(
+            sim=SimpleNamespace(plant=SimpleNamespace(contact_interval=SimpleNamespace(facts=object_interval))),
+            _object_pair_contact_addresses={key: dict(first_entity_name="object", first_root_body_name="object_root",
+                second_entity_name="loose_prop", second_root_body_name="prop_root")})
+        env.scene.object_pair_contact_interval_facts = lambda: NativeScene.object_pair_contact_interval_facts(receiver)
 
     manifest = record_reference_phase_fixture(tmp_path, binding, native=True, setup_scene=setup)
     recorded = load_flashdex_rollout(manifest, motion_id=0)
     arrays = recorded.arrays
     np.testing.assert_array_equal(arrays["recorded_motion_steps"], [0, 1, 2])
     np.testing.assert_array_equal(arrays["command_motion_steps"], [1, 2, 2])
-    assert arrays["hand_part_normal_force_n"].shape == (3, 4)
+    assert arrays["hand_part_normal_force_n"].shape == (3, 6)
     assert np.isnan(arrays["hand_part_normal_force_n"][0]).all()
     np.testing.assert_array_equal(arrays["hand_part_measurement_support"][:, 0], [False, True, True])
     np.testing.assert_allclose(arrays["hand_part_sample_time_s"][1:], [7.14, 7.16])
@@ -739,7 +756,15 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
     assert arrays["hand_part_interval_execution_interval_complete"][1:].all()
     assert arrays["native_hand_twist_w"].shape == (3, 2, 6)
     metadata = json.loads(str(arrays["hand_part_contact_metadata_json"]))
-    assert len(metadata["pairs"]) == 4 and "not original" in metadata["provenance"]
+    assert len(metadata["pairs"]) == 6 and "not original" in metadata["provenance"]
+    pair = json.loads(str(arrays["object_pair_interval_metadata_json"]))
+    assert pair["schema"] == "solver_object_pair_control_interval_v1"
+    assert pair["pairs"] == [dict(first_entity_name="object", first_root_body_name="object_root",
+        second_entity_name="loose_prop", second_root_body_name="prop_root")]
+    np.testing.assert_array_equal(arrays["object_pair_interval_measurement_support"][:, 0], [False, True, True])
+    np.testing.assert_allclose(arrays["object_pair_interval_peak_normal_force_n"][:, 0], [np.nan, 1.5, 0.])
+    np.testing.assert_allclose(arrays["object_pair_interval_normal_force_n"][:, :, 0],
+                               [[np.nan] * 4, [0., 1.5, 0.25, 0.], [0.] * 4])
     assert json.loads(str(arrays["native_backend_metadata_json"]))["backend"] == "synthetic_port_protocol_not_physics"
 
 
@@ -1092,7 +1117,12 @@ def test_native_factory_keeps_multiple_objects_and_duplicate_local_part_labels(t
         decimation=4, episode_length_s=1., seed=1, eval={}))
     env, _ = native_create.create_native_envs(cfg, "cpu")
     scene, plant = env.scene, env.sim.plant
-    assert len(plant.contact_facts) == 6
+    key = "objects/object/loose_prop"
+    assert len(plant.contact_facts) == 7
+    assert plant.contact_pairs[key] == ([plant.model.body("base").id, plant.model.body("lid").id],
+                                       [plant.model.body("prop_root").id])
+    assert key not in scene.hand_part_contact_facts()["pairs"]
+    assert key not in scene.hand_part_contact_interval_facts()["pairs"]
     assert {a["part_entity_name"] for a in scene.hand_part_contact_facts()["addresses"].values()} == {"object", "loose_prop"}
     assert "left/object/base" in plant.contact_facts and "left/loose_prop/base" in plant.contact_facts
     assert set(scene.object_parts) == {"object/base", "object/lid", "loose_prop/base"}

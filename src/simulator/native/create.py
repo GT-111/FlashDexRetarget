@@ -25,13 +25,17 @@ def create_native_envs(cfg, device="cuda"):
     # Resolve actual body addresses from the same authored scene used by the plant.
     import mujoco
     model = mujoco.MjModel.from_xml_path(layout.scene_xml_path)
+    bodies = {entry.root_body_name: [model.body(name).id for name in meta.subtree(entry.root_body_name).body_names]
+              for entry in layout.articulations}
     pairs = {
         f"{hand.side}/{obj.entity_name}/{part.name}": (
-            [model.body(n).id for n in meta.subtree(hand.root_body_name).body_names],
+            bodies[hand.root_body_name],
             [model.body(part.body_name).id],
         )
         for hand in layout.hands for obj, part in layout.part_bindings
     }
+    pairs.update({key: (bodies[first.root_body_name], bodies[second.root_body_name])
+                  for key, (first, second) in layout.object_pair_bindings.items()})
     plant = plant_class(
         scene_xml_path=layout.scene_xml_path, num_envs=int(cfg.scene.num_envs),
         sim_dt=float(cfg.sim.dt), device=device, contact_pairs=pairs, **config,

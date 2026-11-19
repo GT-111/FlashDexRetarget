@@ -7,6 +7,7 @@ engine-specific converted assets remain in the simulator configuration.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Mapping
 
 
@@ -115,6 +116,11 @@ class NativeSceneCfg:
     @property
     def object_root_body_names(self) -> dict[str, str]:
         return {obj.entity_name: obj.root_body_name for obj in self.objects}
+
+    @property
+    def object_pair_bindings(self) -> dict[str, tuple[NativeObjectCfg, NativeObjectCfg]]:
+        return {f"objects/{first.entity_name}/{second.entity_name}": (first, second)
+                for first, second in combinations(self.objects, 2)}
 
 
 def bind_native_scene_config(cfg, *, constructor_gravity_world_m_per_s2) -> NativeSceneCfg:
