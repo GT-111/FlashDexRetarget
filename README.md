@@ -483,9 +483,10 @@ Native object disturbances use known source hand-part engagement. An object's
 burst can start after its configured engagement lag and the same delay after
 reset. The wrench acts on its FREE root and clears when source engagement
 ends. This also covers objects manipulated on a support surface.
-The HOI recipe treats a take that exceeds its declared part-pose tracking
-tolerances as a training failure. Frozen evaluation still records the entire
-source take so the failure window can be inspected.
+The HOI recipe treats a take that exceeds 5 cm of part translation or 20° of
+part rotation as a training failure. The part-position reward uses the same
+5 cm scale. Frozen evaluation still records the entire source take so the
+failure window can be inspected.
 Set `eval.interval=0` for an HOI training run whose exact-zero FULL checkpoint
 will be evaluated separately in nominal and perturbed modes.
 

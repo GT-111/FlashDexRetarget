@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -120,12 +121,19 @@ def test_hoi_collection_treats_outside_pose_tolerance_as_a_failed_take(tmp_path:
     cfg = _native_hoi_config(tmp_path / "motion.pt")
     bounds = OmegaConf.to_container(cfg.terminations.native_reference_diverged.params, resolve=True)
     command, env, _ = _command(rigid=True)
-    object_position = next(iter(command.native_objects.values())).data.body_link_pos_w
+    object_data = next(iter(command.native_objects.values())).data
     diverged = NativeMotionTrackingTerminations.native_reference_diverged
-    object_position[..., 2] = -0.025
+    object_data.body_link_pos_w[..., 2] = -0.025
     assert not diverged(env, "motion", **bounds).item()
-    object_position[..., 2] = -0.075
+    object_data.body_link_pos_w[..., 2] = -0.075
     assert diverged(env, "motion", **bounds).item()
+    object_data.body_link_pos_w.zero_()
+    for degrees, failed in ((15, False), (25, True)):
+        half_angle = math.radians(degrees / 2)
+        object_data.body_link_quat_w[:] = torch.tensor([math.cos(half_angle), 0, 0, math.sin(half_angle)])
+        assert diverged(env, "motion", **bounds).item() == failed
+    part_pose_reward = cfg.rewards.reward_params.native_object_part_pose
+    assert part_pose_reward.position_scale_m == bounds["part_position_m"]
     command.motion_lib.native_object_part_pose_support[:] = False
     assert not diverged(env, "motion", **bounds).item()
     assert bounds["part_rotation_rad"] == cfg.native_tracking_tolerances.part_rotation_error_rad
