@@ -138,13 +138,13 @@ class XfrcAssistCurriculum:
 
     def hoi_zero_receipt(self) -> dict | None:
         required_epochs = 15
-        if (self.zero_epoch >= 0 or not self.gain_history or not self.has_zero_gains()
-                or self.num_epoch_since_last_decay < required_epochs):
+        zero_epochs = min(self._last_epoch, self.num_epoch_since_last_decay)
+        if self.zero_epoch >= 0 or not self.has_zero_gains() or zero_epochs < required_epochs:
             return None
         return {
             "upper": dict(self.curr_gains),
             "lower": dict(self.curr_gains_lower),
-            "continuous_zero_epochs": self.num_epoch_since_last_decay,
+            "continuous_zero_epochs": zero_epochs,
             "required_zero_epochs": required_epochs,
         }
 

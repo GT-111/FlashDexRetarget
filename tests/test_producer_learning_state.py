@@ -723,11 +723,11 @@ def test_rng_roundtrip_covers_independent_gym_and_learning_generators(tmp_path):
     np.testing.assert_array_equal(action_space.sample(), expected[3])
 
 
-def _curriculum():
+def _curriculum(*, kp=80, kv=5, force=50):
     command = SimpleNamespace()
     curriculum = XfrcAssistCurriculum(
         command=command, num_envs=2, max_episode_length=100, num_steps_per_env=4,
-        kp_init=80, kv_init=5, force_range=50, wait_epochs=0, deque_len=2,
+        kp_init=kp, kv_init=kv, force_range=force, wait_epochs=0, deque_len=2,
         reward_terms={"task": ("task",)}, rew_thresholds={"task": .6},
         upper_ratios={"kp": .9, "kv": .9, "fr": 1},
         lower_ratios={"kp": 1, "kv": 1, "fr": 1},
@@ -799,14 +799,22 @@ def test_hoi_zero_hold_requires_fifteen_actual_epochs_after_adaptive_decay():
     assert restored.hoi_zero_receipt() is None
 
 
+def test_initially_free_hoi_requires_observed_zero_epochs():
+    curriculum, env = _curriculum(kp=0, kv=0, force=0)
+    for step in range(1, 15 * 4):
+        _curriculum_step(curriculum, env, step)
+    assert not curriculum.gain_history
+    assert curriculum.hoi_zero_receipt() is None
+    _curriculum_step(curriculum, env, 15 * 4)
+    assert curriculum.hoi_zero_receipt()["continuous_zero_epochs"] == 15
+
+
 def test_hoi_frozen_evaluation_checks_actual_restored_full_curriculum(tmp_path):
     from evaluate import _restore_hoi_zero_curriculum
 
-    trained, _ = _curriculum()
-    trained.gain_history.append({"gains": trained.curr_gains.copy(), "lower": trained.curr_gains_lower.copy()})
-    trained.curr_gains = dict.fromkeys(trained.decay_terms, 0.0)
-    trained.curr_gains_lower = dict.fromkeys(trained.decay_terms, 0.0)
-    trained.num_epoch_since_last_decay = 15
+    trained, env = _curriculum(kp=0, kv=0, force=0)
+    for step in range(1, 15 * 4 + 1):
+        _curriculum_step(trained, env, step)
     state = {"env_step": 512, "curriculum": trained.state_dict(),
              "native_hoi_zero": trained.hoi_zero_receipt(), "native_hoi_source_revision": "test-source"}
     (tmp_path / "replay_buffer.pt").touch()

@@ -494,7 +494,9 @@ part rotation as a training failure. The part-position reward uses the same
 5 cm scale. Frozen evaluation still records the entire source take so the
 failure window can be inspected.
 Set `eval.interval=0` for an HOI training run whose exact-zero FULL checkpoint
-will be evaluated separately in nominal and perturbed modes.
+will be evaluated separately in nominal and perturbed modes. Runs that begin
+with zero assistance must still execute the full 15-epoch zero hold before an
+eligible checkpoint is written.
 
 ## Project Structure
 
