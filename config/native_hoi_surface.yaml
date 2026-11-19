@@ -1,4 +1,4 @@
-# High-efficiency, grasp-hardened native HOI FlashSAC recipe across all 6 hands.
+# Native HOI FlashSAC recipe for prepared physical hands.
 defaults:
   - native
   - _self_

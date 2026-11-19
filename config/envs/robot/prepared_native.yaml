@@ -1,0 +1,20 @@
+# @package _global_
+
+# Prepared motion declares physical actuators and MANO fingertip bindings.
+robot:
+  entity_name: robot
+  self_collision: true
+  body_names:
+    fingers: []
+  joint_names:
+    wrist_trans: []
+    wrist_rot: []
+    finger: []
+  site_names:
+    tip: {left: [], right: []}
+    contact: ${robot.site_names.tip}
+  contact_links: {left: [], right: []}
+  body_mapping:
+    all: []
+    level1: {}
+    level2: {}

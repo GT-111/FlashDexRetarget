@@ -41,6 +41,42 @@ def _native_hoi_config(motion_file, robot_cfg="inspire_rh56f1_bimanual"):
         )
 
 
+def test_prepared_native_profile_uses_ordered_source_roles_and_actual_actuators(tmp_path):
+    _, mapping = _scene(tmp_path)
+    left, right = mapping["hands"]
+    left.update(tip_source_point_names=["pinky_tip", "thumb_tip"],
+                tip_site_names=["left_pad", "left_tip"])
+    right.update(tip_source_point_names=["thumb_tip", "pinky_tip"],
+                 tip_site_names=["right_tip", "right_pad"])
+    motion_file = write_native_scene_manifest(tmp_path, mapping)
+    cfg = _native_hoi_config(motion_file, "prepared_native")
+    bind_prepared_native_reference(cfg)
+    layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=(0., 0., -9.81))
+
+    assert list(cfg.commands.finger_names) == ["pinky", "thumb"]
+    assert list(cfg.commands.site_names["tip"]["left"]) == ["left_pad", "left_tip"]
+    assert list(cfg.commands.site_names["tip"]["right"]) == ["right_pad", "right_tip"]
+    assert cfg.commands.site_names["contact"] == cfg.commands.site_names["tip"]
+    assert list(cfg.commands.joint_names.finger) == [
+        name for hand in mapping["hands"] for name in hand["command_actuator_names"]
+    ]
+    assert [list(hand.tip_site_names) for hand in layout.hands] == [
+        hand["tip_site_names"] for hand in mapping["hands"]
+    ]
+
+
+def test_prepared_native_profile_cannot_borrow_undeclared_roles(tmp_path):
+    _, mapping = _scene(tmp_path)
+    for hand in mapping["hands"]:
+        side = hand["side"]
+        hand.update(tip_source_point_names=["thumb_tip" if side == "left" else "index_tip"],
+                    tip_site_names=[f"{side}_tip"])
+    cfg = _native_hoi_config(write_native_scene_manifest(tmp_path, mapping), "prepared_native")
+
+    with pytest.raises(ValueError, match="same fingertip source roles"):
+        bind_prepared_native_reference(cfg)
+
+
 @pytest.mark.parametrize("robot_cfg", SIX_HAND_ROBOT_CONFIGS)
 def test_six_hand_hoi_surface_hydra_configs_compose(robot_cfg: str, tmp_path: Path) -> None:
     _, mapping = _scene(tmp_path)

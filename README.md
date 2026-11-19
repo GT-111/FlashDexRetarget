@@ -132,10 +132,14 @@ The native trainer and evaluator read `native_scene` and `recording_binding`
 from the `native-reference.json` beside `commands.motion_file`. Scene and
 surface mesh paths resolve relative to that manifest. A scene can contain
 rigid objects and articulated objects together, with genuinely absent joints
-omitted. Each hand can declare `tip_site_names` in terminal order. Robot
-profiles supply anatomical mappings, and simulator profiles select the plant.
+omitted. Each hand can declare `tip_source_point_names` from the prepared
+MANO reference alongside the corresponding physical `tip_site_names`. The
+prepared profile binds both hands by those roles and uses the command
+actuators declared by the scene. Older references with only site names can
+still use their original robot profile.
 
-Select `--config_name native_hoi_surface` for the six-hand HOI producer.
+Select `--config_name native_hoi_surface envs/robot@robot=prepared_native`
+for the HOI producer with declared fingertip roles.
 Its tracking tolerances control reference-tracking evaluation and the
 prepared manifest retains source, scene and command correspondence.
 

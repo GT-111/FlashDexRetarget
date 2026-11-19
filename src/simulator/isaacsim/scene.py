@@ -877,8 +877,16 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
             )
     from pxr import UsdPhysics
 
-    contacts = {}
+    contacts, contact_links = {}, {}
     for hand in layout.hands:
+        hand_meta = metadata[hand.entity_name]
+        names = list(cfg.robot.contact_links[hand.side])
+        if not names:
+            tip_bodies = {
+                hand_meta.sites[site].body_name for site in cfg.robot.site_names.contact[hand.side]
+            }
+            names = [name for name in hand_meta.body_names if name in hand_meta.body_bound or name in tip_bodies]
+        contact_links[hand.side] = names
         asset_path = assets[hand.entity_name].cfg.prim_path
         entity_path = next(
             path
@@ -893,8 +901,8 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
                 stage=scene.stage,
             )
         }
-        for body in cfg.robot.contact_links[hand.side]:
-            metadata[hand.entity_name].body_names.index(body)
+        for body in names:
+            hand_meta.body_names.index(body)
             relative_path = str(bodies[body].GetPath()).removeprefix(entity_path)
             contacts[body] = ContactSensor(
                 ContactSensorCfg(
@@ -953,9 +961,9 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         for obj, p in layout.part_bindings
     }
     for hand in layout.hands:
-        names = list(cfg.robot.contact_links[hand.side])
+        names = contact_links[hand.side]
         margins = torch.tensor(
-            [scene_meta.body_bound[n] + 0.015 for n in names],
+            [scene_meta.body_bound.get(n, 0.0) + 0.015 for n in names],
             device=device,
         )
         bank, views = build_tracking_contact_views(

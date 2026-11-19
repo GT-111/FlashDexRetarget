@@ -35,6 +35,33 @@ def native_usd_paths(motion_file: str | Path, scene: dict) -> dict:
     }
 
 
+def _bind_tip_sites(robot, hands: list[dict]) -> None:
+    if not any("tip_source_point_names" in hand for hand in hands):
+        if not robot.body_names.fingers:
+            raise ValueError("prepared native profile requires tip_source_point_names for each hand")
+        for hand in hands:
+            if "tip_site_names" in hand:
+                robot.site_names.tip[hand["side"]] = hand["tip_site_names"]
+        return
+
+    sites_by_side = {}
+    for hand in hands:
+        side = hand["side"]
+        points = hand.get("tip_source_point_names", ())
+        sites = hand.get("tip_site_names", ())
+        if (not points or len(points) != len(sites) or len(set(points)) != len(points)
+                or len(set(sites)) != len(sites) or any(not point.endswith("_tip") for point in points)):
+            raise ValueError(f"native hand {side!r} requires one distinct MANO fingertip role per physical tip site")
+        sites_by_side[side] = dict(zip(points, sites, strict=True))
+    point_order = next(iter(sites_by_side.values()))
+    if any(sites.keys() != point_order.keys() for sites in sites_by_side.values()):
+        raise ValueError("native hands must declare the same fingertip source roles")
+    robot.body_names.fingers = [point.removesuffix("_tip") for point in point_order]
+    robot.joint_names.finger = [name for hand in hands for name in hand["command_actuator_names"]]
+    for side, sites in sites_by_side.items():
+        robot.site_names.tip[side] = [sites[point] for point in point_order]
+
+
 def bind_prepared_native_reference(cfg) -> None:
     """Bind a native Hydra configuration before resolving its interpolations."""
     if cfg.commands.get("_target_") != _NATIVE_COMMAND:
@@ -57,8 +84,6 @@ def bind_prepared_native_reference(cfg) -> None:
         cfg.native_recording_binding = binding
         cfg.robot.native_scene = scene
         cfg.robot.xml_path = scene["scene_xml_path"]
-        for hand in scene["hands"]:
-            if "tip_site_names" in hand:
-                cfg.robot.site_names.tip[hand["side"]] = hand["tip_site_names"]
+        _bind_tip_sites(cfg.robot, scene["hands"])
     if "native_assets" in cfg.sim:
         cfg.sim.native_assets = native_usd_paths(motion_file, scene)
