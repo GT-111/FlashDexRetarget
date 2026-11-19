@@ -229,7 +229,11 @@ def run_native_viewer(args, sets):
             self.pt = torch.load(pt_path, map_location="cpu", weights_only=False)
             self.nat_ref = json.loads((self.dir / "native-reference.json").read_text())
             scene_cfg = self.nat_ref["native_scene"]
-            self.model = mujoco.MjModel.from_xml_path(str(scene_cfg["scene_xml_path"]))
+            import os as _os
+            xml_cand = Path(_os.environ.get("FDR_NATIVE_SCENE_XML") or scene_cfg["scene_xml_path"])
+            if not xml_cand.is_file() and (self.dir.parent / "scene/scene.xml").is_file():
+                xml_cand = self.dir.parent / "scene/scene.xml"
+            self.model = mujoco.MjModel.from_xml_path(str(xml_cand))
             self.data = mujoco.MjData(self.model)
             self.hand_free_qadr = {
                 h["side"]: int(self.model.joint(h["root_joint_name"]).qposadr[0])
@@ -329,11 +333,16 @@ def run_native_viewer(args, sets):
     for i, n in enumerate(names):
         alias.setdefault(urllib.parse.unquote(n), i)
 
-    # Load object part meshes from native_scene
+    # Load object part meshes from native_scene (with relocatable fallback)
+    import os as _os
     part_meshes = []
     for obj in ref.nat_ref["native_scene"]["objects"]:
         for part in obj["parts"]:
             mp = Path(part["mesh_path"])
+            if not mp.is_file():
+                env_m = _os.environ.get("FDR_NATIVE_OBJECT_MESH")
+                if env_m and Path(env_m).is_file():
+                    mp = Path(env_m)
             mesh = trimesh.load(str(mp), force="mesh", process=False, skip_materials=True)
             part_meshes.append((f"{obj['entity_name']}/{part['name']}", np.asarray(mesh.vertices, np.float32), np.asarray(mesh.faces, np.int32)))
 

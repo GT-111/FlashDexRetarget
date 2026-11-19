@@ -93,10 +93,10 @@ robot:
           - left_ctrl_joint_14_0
           - left_ctrl_joint_15_0
         root_control:
-          position_stiffness: 900.0
-          position_damping: 90.0
-          rotation_stiffness: 800.0
-          rotation_damping: 80.0
+          position_stiffness: 360.0
+          position_damping: 38.0
+          rotation_stiffness: 360.0
+          rotation_damping: 38.0
           force_limit_n: null
           torque_limit_nm: null
           gravity_compensation: 1.0
