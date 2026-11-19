@@ -458,15 +458,16 @@ Every option, GPU memory and resuming:
 bash scripts/visualization.sh <output_dataset_path>
 # plus the archived rollouts of training runs (a run dir, its success/ dir, or logs/flashsac for every run)
 bash scripts/visualization.sh <output_dataset_path> logs/flashsac/<run>
-# native 6-hand FREE-wrist pool + recorded rollouts (or headless validation via --check)
-python src/utils/visualization.py --dataset <pool_dir> --saved <run_or_eval_dir> --check
+# prepared native FREE-wrist dataset and recorded rollouts (headless validation via --check)
+python src/utils/visualization.py --dataset <prepared_dataset> --saved <run_or_eval_dir> --check
 ```
 
 Open the printed URL (`PORT=8080` by default) in a browser. With a saved run the simulated hands and objects are
 drawn solid over the reference (translucent blue); a run trained on another `motion.pt` is tagged `[other reference]`.
-Native FREE-wrist datasets (`native-reference.json`) automatically render all six dexterous hands (`inspire_rh56f1`,
-`inspire_rh56dftp`, `wuji_hand`, `sharpa_wave`, `unitree_dex3_1`, `wonik_allegro_v5`), multi-part articulated objects,
-object tracking error, per-hand contact forces and supported interval peaks of applied force.
+For native FREE-wrist datasets, Viser uses `native-reference.json` to identify the hand and named object parts.
+It renders object tracking error, per-hand contact forces and supported interval peaks of applied force.
+Pass a directory containing one prepared dataset per hand to compare hands on the same clips and object layout.
+For a hand with multiple prepared selections, point `--dataset` at the selection containing the desired `motion.pt`.
 
 ### Six-hand grasp-hardened native HOI recipe (`native_hoi_surface`)
 

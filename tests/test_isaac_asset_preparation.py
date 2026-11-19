@@ -398,6 +398,7 @@ def test_kinematic_converter_forwards_configured_kit_args_and_operator_acceptanc
 
     dataset = tmp_path / "dataset"
     dataset.mkdir()
+    object_id = "fixture_prop"
     (dataset / "motion.pt").touch()
     if accepted is None:
         monkeypatch.delenv("OMNI_KIT_ACCEPT_EULA", raising=False)
@@ -405,7 +406,7 @@ def test_kinematic_converter_forwards_configured_kit_args_and_operator_acceptanc
         monkeypatch.setenv("OMNI_KIT_ACCEPT_EULA", accepted)
     monkeypatch.setattr(pipeline.torch, "load", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(pipeline, "object_meshes", lambda *_args: [
-        (dataset / "objects" / "S10001" / "visual.obj", 1),
+        (dataset / "objects" / object_id / "visual.obj", 1),
     ])
     run = Mock()
     monkeypatch.setattr(pipeline.subprocess, "run", run)
@@ -426,7 +427,7 @@ def test_kinematic_converter_forwards_configured_kit_args_and_operator_acceptanc
         Path(pipeline.__file__).resolve().parents[1] / "simulator/isaacsim/convert_assets.py"
     )
     assert arguments[2:] == [
-        "--data-root", str(dataset), "--objects", "S10001",
+        "--data-root", str(dataset), "--objects", object_id,
         "--kit_args=--/renderer/activeGpu=1 --/plugins/carb.tasking.plugin/threadCount=8",
     ]
     assert run.call_args.kwargs["check"] is True

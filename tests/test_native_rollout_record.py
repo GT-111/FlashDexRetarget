@@ -54,7 +54,7 @@ def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, se
     if native:
         binding = dict(binding)
         placement = binding.pop("scene_from_source_world")
-        source = {**source, "processing": {**source["processing"], "scene_from_source_world": placement}}
+        source = {**source, "processing": {**source.get("processing", {}), "scene_from_source_world": placement}}
         binding["clips"] = {name: source}
         library.source_lineage = [dict(source)]
         library.native_reference_provenance = [dict(
@@ -137,7 +137,7 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
     selected = [1, 2, 8]
     ordinal = np.array((0., 2.))
     imported_time = np.array((0, 16_666_667), np.int64)
-    source = {"source_unit_id": "S10001", "prepared_time_ns": [0, 58_333_333],
+    source = {"source_unit_id": "capture-001", "prepared_time_ns": [0, 58_333_333],
               "selected_source_frame_index": selected, "prepared_source_ordinal": ordinal.tolist(),
               "prepared_elapsed_time_ns": imported_time.tolist()}
     binding = {"hands": {
@@ -145,7 +145,7 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
         "right": {"body_name": "right_wrist", "physical_joint_names": {"hinge": "r_joint"}}},
         "object_part_names": ["base"], "scene_from_source_world": np.eye(4).tolist(),
         "object_parts": {"base": {"entity_name": "box", "body_name": "base"}},
-        "clips": {"S10001__st00": source}}
+        "clips": {"capture-001__stage-01": source}}
     robot = SimpleNamespace(joint_names=["r_joint", "l_joint"],
         body_names=["global_root", "right_wrist", "left_wrist"],
         data=SimpleNamespace(joint_pos=torch.tensor([[.1, .2]]), joint_vel=torch.tensor([[4., 8.]]),
@@ -161,8 +161,8 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
         cfg=SimpleNamespace(object=SimpleNamespace(pin_objects=False)),
         sim_obj_trans_w=torch.zeros((1, 1, 3)), sim_obj_quat_w=torch.tensor([[[1., 0., 0., 0.]]]),
         motion_lib=SimpleNamespace(hand_sides=("right", "left"),
-            motion_files=["file#S10001__st00"], _motion_num_frames=torch.tensor([2]),
-            source_lineage=[{"capture_id": "S10001", "selected_source_frame_index": selected,
+            motion_files=["file#capture-001__stage-01"], _motion_num_frames=torch.tensor([2]),
+            source_lineage=[{"capture_id": "capture-001", "selected_source_frame_index": selected,
                              "scene_from_source_world": np.eye(4).tolist()}],
             source_query_ordinal=[ordinal], source_import_elapsed_ns=[imported_time]))
     class Scene(dict):
@@ -193,9 +193,9 @@ def test_real_author_recorder_keeps_reset_named_bodies_raw_actions_and_source_li
     np.testing.assert_array_equal(output["native_object_part_pose"][:, 0, :3], ((7., 7., 7.), (7., 7., 7.)))
     np.testing.assert_array_equal(output["actions"], ((77., 88.), (77., 88.)))
     assert np.max(output["native_hand_pose"][..., :3]) < 999.
-    assert json.loads(str(output["native_binding_json"]))["clips"]["S10001__st00"] == source
+    assert json.loads(str(output["native_binding_json"]))["clips"]["capture-001__stage-01"] == source
     assert export_success(tmp_path, callback, [state], torch.tensor([True]), torch.tensor([0]),
-        20_000_000, "obj SR@1.0", motion_names=["S10001__st00"]) == 1
+        20_000_000, "obj SR@1.0", motion_names=["capture-001__stage-01"]) == 1
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["selection"].startswith("first_success_ever")
     assert manifest["saved"][0]["frames"] == 2
@@ -213,7 +213,7 @@ def test_ik_crop_preserves_full_id_inventory_and_query_origin(tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    lineage = {"capture_id": "S10001", "selected_source_frame_index": [1, 2, 8]}
+    lineage = {"capture_id": "capture-001", "selected_source_frame_index": [1, 2, 8]}
     clip = {"mano_left_wrist_pos": np.zeros((3, 3)), "qpos": np.arange(6).reshape(3, 2),
             "source_lineage_json": np.asarray(json.dumps(lineage)),
             "source_query_ordinal": np.array((0., 1., 2.)),
@@ -226,11 +226,11 @@ def test_ik_crop_preserves_full_id_inventory_and_query_origin(tmp_path):
         "source_query_ordinal": torch.from_numpy(cropped["source_query_ordinal"]),
         "source_import_elapsed_ns": torch.from_numpy(cropped["source_import_elapsed_ns"]),
         "motion_num_frames": torch.tensor([2]), "length_starts": torch.tensor([0]),
-        "motion_filename": ["S10001__st00"], "motion_source_lineage": [lineage]}
+        "motion_filename": ["capture-001__stage-01"], "motion_source_lineage": [lineage]}
     path = tmp_path / "motion.pt"
     torch.save(packed, path)
     loaded, names = module._load_packed_pt(str(path))
-    assert names == [f"{path}#S10001__st00"]
+    assert names == [f"{path}#capture-001__stage-01"]
     assert loaded[0]["source_lineage"] == lineage
     np.testing.assert_array_equal(loaded[0]["source_query_ordinal"], (1., 2.))
 
@@ -241,7 +241,7 @@ def test_frozen_attempt_npz_keeps_actual_native_schema_clocks_interval_and_first
     from evaluation.callbacks.success_export import export_current_attempts
 
     origin = 2**54 + 31
-    source = flashdex_source_mapping(source_id="arctic", source_revision="fixture",
+    source = flashdex_source_mapping(source_id="synthetic", source_revision="fixture",
         source_unit_id="fixture", source_episode_index=174, fold="train",
         source_frame_index=(0, 1, 2), source_time_ns=(origin, origin+20_000_000, origin+40_000_000),
         selected_source_frame_index=(0, 1, 2), prepared_source_ordinal=(0., 1., 2.),
@@ -337,7 +337,7 @@ def _prepared_native_recorder_fixture(tmp_path, *, hand_sides=("left", "right"),
     dataset, clip = _prepared_native_dataset(tmp_path)
     elapsed = np.arange(3, dtype=np.int64) * 20_000_000
     origin = 2**60 + 37
-    source = flashdex_source_mapping(source_id="arctic", source_revision="synthetic-fixture",
+    source = flashdex_source_mapping(source_id="synthetic", source_revision="synthetic-fixture",
         source_unit_id="episode-000174", source_episode_index=174, fold="train",
         source_frame_index=(0, 1, 2), source_time_ns=origin + elapsed,
         selected_source_frame_index=(0, 1, 2), prepared_source_ordinal=(0., 1., 2.),
@@ -795,7 +795,7 @@ def test_source_tip_geometry_uses_real_consumed_phase_through_final_endpoint(tmp
     from dexforge_adaptation.flashdex_retarget import flashdex_source_mapping
 
     clock_origin = 2**60 + 37
-    source = flashdex_source_mapping(source_id="arctic", source_revision="fixture", source_unit_id="fixture",
+    source = flashdex_source_mapping(source_id="synthetic", source_revision="fixture", source_unit_id="fixture",
         source_episode_index=174, fold="train", source_frame_index=(0, 1, 2),
         source_time_ns=(clock_origin, clock_origin + 20_000_000, clock_origin + 40_000_000),
         selected_source_frame_index=(0, 1, 2), prepared_source_ordinal=(0., 1., 2.),
@@ -850,7 +850,7 @@ def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assista
     )
     from test_native_task_contract import _add_loose_object, _declare_joint_coordinates
 
-    source = flashdex_source_mapping(source_id="arctic", source_revision="synthetic", source_unit_id="fixture",
+    source = flashdex_source_mapping(source_id="synthetic", source_revision="synthetic", source_unit_id="fixture",
         source_episode_index=0, fold="train", source_frame_index=(0, 1, 2),
         source_time_ns=(0, 20_000_000, 40_000_000), selected_source_frame_index=(0, 1, 2),
         prepared_source_ordinal=(0., 1., 2.), prepared_elapsed_time_ns=(0, 20_000_000, 40_000_000),

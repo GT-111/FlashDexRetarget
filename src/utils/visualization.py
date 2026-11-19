@@ -14,7 +14,6 @@ import mujoco
 import numpy as np
 import torch
 import trimesh
-import viser
 
 REPO = Path(__file__).resolve().parents[2]
 if __name__ == "__main__":
@@ -25,10 +24,10 @@ SIDES = ("right", "left")
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", required=True, help="dir with motion.pt, or with <robot>/motion.pt subdirs")
+    p.add_argument("--dataset", required=True, help="dir with motion.pt or a collection of prepared datasets")
     p.add_argument("--saved", nargs="*", default=[],
                    help="success archives (manifest.json + rollouts/), run dirs holding success/, or their parents")
-    p.add_argument("--robot", default="", help="robot of a single motion.pt (default: dir name, else by dof count)")
+    p.add_argument("--robot", default="", help="native embodiment to display, or robot for a stock motion.pt")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--fps", type=float, default=60.0)
     p.add_argument("--geom", default="convex", help="visual, or an objects/<id>/convex* parts dir")
@@ -71,25 +70,32 @@ def infer_robot(pt_path):
 
 
 def find_robots(root, robot):
-    if (root / "motion.pt").exists():
-        nat = root / "native-reference.json"
-        if nat.exists():
-            name = robot or json.loads(nat.read_text())["target"]["embodiment_id"]
-            return {name: root / "motion.pt"}
-        name = robot or (root.name if robot_xml(root.name).exists() else infer_robot(root / "motion.pt"))
-        return {name: root / "motion.pt"}
-    # Also support <hand>/dataset-{all,train}/motion.pt native pool layouts
-    nat_pts = sorted(root.glob("*/dataset-all/motion.pt")) or sorted(root.glob("*/dataset-train/motion.pt"))
-    if nat_pts:
-        return {
-            p.parents[1].name: p
-            for p in nat_pts
-            if (p.parent / "native-reference.json").exists() and robot in ("", p.parents[1].name)
-        }
+    from common.native_reference import load_native_reference
+
+    motion = root / "motion.pt"
+    if motion.is_file():
+        if motion.with_name("native-reference.json").is_file():
+            name = load_native_reference(motion)["target"]["embodiment_id"]
+            return {name: motion} if robot in ("", name) else {}
+        name = robot or (root.name if robot_xml(root.name).exists() else infer_robot(motion))
+        return {name: motion}
+
+    native = {}
+    manifests = sorted(p for p in root.rglob("native-reference.json") if p.with_name("motion.pt").is_file())
+    for manifest in manifests:
+        motion = manifest.with_name("motion.pt")
+        name = load_native_reference(motion)["target"]["embodiment_id"]
+        if robot not in ("", name):
+            continue
+        if name in native:
+            raise SystemExit(f"{root}: several prepared datasets for {name}; pass --dataset for one motion.pt directory")
+        native[name] = motion
+    if manifests:
+        return native
+
     pts = sorted(root.glob("*/motion.pt"), key=lambda p: (p.parent.name != "xhand", p.parent.name))
     return {p.parent.name: p for p in pts
-            if ((p.parent / "native-reference.json").exists() or robot_xml(p.parent.name).exists())
-            and robot in ("", p.parent.name)}
+            if robot_xml(p.parent.name).exists() and robot in ("", p.parent.name)}
 
 
 def find_archives(paths):
@@ -213,28 +219,15 @@ class Archive:
         return {"joint_pos": z["joint_pos"], "obj_pos": op, "obj_quat": oq, "entry": e}
 
 
-def dataset_of(name, info):
-    if name in info:
-        return info[name]
-    if name.startswith("taco_"):
-        return "taco"
-    if name.startswith("scene_"):
-        return "oakink2"
-    if name[:1] == "P" and "_seg" in name:
-        return "hot3d"
-    return "other"
-
-
 def run_native_viewer(args, sets):
-    """Viser viewer + --check validator for all 6 native FREE-wrist hands and multi-part objects."""
+    """Display prepared FREE-wrist clips and their declared objects."""
     from common.native_reference import load_native_reference
 
     class NativeRobot:
         def __init__(self, name, pt_path):
-            self.name, self.dir = name, Path(pt_path).parent
+            self.name = name
             self.pt = torch.load(pt_path, map_location="cpu", weights_only=False)
-            self.nat_ref = load_native_reference(pt_path)
-            scene_cfg = self.nat_ref["native_scene"]
+            scene_cfg = load_native_reference(pt_path)["native_scene"]
             self.model = mujoco.MjModel.from_xml_path(scene_cfg["scene_xml_path"])
             self.data = mujoco.MjData(self.model)
             self.hand_free_qadr = {
@@ -253,6 +246,11 @@ def run_native_viewer(args, sets):
             ]
             self.nframes = np.asarray(self.pt["motion_num_frames"]).astype(int)
             self.refs = self.pt["motion_native_reference"]
+            self.parts = tuple((obj["entity_name"], part) for obj in scene_cfg["objects"] for part in obj["parts"])
+            self.part_addresses = tuple((entity, part["body_name"]) for entity, part in self.parts)
+            bodies = tuple(body for _, body in self.part_addresses)
+            if any(tuple(clip["object_part_body_names"]) != bodies for clip in self.refs):
+                raise ValueError(f"{pt_path}: reference part columns differ from the native scene")
             self.trees = {}
 
         def add_tree(self, server, key, tint=None, opacity=None):
@@ -331,16 +329,21 @@ def run_native_viewer(args, sets):
     robots = {r: NativeRobot(r, pt) for r, pt in sets.items()}
     ref = next(iter(robots.values()))
     names, nframes = ref.names, ref.nframes
+    for r in robots.values():
+        if r.names != names or not np.array_equal(r.nframes, nframes) or r.part_addresses != ref.part_addresses:
+            raise SystemExit(f"{r.name}: clips or object layout differ from {ref.name}; pass one prepared dataset directory")
     alias = {n: i for i, n in enumerate(names)}
     for i, n in enumerate(names):
         alias.setdefault(urllib.parse.unquote(n), i)
 
     # Load the declared part-local surface meshes.
     part_meshes = []
-    for obj in ref.nat_ref["native_scene"]["objects"]:
-        for part in obj["parts"]:
-            mesh = trimesh.load(part["mesh_path"], force="mesh", process=False, skip_materials=True)
-            part_meshes.append((f"{obj['entity_name']}/{part['name']}", np.asarray(mesh.vertices, np.float32), np.asarray(mesh.faces, np.int32)))
+    for _, part in ref.parts:
+        mesh = trimesh.load(part["mesh_path"], force="mesh", process=False, skip_materials=True)
+        rotation = np.empty(9)
+        mujoco.mju_quat2Mat(rotation, np.asarray(part.get("body_from_mesh_quat_wxyz", (1., 0., 0., 0.)), np.float64))
+        vertices = mesh.vertices @ rotation.reshape(3, 3).T + part.get("body_from_mesh_position_m", (0., 0., 0.))
+        part_meshes.append((np.asarray(vertices, np.float32), np.asarray(mesh.faces, np.int32)))
 
     # Discover native rollouts (either success/manifest.json or current-policy-*/*.npz)
     archives = {}
@@ -362,10 +365,14 @@ def run_native_viewer(args, sets):
             if cname not in alias or not npz_p.exists():
                 continue
             d = np.load(npz_p)
-            if "native_hand_pose" not in d:
+            if "native_hand_pose" not in d or "native_binding_json" not in d:
                 continue
-            if rob_name is None and "native_binding_json" in d:
-                nb = json.loads(str(d["native_binding_json"]))
+            nb = json.loads(str(d["native_binding_json"]))
+            addresses = tuple((nb["object_parts"][name]["entity_name"], nb["object_parts"][name]["body_name"])
+                              for name in nb["object_part_names"])
+            if addresses != ref.part_addresses:
+                continue
+            if rob_name is None:
                 emb = nb.get("producer_identity", {}).get("embodiment_id")
                 if emb in robots:
                     rob_name = emb
@@ -378,6 +385,8 @@ def run_native_viewer(args, sets):
             archives[key] = {"label": key, "robot": robots[rob_name], "clips": clips}
             print(f"[viewer] {key}: {len(clips)} native rollouts ({rob_name})", flush=True)
 
+    import viser
+
     server = viser.ViserServer(host="0.0.0.0", port=args.port, label=f"FlashDexRetarget Native {Path(args.dataset).name}")
     server.gui.configure_theme(control_width="large", show_share_button=False)
     server.scene.set_up_direction("+z")
@@ -388,7 +397,7 @@ def run_native_viewer(args, sets):
 
     part_frames = []
     ghost_part_frames = []
-    for pidx, (pname, v, f) in enumerate(part_meshes):
+    for pidx, (v, f) in enumerate(part_meshes):
         fr = server.scene.add_frame(f"/part_{pidx}", show_axes=False)
         server.scene.add_mesh_simple(f"/part_{pidx}/m", v, f, color=(204, 158, 97))
         part_frames.append(fr)
@@ -396,7 +405,7 @@ def run_native_viewer(args, sets):
         server.scene.add_mesh_simple(f"/ghost_part_{pidx}/m", v, f, color=(130, 175, 235), opacity=0.32)
         ghost_part_frames.append(gfr)
 
-    with server.gui.add_folder("Native 6-Hand Clip"):
+    with server.gui.add_folder("Native clip"):
         g_robot = server.gui.add_dropdown("hand", list(robots) + (["overlay"] if len(robots) > 1 else []), initial_value=next(iter(robots)))
         g_run = server.gui.add_dropdown("saved rollout", ["none"] + list(archives), initial_value=next(iter(archives), "none"))
         g_clip = server.gui.add_dropdown("clip", [f"{i:02d} {n}" for i, n in enumerate(names)], initial_value=f"00 {names[0]}")
@@ -451,7 +460,7 @@ def run_native_viewer(args, sets):
                     if vis:
                         rb.pose_from_ref("robot", m, tr)
                 for pidx, fr in enumerate(part_frames):
-                    pstate = nr["object_part_state_w"][tr, min(pidx, nr["object_part_state_w"].shape[1] - 1)]
+                    pstate = nr["object_part_state_w"][tr, pidx]
                     fr.position = np.asarray(pstate[:3])
                     fr.wxyz = np.asarray(pstate[3:7])
                     ghost_part_frames[pidx].visible = False
@@ -466,10 +475,10 @@ def run_native_viewer(args, sets):
                 if g_ghost.value:
                     rb.pose_from_ref("ghost", m, tr)
                 for pidx, fr in enumerate(part_frames):
-                    pp = ro["part_pose"][t_ro, min(pidx, ro["part_pose"].shape[1] - 1)]
+                    pp = ro["part_pose"][t_ro, pidx]
                     fr.position = pp[:3]
                     fr.wxyz = pp[3:7]
-                    pstate = nr["object_part_state_w"][tr, min(pidx, nr["object_part_state_w"].shape[1] - 1)]
+                    pstate = nr["object_part_state_w"][tr, pidx]
                     ghost_part_frames[pidx].visible = g_ghost.value
                     ghost_part_frames[pidx].position = np.asarray(pstate[:3])
                     ghost_part_frames[pidx].wxyz = np.asarray(pstate[3:7])
@@ -484,15 +493,17 @@ def run_native_viewer(args, sets):
             g_frame.value = 0
             if ro is not None:
                 T = min(len(ro["part_pose"]), int(nframes[m]))
-                ref_p = np.asarray(ref.refs[m]["object_part_state_w"][:T, 0, :3])
-                err_cm = float(np.linalg.norm(ro["part_pose"][:T, 0, :3] - ref_p, axis=-1).mean() * 100.0)
+                ref_p = ref.refs[m]["object_part_state_w"][:T, :, :3]
+                support = ref.refs[m]["object_part_pose_support"][:T]
+                errors = np.linalg.norm((ro["part_pose"][:T, :, :3] - ref_p)[support], axis=-1)
+                err_cm = f"{errors.mean() * 100.0:.2f} cm" if errors.size else "unmeasured"
                 force = ro["mean_contact_force_n"]
                 f_l, f_r = (f"{force[side]:.2f} N" if side in force else "unmeasured" for side in ("left", "right"))
                 wrench = ro["max_wrench_n"]
                 wrench_label = "unmeasured" if wrench is None else f"{wrench:.4f} N"
                 g_info.content = (
                     f"**{names[m]}** ({ro['robot'].name})  \n"
-                    f"first part position error: **{err_cm:.2f} cm** · "
+                    f"mean part position error: **{err_cm}** · "
                     f"mean peak contact L/R: **{f_l} / {f_r}** · "
                     f"peak applied force: **{wrench_label}**"
                 )
@@ -539,7 +550,7 @@ def run_native_viewer(args, sets):
         return
 
     load_clip(0)
-    print(f"[viewer] native 6-hand ready: {len(names)} clips, hands={list(robots)}, runs={len(archives)} -> http://0.0.0.0:{args.port}", flush=True)
+    print(f"[viewer] native ready: {len(names)} clips, hands={list(robots)}, runs={len(archives)} -> http://0.0.0.0:{args.port}", flush=True)
     clock = time.perf_counter()
     while True:
         time.sleep(1 / 30)
@@ -563,6 +574,9 @@ def main():
     first_pt = next(iter(sets.values()))
     if (first_pt.parent / "native-reference.json").exists():
         return run_native_viewer(args, sets)
+
+    import viser
+
     robots = {r: Robot(r, pt) for r, pt in sets.items()}
     ref = next(iter(robots.values()))
     pt, names, starts, nframes = ref.pt, ref.names, ref.starts, ref.nframes
@@ -587,9 +601,12 @@ def main():
                 info.setdefault(r["clip"], r["dataset"])
                 if r.get("b200_clip") and r["clip"] in alias:  # clips renamed since an older pack
                     alias.setdefault(r["b200_clip"], alias[r["clip"]])
+    for n, lineage in zip(names, pt.get("motion_source_lineage", ())):
+        if lineage and lineage.get("source_id"):
+            info.setdefault(n, lineage["source_id"])
     groups = {}
     for i, n in enumerate(names):
-        groups.setdefault(dataset_of(n, info), []).append(i)
+        groups.setdefault(info.get(n, "other"), []).append(i)
 
     archives = {}
     for a in find_archives(args.saved):
@@ -715,7 +732,7 @@ def main():
                                         + (f" x{scales[s][slots[s][m]]:g}" if scales[s][slots[s][m]] != 1 else "")
                                         for s in SIDES))
         rows = [f"**{names[m]}**",
-                f"{dataset_of(names[m], info)} · {nframes[m]} frames · {nframes[m] / args.fps:.1f} s · {objs}"]
+                f"{info.get(names[m], 'other')} · {nframes[m]} frames · {nframes[m] / args.fps:.1f} s · {objs}"]
         for r in robots.values():
             rep = r.report.get(names[m], {})
             tip = rep.get("ik_tip_err_mean_m")

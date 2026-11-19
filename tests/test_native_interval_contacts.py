@@ -400,7 +400,7 @@ def test_recorder_retains_substep_tape_reset_unknown_and_original_phase(tmp_path
         load_flashdex_rollout,
     )
 
-    source = flashdex_source_mapping(source_id="arctic", source_revision="fixture-v1",
+    source = flashdex_source_mapping(source_id="synthetic-source", source_revision="fixture-v1",
         source_unit_id="fixture", source_episode_index=174, fold="train",
         source_frame_index=(0, 1, 2), source_time_ns=(0, 20_000_000, 40_000_000),
         selected_source_frame_index=(0, 1, 2), prepared_source_ordinal=(0.0, 1.0, 2.0),

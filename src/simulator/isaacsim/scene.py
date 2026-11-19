@@ -844,12 +844,7 @@ def _install_native_joint_properties(asset, meta, joint_ids, device) -> None:
 
 
 def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
-    """Compose named FREE hands and one passive articulated object.
-
-    The converted assets come from the configured, already composed source
-    scene. No visual-mesh density estimate or side-based object duplication is
-    used by this path.
-    """
+    """Install the named hand, object and static assets converted from the source scene."""
     layout = NativeSceneCfg.from_mapping(cfg.robot.native_scene)
     scene = InteractiveScene(
         InteractiveSceneCfg(

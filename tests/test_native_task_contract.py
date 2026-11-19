@@ -267,7 +267,7 @@ def test_multiple_object_reset_and_assistance_follow_actual_tree_ownership():
         command._resample_command(torch.tensor([0]))
 
 
-def test_native_profile_builds_real_box_and_rigid_managers(tmp_path):
+def test_native_profile_builds_articulated_and_rigid_managers(tmp_path):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
     from test_native_contract import _scene, write_native_scene_manifest
@@ -557,7 +557,7 @@ if __name__ == "__main__":
 
     torch.set_num_threads(1)
     cases = (
-        test_native_profile_builds_real_box_and_rigid_managers,
+        test_native_profile_builds_articulated_and_rigid_managers,
         test_native_binding_admits_clock_phase_and_maps_actual_object_joint_order,
         test_native_bc_uses_installed_independent_reference_and_support,
         test_native_part_sdf_observations_and_future_masks_use_named_geometry,

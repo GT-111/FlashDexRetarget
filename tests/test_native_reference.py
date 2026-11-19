@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import xml.etree.ElementTree as ET
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 from hydra import compose, initialize_config_dir
 from hydra.errors import InstantiationException
@@ -218,6 +220,107 @@ def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_co
     assert command.command_reference()["position_support"].tolist() == [[True, False]]
     assert not command.motion_lib.native_root_pose_support["left"][1]
     assert command.motion_lib.native_root_angular_velocity_support["left"][1]
+
+
+@pytest.mark.parametrize("with_articulation", (False, True), ids=("rigid", "articulated-and-rigid"))
+def test_prepared_scene_binds_to_the_newton_training_profile(tmp_path, with_articulation):
+    from omegaconf import OmegaConf
+    from test_native_contract import _two_object_scene, write_native_scene_manifest
+
+    from common.native_reference import bind_prepared_native_reference
+    from envs import build_manager_cfgs
+    from envs.scene.native import bind_native_scene_config
+    from retarget import kinematic_retargeting as pipeline
+    from simulator.mjcf_meta import load_robot_mjcf_meta
+
+    dataset, clip = _prepared_native_dataset(tmp_path)
+    _, scene = _two_object_scene(tmp_path)
+    xml = Path(scene["scene_xml_path"])
+    if not with_articulation:
+        document = ET.parse(xml)
+        world = document.getroot().find("worldbody")
+        world.remove(world.find(f"body[@name='{scene['objects'][0]['root_body_name']}']"))
+        document.write(xml)
+        scene["objects"] = scene["objects"][1:]
+    scene["scene_xml_path"] = "../source.xml"
+    for index, obj in enumerate(scene["objects"]):
+        obj["entity_name"] = f"fixture-prop-{index}"
+        for part in obj["parts"]:
+            part["mesh_path"] = "objects/synthetic-mesh/visual.obj"
+
+    meta = load_robot_mjcf_meta(xml)
+    hand_joints = tuple(name for hand in scene["hands"] for name in meta.subtree(hand["root_body_name"]).joint_names)
+    object_joints = tuple(name for obj in scene["objects"] for name in meta.subtree(obj["root_body_name"]).joint_names)
+    bodies = tuple(part["body_name"] for obj in scene["objects"] for part in obj["parts"])
+    frames = C.num_frames(clip)
+    native = clip["native_reference"]
+    for prefix, names in (("joint", hand_joints), ("object_joint", object_joints)):
+        native[f"{prefix}_names"] = names
+        native[f"{prefix}_pos"] = np.zeros((frames, len(names)), np.float32)
+        native[f"{prefix}_vel"] = np.zeros((frames, len(names)), np.float32)
+        native[f"{prefix}_position_support"] = np.ones((frames, len(names)), bool)
+        native[f"{prefix}_velocity_support"] = np.zeros((frames, len(names)), bool)
+    native["object_root_body_names"] = {obj["entity_name"]: obj["root_body_name"] for obj in scene["objects"]}
+    native["object_part_body_names"] = bodies
+    native["object_part_state_w"] = np.zeros((frames, len(bodies), 13), np.float32)
+    native["object_part_state_w"][..., 3] = 1.0
+    native["object_part_pose_support"] = np.ones((frames, len(bodies)), bool)
+    for kind in ("linear", "angular"):
+        native[f"object_part_{kind}_velocity_support"] = np.zeros((frames, len(bodies)), bool)
+    clip = {key: value for key, value in clip.items() if not key.startswith("obj_")}
+    C.save_clip(dataset / "native_reference/synthetic-stage.npz", clip)
+    motion_file = write_native_scene_manifest(dataset, scene)
+    pipeline.main.__wrapped__(_pipeline_config(dataset))
+
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / "config"), version_base=None):
+        OmegaConf.register_new_resolver("eval", lambda expression: eval(expression), replace=True)
+        cfg = compose(config_name="native_hoi_surface", overrides=[
+            "envs/simulator@simulator=newton", f"commands.motion_file={motion_file}",
+            "sim.plant.cuda_graph=false", "episode_length_s=1.0", "num_envs=2", "num_env_steps=128",
+            "runner.agent.use_compile=false",
+        ])
+    bind_prepared_native_reference(cfg)
+    OmegaConf.resolve(cfg)
+    layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=meta.gravity)
+    managers = build_manager_cfgs(cfg)
+    library = _reader(motion_file, joint_names=hand_joints)
+
+    assert cfg.sim.backend == "newton" and cfg.sim.runtime_launcher is None
+    assert cfg.sim.dt * cfg.decimation == .02
+    assert cfg.robot.xml_path == str(xml)
+    assert layout.object_root_body_names == library.native_object_root_body_names
+    assert tuple(part.body_name for _, part in layout.part_bindings) == library.native_object_part_body_names
+    assert library.native_object_joint_names == object_joints
+    assert library.obj_trans == {}
+    assert "xfrc_curriculum_adaptive" in managers["curriculum"]
+
+
+def test_viewer_discovers_prepared_datasets_by_declared_embodiment(tmp_path):
+    from test_native_contract import _scene, write_native_scene_manifest
+
+    from utils.visualization import find_robots
+
+    _, scene = _scene(tmp_path)
+    collection = tmp_path / "collection"
+
+    def write_dataset(directory, embodiment):
+        directory.mkdir(parents=True)
+        motion = write_native_scene_manifest(directory, scene)
+        manifest = motion.with_name("native-reference.json")
+        data = json.loads(manifest.read_text())
+        data["target"] = {"embodiment_id": embodiment}
+        manifest.write_text(json.dumps(data))
+        motion.touch()
+        return motion
+
+    first = write_dataset(collection / "version" / "selection-a", "fixture-hand-a")
+    second = write_dataset(collection / "export" / "version" / "selection-b", "fixture-hand-b")
+    assert find_robots(collection, "") == {"fixture-hand-a": first, "fixture-hand-b": second}
+    assert find_robots(collection, "fixture-hand-a") == {"fixture-hand-a": first}
+    assert find_robots(second.parent, "fixture-hand-b") == {"fixture-hand-b": second}
+    write_dataset(collection / "selection-c", "fixture-hand-a")
+    with pytest.raises(SystemExit, match="several prepared datasets for fixture-hand-a"):
+        find_robots(collection, "")
 
 
 def test_prepared_native_entry_rejects_stock_carrier_or_support_before_packing(tmp_path):
