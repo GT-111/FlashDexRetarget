@@ -41,6 +41,14 @@ def _source_intent_mean(value, required, metadata, side):
     return len(_SIDES) * value[:, index] / count
 
 
+def _thumb_opposition_distance(distance, point_names):
+    thumb = [i for i, name in enumerate(point_names) if "thumb" in name]
+    fingers = [i for i, name in enumerate(point_names) if "thumb" not in name]
+    if not thumb or not fingers:
+        return None
+    return torch.maximum(distance[:, thumb].amin(1), distance[:, fingers].amin(1))
+
+
 class NativeMotionTrackingRewards(MotionTrackingRewards):
     @staticmethod
     def native_part_surface_displacement(
@@ -72,7 +80,9 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         return torch.where(support.any(-1), torch.where(support, value, 1.).amin(-1), 0.)
 
     @staticmethod
-    def native_source_hand_part_proximity(env, command_name, distance_scale_m, side=None):
+    def native_source_hand_part_proximity(
+        env, command_name, distance_scale_m, side=None, require_thumb_opposition=False,
+    ):
         """Source-intended surface approach; SDF proximity is never solved contact."""
         if not math.isfinite(distance_scale_m) or distance_scale_m <= 0:
             raise ValueError("source hand-part proximity requires a positive finite distance scale")
@@ -101,7 +111,13 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
                        & geometry["live_part_pose_support"][:, None, parts]
                        & active[:, hand, None] & execution[:, None, None]
                        & torch.isfinite(distance))
-            closest = torch.where(support, distance.abs(), float("inf")).flatten(1).amin(-1)
+            distance = torch.where(support, distance.abs(), float("inf"))
+            if require_thumb_opposition:
+                names = points.get("source_point_names", points.get("point_names", ()))[begin:end]
+                opposed_distance = _thumb_opposition_distance(distance, names)
+                if opposed_distance is not None:
+                    distance = opposed_distance
+            closest = distance.flatten(1).amin(-1)
             values.append(torch.exp(-closest / distance_scale_m))
         return _source_intent_mean(torch.stack(values, -1), required, metadata, side)
 
@@ -158,19 +174,16 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
                     if body in g_meta["part_body_names"] and e_off > b_off:
                         p_col = g_meta["part_body_names"].index(body)
                         p_names = g_meta.get("source_point_names", g_meta.get("point_names", ()))[b_off:e_off]
-                        thumb_cols = [i for i, pn in enumerate(p_names) if "thumb" in pn]
-                        finger_cols = [i for i, pn in enumerate(p_names) if "thumb" not in pn]
-                        if thumb_cols and finger_cols:
-                            d_live = geometry["live_part_distance_m"][:, b_off:e_off, p_col]
-                            sup_live = (
-                                geometry["live_part_query_support"][:, b_off:e_off, p_col]
-                                & geometry["achieved_position_support"][:, b_off:e_off]
-                                & torch.isfinite(d_live)
-                            )
-                            d_valid = torch.where(sup_live, d_live.abs(), float("inf"))
-                            thumb_near = (d_valid[:, thumb_cols].amin(-1) <= opposition_distance_m)
-                            finger_near = (d_valid[:, finger_cols].amin(-1) <= opposition_distance_m)
-                            opposed = thumb_near & finger_near
+                        d_live = geometry["live_part_distance_m"][:, b_off:e_off, p_col]
+                        sup_live = (
+                            geometry["live_part_query_support"][:, b_off:e_off, p_col]
+                            & geometry["achieved_position_support"][:, b_off:e_off]
+                            & torch.isfinite(d_live)
+                        )
+                        d_valid = torch.where(sup_live, d_live.abs(), float("inf"))
+                        opposed_distance = _thumb_opposition_distance(d_valid, p_names)
+                        if opposed_distance is not None:
+                            opposed = opposed_distance <= opposition_distance_m
                             opp_mult = torch.where(opposed, 1.0, float(non_opposed_scale)).to(bounded.dtype)[:, None]
                             bounded = bounded * opp_mult
                 credit = torch.maximum(credit, torch.where(eligible, bounded, 0.0))

@@ -1,5 +1,6 @@
 """Synthetic native task contracts and CPU FK; no learner, Kit or integration."""
 
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -1830,6 +1831,40 @@ def test_source_intent_reward_unavailable_stale_and_measured_absence_stay_distin
     env.scene.hand_part_contact_interval_facts = lambda: None
     assert proximity(env, "motion", .01).item() == 0.
     assert contact(env, "motion", .5, .02).item() == 0.
+
+
+def test_source_approach_rewards_two_digit_groups_on_the_same_supported_part():
+    command, env, _, geometry, _ = _source_intent_reward_case((("right", 3),))
+    command.motion_lib.native_source_hand_part_intent["active"][1] = True
+    names = geometry["metadata"]["source_point_names"]
+    thumb, finger = names.index("thumb_tip"), names.index("index_tip")
+    distances = geometry["live_part_distance_m"]
+    distances.fill_(.09)
+    distances[0, thumb, 0] = -.004  # Absolute signed distance measures approach from either side.
+    distances[0, finger, 1] = .005
+    support = geometry["live_part_query_support"]
+    support.fill_(True)
+
+    proximity = NativeMotionTrackingRewards.native_source_hand_part_proximity
+    contact = NativeMotionTrackingRewards.native_source_hand_part_contact
+    approach = dict(distance_scale_m=.04, require_thumb_opposition=True)
+    solved = dict(force_scale_n=.5, separation_bound_m=.02, require_thumb_opposition=True,
+                  opposition_distance_m=.02, non_opposed_scale=.15)
+    assert proximity(env, "motion", **approach).item() == pytest.approx(math.exp(-.09 / .04))
+    assert contact(env, "motion", **solved).item() == pytest.approx(.875 * .15)
+
+    distances[0, finger, 0] = .021
+    assert proximity(env, "motion", **approach).item() == pytest.approx(math.exp(-.021 / .04))
+    assert contact(env, "motion", **solved).item() == pytest.approx(.875 * .15)
+    distances[0, finger, 0] = .015
+    assert proximity(env, "motion", **approach).item() == pytest.approx(math.exp(-.015 / .04))
+    assert contact(env, "motion", **solved).item() == pytest.approx(.875)
+
+    support[0, finger, 0] = False
+    assert proximity(env, "motion", **approach).item() == pytest.approx(math.exp(-.09 / .04))
+    assert contact(env, "motion", **solved).item() == pytest.approx(.875 * .15)
+    support.zero_()
+    assert proximity(env, "motion", **approach).item() == 0.0
 
 
 def test_source_intent_rewards_follow_real_manager_consumed_packet_and_reset():

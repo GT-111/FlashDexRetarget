@@ -138,6 +138,7 @@ rewards:
     native_object_part_pose: 0.5
     native_part_surface_displacement: 1.0
     native_object_articulation: 0.8
+    native_source_hand_part_proximity: 0.5
     native_source_hand_part_contact: 0.5
     native_source_tip_object_bound: 0.25
     native_source_tip_position: 0.2
@@ -160,6 +161,9 @@ rewards:
       deadband: 0.0
       norm_radius: 0.058
       part_reduce: worst
+    native_source_hand_part_proximity:
+      distance_scale_m: 0.04
+      require_thumb_opposition: true
     native_source_hand_part_contact:
       force_scale_n: 1.5
       separation_bound_m: 0.02

@@ -513,10 +513,14 @@ intent observation or changing the actor/critic graph.
 
 For each source-known required hand, proximity takes the closest supported
 achieved site to any of that hand's active candidate parts and returns
-`exp(-abs(surface_distance_m) / distance_scale_m)`. It retains the baked grid,
-pose and point-query support; it is geometric approach credit, not measured
-contact, penetration clearance or a guarantee of mesh coverage. Existing
-source-tip position and object-bound terms retain their separate meanings.
+`exp(-distance_m / distance_scale_m)`, using the absolute signed distance.
+The `native_hoi_surface` recipe enables `require_thumb_opposition`. For each
+candidate part with both named digit groups, the farther of the closest thumb
+and closest other fingertip sets its distance. The reward uses the closest
+candidate under that metric. This gives approach credit before the first
+measured contact and keeps both groups on the same source-intended part.
+The baked grid, pose and point-query support bound the calculation. The force
+term below supplies separate solver contact credit.
 
 Contact reads the completed native control interval, matched to the current
 solver endpoint. For each actual named hand/body and active candidate part,

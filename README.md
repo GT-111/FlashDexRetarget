@@ -472,8 +472,8 @@ For a hand with multiple prepared selections, point `--dataset` at the selection
 ### Six-hand grasp-hardened native HOI recipe (`native_hoi_surface`)
 
 `config/native_hoi_surface.yaml` combines worst-named-part surface tracking, `native_source_tip_reference_error`,
-`native_source_hand_part_intent`, opposing thumb+finger contact credit (`native_source_hand_part_contact` with
-`require_thumb_opposition: true`), contact-gated rotational `xfrc` scaling (`contact_scale: 0.5`), post-decay wrench
+`native_source_hand_part_intent`, same-part thumb and fingertip approach and contact credit,
+contact-gated rotational `xfrc` scaling (`contact_scale: 0.5`), post-decay wrench
 perturbations (`require_assist_decayed: true`), and fast adaptive `xfrc -> 0` decay across all six registered FREE-wrist
 robot configs (`config/envs/robot/{inspire_rh56f1,inspire_rh56dftp,wuji_hand,sharpa_wave_native,unitree_dex3_1,wonik_allegro_v5}_bimanual.yaml`).
 Pairing `envs/simulator@simulator=newton` with CoACD convex hulls capped at `<= 16` hulls and `<= 32` vertices/hull runs
