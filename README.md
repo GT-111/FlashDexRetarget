@@ -247,6 +247,11 @@ bash scripts/setup.sh --profile mjwarp
 bash scripts/setup.sh --profile newton --dexforge-root /path/to/DexForge
 ```
 
+The native requirements pair Newton 1.7 with MuJoCo and MuJoCo Warp 3.15
+and Warp 1.19. This includes the upstream implicit free-body integration
+correction for high-spin asymmetric bodies. Newton recordings retain the
+installed engine versions in the existing backend identity packet.
+
 To reproduce a qualified native dependency closure or select a built dependency
 artifact, use a separately named environment. The lock contains all noneditable
 third-party requirements; it is installed with `--no-deps`. Public project and

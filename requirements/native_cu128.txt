@@ -5,10 +5,10 @@
 # Runtime binds actual installed engine versions before qualification; this
 # candidate list does not describe or authorize changing a running environment.
 torch==2.11.0+cu128
-newton[sim]==1.6.1
-mujoco==3.12.0
-mujoco-warp==3.12.0
-warp-lang==1.17.0
+newton[sim]==1.7.0
+mujoco==3.15.0
+mujoco-warp==3.15.0
+warp-lang==1.19.0
 numpy==1.26.4
 scipy==1.15.3
 trimesh==4.5.1
