@@ -94,6 +94,8 @@ class NativeActionControlContext:
     source_contact_translation: torch.Tensor
     source_contact_part: torch.Tensor
     source_contact_compression: torch.Tensor
+    source_hold_offset_m: torch.Tensor
+    source_hold_force_n: torch.Tensor
     correction_twist: torch.Tensor
     correction_interval_valid: torch.Tensor
     finger_requested: torch.Tensor
@@ -130,15 +132,19 @@ class NativeResidualAction(ActionTerm):
         self._source_contact_scale = 0.
         self._source_contact_guard = None
         self._pad_travel_m = 0.
+        self._stationary_hold_force_n = 0.
         if cfg.source_contact_approach is not None:
             self._source_contact_guard = dict(cfg.source_contact_approach)
             self._source_contact_scale = self._source_contact_guard.pop("translation_m")
             self._pad_travel_m = self._source_contact_guard.pop("pad_compression_m", 0.)
+            self._stationary_hold_force_n = self._source_contact_guard.pop("stationary_hold_force_n", 0.)
             if (not 0. < self._source_contact_scale <= cfg.translation_residual_m
                     or not all(math.isfinite(value) and value > 0. for value in self._source_contact_guard.values())):
                 raise ValueError("source contact approach requires positive pose and tip bounds within the wrist budget")
             if not 0. <= self._pad_travel_m <= self._source_contact_scale:
                 raise ValueError("pad compression must be between zero and the source contact approach distance")
+            if not math.isfinite(self._stationary_hold_force_n) or self._stationary_hold_force_n < 0.:
+                raise ValueError("stationary hold force requires a finite nonnegative load")
         self.layout = NativeSceneCfg.from_mapping(cfg.native_scene)
         self.hand_sides = tuple(h.side for h in self.layout.hands)
         self.hand_body_names = tuple(h.root_body_name for h in self.layout.hands)
@@ -219,6 +225,16 @@ class NativeResidualAction(ActionTerm):
         self._source_contact_part = torch.full((self.num_envs, roots), -1, dtype=torch.long, device=self.device)
         self._source_contact_compression = torch.zeros(
             self.num_envs, len(self.finger_command_names), device=self.device)
+        self._source_hold_offset_m = torch.zeros(self.num_envs, roots, device=self.device)
+        self._source_hold_force_n = torch.zeros_like(self._source_hold_offset_m)
+        self._source_hold_pairs = ()
+        if self._stationary_hold_force_n:
+            self._source_hold_pairs = tuple(key for key in self.layout.support_pair_bindings
+                                          if key in env.sim.plant.contact_facts)
+            if self._source_hold_pairs:
+                object_index = {obj.entity_name: i for i, obj in enumerate(self.layout.objects)}
+                self._source_hold_weights_n = env.scene.native_object_weights_n[[
+                    object_index[obj.entity_name] for obj, _ in self.layout.part_bindings]]
         self._control_dt = float(env.step_dt)
         self._correction_twist = torch.zeros(
             self.num_envs, roots, 6, device=self.device
@@ -424,6 +440,36 @@ class NativeResidualAction(ActionTerm):
         self._source_contact_compression.masked_fill_(~roles.any(-1)[:, self._pad_command_hand], 0.)
         return direction, nearest
 
+    def _supported_hold_translation(self, command, part, fallback):
+        """Bound wrist motion using observed hand load on a stationary supported part."""
+        scene = self._env.scene
+        plant = self._env.sim.plant
+        index = part.clamp_min(0)
+        stationary = (part >= 0) & command.source_stationary_parts[command.motion_ids].gather(1, index)
+        support_up = torch.stack([plant.contact_facts[key]["force_on_second_w_n"] @ scene.gravity_up_w
+                                  for key in self._source_hold_pairs], 1).gather(1, index)
+        hand_contacts = [[plant.contact_facts[f"{hand.side}/{obj.entity_name}/{p.name}"]
+                          for obj, p in self.layout.part_bindings] for hand in self.layout.hands]
+
+        def selected(field):
+            return torch.stack([torch.stack([pair[field] for pair in hand], dim=1)
+                                for hand in hand_contacts], dim=1).gather(2, index[..., None]).squeeze(-1)
+
+        force = selected("normal_force_n")
+        distance = torch.nan_to_num(selected("force_bearing_distance_max_m"))
+        measured = plant.contact_support[:, None] & torch.isfinite(force)
+        self._source_hold_force_n.lerp_(torch.where(measured, force, 0.), .4)
+        supported = measured & (support_up >= .25 * self._source_hold_weights_n[index])
+        delta = .001 * (self._stationary_hold_force_n - self._source_hold_force_n)
+        delta = torch.where(stationary & supported & (distance <= .0025), delta, -self._source_hold_offset_m)
+        max_step_m = .035 * self._control_dt
+        self._source_hold_offset_m.add_(delta.clamp(-max_step_m, max_step_m)).clamp_(
+            0., min(.02, self._source_contact_scale))
+        self._source_hold_offset_m.masked_fill_(~stationary, 0.)
+        self._source_hold_force_n.masked_fill_(~stationary, 0.)
+        return torch.where(stationary[..., None],
+                           -self._source_hold_offset_m[..., None] * scene.gravity_up_w, fallback)
+
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
         processed = actions * self.cfg.action_scale + self.cfg.action_offset
@@ -445,8 +491,14 @@ class NativeResidualAction(ActionTerm):
             else:
                 direction, part = command.source_contact_approach_direction(
                     command._motion_flat_ids, **self._source_contact_guard)
-            self._source_contact_translation.masked_fill_((part != self._source_contact_part)[..., None], 0.0)
+            changed_part = part != self._source_contact_part
+            self._source_contact_translation.masked_fill_(changed_part[..., None], 0.0)
             self._source_contact_translation.lerp_(direction * self._source_contact_scale, 0.35)
+            if self._source_hold_pairs:
+                self._source_hold_offset_m.masked_fill_(changed_part, 0.)
+                self._source_hold_force_n.masked_fill_(changed_part, 0.)
+                self._source_contact_translation.copy_(self._supported_hold_translation(
+                    command, part, self._source_contact_translation))
             self._source_contact_part.copy_(part)
         if self.cfg.wrist_target_twist == "filtered_correction_feedforward":
             self._correction_twist[..., :3] = (
@@ -551,6 +603,8 @@ class NativeResidualAction(ActionTerm):
         self._source_contact_translation[rows] = 0.0
         self._source_contact_part[rows] = -1
         self._source_contact_compression[rows] = 0.0
+        self._source_hold_offset_m[rows] = 0.0
+        self._source_hold_force_n[rows] = 0.0
         self._correction_twist[rows] = 0.0
         self._correction_interval_valid[rows] = False
         self._installed_valid[rows] = False

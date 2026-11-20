@@ -520,6 +520,14 @@ normal travel at each loaded pad through the solved point Jacobian into the
 named finger command coordinates. Use the same setting for training and both
 frozen evaluations. Grip adjustment acts through hand position targets and
 retains the original source roles, installed actuator bounds, and perturbation.
+Set `++actions.source_contact_approach.stationary_hold_force_n=<newtons>`
+to regulate the assigned hand's normal force during a complete stationary
+source task on a passive plane. The guide requires measured object-plane
+support and uses the last solved hand-part force. It retreats when support
+is lost or solved hand penetration exceeds 2.5 mm. The wrist approach
+stays within the translation budget and advances through the normal wrist
+pose and twist targets. Apply the same setting during training and both
+frozen evaluations.
 The HOI recipe treats a take that exceeds 5 cm of part translation or 20° of
 part rotation as a training failure. The part-position reward uses the same
 5 cm scale. Frozen evaluation still records the entire source take so the

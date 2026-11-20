@@ -15,6 +15,7 @@ from envs.actions.native import (
     NativeResidualActionCfg,
     _contact_compression,
 )
+from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
 from envs.scene.native import NativeSceneCfg
 from simulator.isaacsim.convert_assets import (
     native_mimic_imports,
@@ -678,7 +679,7 @@ def test_native_isaac_contacts_resolve_named_rigid_descendants_before_reset(monk
 
 def _native_action_case(
     tmp_path, *, wrist_target_twist="source_only", dt=.02, cutoff_hz=None,
-    hand_sides=("left", "right"), fanout=False, source_contact_approach=None,
+    hand_sides=("left", "right"), fanout=False, source_contact_approach=None, support_contacts=False,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     layout, mapping = _scene(tmp_path)
@@ -750,6 +751,18 @@ def _native_action_case(
         command_manager=SimpleNamespace(get_term=lambda name: command),
         close=lambda: None,
     )
+    if support_contacts:
+        layout = NativeSceneCfg.from_mapping(mapping)
+        facts = {key: {"force_on_second_w_n": torch.tensor([[0., 0., 2.], [0., 0., 2.]])}
+                 for key in layout.support_pair_bindings}
+        facts.update({f"{hand.side}/{obj.entity_name}/{part.name}": {
+            "normal_force_n": torch.zeros(2), "force_bearing_distance_max_m": torch.full((2,), float("nan")),
+        } for hand in layout.hands for obj, part in layout.part_bindings})
+        env.sim = SimpleNamespace(plant=SimpleNamespace(
+            contact_facts=facts, contact_support=torch.ones(2, dtype=torch.bool),
+        ))
+        env.scene.gravity_up_w = torch.tensor([0., 0., 1.])
+        env.scene.native_object_weights_n = torch.full((len(layout.objects),), 5.)
     action = NativeResidualAction(
         NativeResidualActionCfg(
             entity_name="robot",
@@ -882,6 +895,55 @@ def test_native_wrist_twist_follows_the_installed_guide_and_translation_cap(tmp_
     installed = action.installed_control["root_state_w"]
     torch.testing.assert_close(installed[..., 7:10], (installed[..., :3] - first) / .02, atol=2e-5, rtol=1e-5)
     torch.testing.assert_close(action._correction_twist[..., 0], torch.full((2, 2), -1.9))
+
+
+def test_stationary_hold_pressure_requires_solved_support_and_retains_wrist_feedforward(tmp_path):
+    env, action, command, _accepted = _native_action_case(
+        tmp_path, wrist_target_twist="filtered_correction_feedforward",
+        source_contact_approach={"translation_m": .024, "guard": 1., "stationary_hold_force_n": 1.},
+        support_contacts=True,
+    )
+    part_count = len(action.layout.part_bindings)
+    command.motion_ids = torch.tensor([0, 1])
+    command.source_stationary_parts = torch.tensor([True, False])[:, None].expand(2, part_count)
+    direction = torch.tensor([1., 0., 0.]).expand(2, 2, 3)
+    command.approach_dir_and_part = direction, torch.tensor([[0, -1], [0, -1]])
+    raw = torch.zeros_like(action.raw_action)
+    action.process_actions(raw)
+    action.apply_actions()
+    first = action.installed_control["root_state_w"][..., :3].clone()
+    torch.testing.assert_close(first[0, 0] - env.scene.env_origins[0], torch.tensor([0., 0., -.0007]))
+    torch.testing.assert_close(first[1, 0] - env.scene.env_origins[1], torch.tensor([.0084, 0., 0.]))
+    assert action._source_hold_offset_m[0, 1] == 0.
+    carry = action.capture_control_context()
+    action.process_actions(raw)
+    action.apply_actions()
+    torch.testing.assert_close(action.installed_control["root_state_w"][0, 0, 7:10], torch.tensor([0., 0., -.035]))
+
+    obj, part = action.layout.part_bindings[0]
+    facts = env.sim.plant.contact_facts[f"left/{obj.entity_name}/{part.name}"]
+    facts["force_bearing_distance_max_m"][0] = .003
+    action.process_actions(raw)
+    torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.0007))
+    env.sim.plant.contact_support[0] = False
+    action.process_actions(raw)
+    assert action._source_hold_offset_m[0, 0] == 0.
+    action.reset()
+    action.restore_control_context(carry)
+    torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.0007))
+
+
+def test_source_stationary_parts_require_every_pose_of_the_complete_assembly():
+    command = object.__new__(NativeMotionTrackingCommand)
+    pose = torch.zeros(6, 2, 13)
+    pose[..., 3] = 1.
+    pose[3, 1, 0] = .015
+    support = torch.ones(6, 2, dtype=torch.bool)
+    support[5, 1] = False
+    command.motion_lib = SimpleNamespace(native_object_part_state_w=pose, native_object_part_pose_support=support,
+        length_starts=torch.tensor([0, 2, 4]), _motion_num_frames=torch.tensor([2, 2, 2]))
+    command._object_part_columns = {"assembly": [0, 1]}
+    assert command.source_stationary_parts.tolist() == [[True, True], [False, False], [False, False]]
 
 
 def test_native_wrist_source_only_keeps_source_rates_through_filter_updates(tmp_path):

@@ -36,6 +36,12 @@ def create_native_envs(cfg, device="cuda"):
     }
     pairs.update({key: (bodies[first.root_body_name], bodies[second.root_body_name])
                   for key, (first, second) in layout.object_pair_bindings.items()})
+    approach = cfg.actions.get("source_contact_approach") or {}
+    if approach.get("stationary_hold_force_n", 0.):
+        world_collision = (model.geom_bodyid == 0) & ((model.geom_contype | model.geom_conaffinity) != 0)
+        if world_collision.any() and (model.geom_type[world_collision] == mujoco.mjtGeom.mjGEOM_PLANE).all():
+            pairs.update({key: ([0], [model.body(part.body_name).id])
+                          for key, (_, part) in layout.support_pair_bindings.items()})
     plant = plant_class(
         scene_xml_path=layout.scene_xml_path, num_envs=int(cfg.scene.num_envs),
         sim_dt=float(cfg.sim.dt), device=device, contact_pairs=pairs, **config,

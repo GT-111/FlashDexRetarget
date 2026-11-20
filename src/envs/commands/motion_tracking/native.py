@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import cached_property
 
 import torch
 from mjlab.managers import CommandTerm
@@ -437,6 +438,24 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                for field, values in intent.items()},
             "reference_time_ns": ml.native_time_ns[ids],
         }
+
+    @cached_property
+    def source_stationary_parts(self):
+        """Require a complete, stationary source trajectory of the whole owning assembly."""
+        from mjlab.utils.lab_api.math import quat_error_magnitude
+
+        ml = self.motion_lib
+        stationary = []
+        for start, count in zip(ml.length_starts.tolist(), ml._motion_num_frames.tolist(), strict=True):
+            rows = slice(start, start + count)
+            pose = ml.native_object_part_state_w[rows, :, :7]
+            displacement = (pose[..., :3] - pose[0, :, :3]).norm(dim=-1)
+            rotation = quat_error_magnitude(pose[..., 3:7], pose[0:1, :, 3:7].expand_as(pose[..., 3:7]))
+            stable = (ml.native_object_part_pose_support[rows] & (displacement <= .005) & (rotation <= .05)).all(0)
+            for columns in self._object_part_columns.values():
+                stable[columns] = stable[columns].all()
+            stationary.append(stable)
+        return torch.stack(stationary)
 
     @torch.no_grad()
     def source_contact_approach_direction(

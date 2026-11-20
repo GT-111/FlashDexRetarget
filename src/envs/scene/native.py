@@ -168,6 +168,10 @@ class NativeSceneCfg:
         return {f"objects/{first.entity_name}/{second.entity_name}": (first, second)
                 for first, second in combinations(self.objects, 2)}
 
+    @property
+    def support_pair_bindings(self) -> dict[str, tuple[NativeObjectCfg, NativeObjectPartCfg]]:
+        return {f"support/{obj.entity_name}/{part.name}": (obj, part) for obj, part in self.part_bindings}
+
 
 def bind_native_scene_config(cfg, *, constructor_gravity_world_m_per_s2) -> NativeSceneCfg:
     """Admit a native recipe with fixed constructor gravity and explicit force assistance."""
