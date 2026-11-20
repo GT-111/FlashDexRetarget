@@ -150,7 +150,9 @@ _CONTACT_INTERVAL_ARRAYS = (
     "measurement_support", "sample_recorded", "clock_support",
     "sample_begin_time_s", "sample_end_time_s", "interval_complete",
 )
-_APPLIED_WRENCH_INTERVAL_ARRAYS = ("peak_force_n", "peak_torque_nm", "measurement_support")
+_APPLIED_WRENCH_INTERVAL_ARRAYS = (
+    "peak_force_n", "peak_torque_nm", "substep_wrench_w", "substep_support", "measurement_support",
+)
 _OBJECT_PAIR_INTERVAL_ARRAYS = ("normal_force_n", "peak_normal_force_n", "measurement_support")
 _SOURCE_TIP_GEOMETRY_ARRAYS = (
     "reference_motion_ids", "reference_motion_steps", "reference_time_ns", "execution_valid",
@@ -299,8 +301,9 @@ class NativeRolloutRecord(RolloutRecord):
                 "entity_names": [part["entity_name"] for part in parts],
                 "part_body_names": [part["body_name"] for part in parts],
                 "num_substeps": applied_interval["num_substeps"],
-                "sampling": "max WORLD force and torque Euclidean norms over all post-solve substeps in each interval",
-                "reset": "no solved substeps; zero peaks with false measurement support",
+                "sampling": "WORLD force then torque at each part COM, after each accepted solve; peaks are maximum vector norms",
+                "substep_wrench_axes": ["recorded_endpoint", "configured_substep", "named_part", "Fx,Fy,Fz,Tx,Ty,Tz"],
+                "reset": "no solved substeps; zero values with false support",
             }
         self._physics_time_reader = getattr(env.scene, "physics_time_s", None)
         self._execution_clock_reader = getattr(env.scene, "physics_execution_clock", None)
@@ -350,6 +353,11 @@ class NativeRolloutRecord(RolloutRecord):
             )
             if "execution_clock" in interval:
                 self.contact_interval_metadata["execution_clock"] = dict(interval["execution_clock"])
+            if self._contact_names and "force_on_second_w_n" in interval["pairs"][self._contact_names[0]]:
+                self.contact_interval_metadata["force_on_part_authority"] = (
+                    "solved WORLD force on object part from its named hand, including tangential force; "
+                    "recorded endpoint, configured substep, named pair, xyz N"
+                )
         self._object_pair_interval_reader = getattr(env.scene, "object_pair_contact_interval_facts", None)
         self.object_pair_interval_metadata = None
         object_pair_interval = (
@@ -429,9 +437,11 @@ class NativeRolloutRecord(RolloutRecord):
                 key: applied_interval[key][:, self._applied_wrench_interval_columns].detach().cpu().clone()
                 for key in ("peak_force_n", "peak_torque_nm")
             }
-            frame["applied_wrench_interval"]["measurement_support"] = (
-                applied_interval["measurement_support"].detach().cpu().clone()
-            )
+            frame["applied_wrench_interval"].update({
+                "substep_wrench_w": applied_interval["substep_wrench_w"][:, :, self._applied_wrench_interval_columns].detach().cpu().clone(),
+                "substep_support": applied_interval["substep_support"].detach().cpu().clone(),
+                "measurement_support": applied_interval["measurement_support"].detach().cpu().clone(),
+            })
         if self.installed_term is not None:
             control = self.installed_term.installed_control
             frame["installed"] = {field: control[field].detach().to("cpu").clone()
@@ -464,6 +474,10 @@ class NativeRolloutRecord(RolloutRecord):
                 key: torch.stack([interval["pairs"][name][key] for name in self._contact_names], -1).detach().cpu().clone()
                 for key in _CONTACT_ARRAYS if key != "measurement_support"
             }
+            if "force_on_part_authority" in self.contact_interval_metadata:
+                frame["contact_interval"]["force_on_part_w_n"] = torch.stack(
+                    [interval["pairs"][name]["force_on_second_w_n"] for name in self._contact_names], dim=-2
+                ).detach().cpu().clone()
             for key in ("measurement_support", "sample_recorded", "clock_support",
                         "sample_begin_time_s", "sample_end_time_s", "interval_complete"):
                 frame["contact_interval"][key] = interval[key].detach().cpu().clone()
@@ -662,6 +676,10 @@ class NativeRolloutRecord(RolloutRecord):
                     for field in _CONTACT_INTERVAL_ARRAYS:
                         result["hand_part_interval_" + field] = np.stack([
                             frame["contact_interval"][field][row].numpy() for frame in frames])
+                    if "force_on_part_authority" in self.contact_interval_metadata:
+                        result["hand_part_interval_force_on_part_w_n"] = np.stack([
+                            frame["contact_interval"]["force_on_part_w_n"][row].numpy() for frame in frames
+                        ])
                     if "execution_clock" in self.contact_interval_metadata:
                         for field in ("execution_sample_begin_step", "execution_sample_end_step",
                                       "execution_clock_support", "execution_interval_complete"):

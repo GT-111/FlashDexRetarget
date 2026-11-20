@@ -184,17 +184,25 @@ class MjWarpPlant(NativePlant):
         active = (wp.to_torch(self._contact_ids) < wp.to_torch(data.nacon)[0]) & geom.ge(0).all(-1)
         body = self._geom_body[geom.clamp(0, self.model.ngeom - 1)]
         world = wp.to_torch(data.contact.worldid).long()
-        normal = wp.to_torch(self._contact_forces)[:, 0].clamp_min(0)
+        contact_force = wp.to_torch(self._contact_forces)[:, :3]
+        normal = contact_force[:, 0].clamp_min(0)
+        frame = wp.to_torch(data.contact.frame)
+        force_w = (frame.transpose(-2, -1) @ contact_force[..., None]).squeeze(-1)
         distance = wp.to_torch(data.contact.dist).abs()
         for name, (first, second) in self.contact_pairs.items():
             a = torch.as_tensor(first, device=self.device)
             b = torch.as_tensor(second, device=self.device)
-            selected = active & ((torch.isin(body[:, 0], a) & torch.isin(body[:, 1], b))
-                                 | (torch.isin(body[:, 0], b) & torch.isin(body[:, 1], a)))
+            forward = torch.isin(body[:, 0], a) & torch.isin(body[:, 1], b)
+            reverse = torch.isin(body[:, 0], b) & torch.isin(body[:, 1], a)
+            selected = active & (forward | reverse)
             rows = world.clamp(0, self.num_envs - 1)
             facts = self.contact_facts[name]
             facts["normal_force_n"].zero_().scatter_add_(0, rows, torch.where(selected, normal, 0))
             bearing = selected & (normal > 0)
+            force_on_second = torch.where(forward[:, None], force_w, -force_w)
+            facts["force_on_second_w_n"].zero_().scatter_add_(
+                0, rows[:, None].expand_as(force_on_second),
+                torch.where(bearing[:, None], force_on_second, 0.0))
             present = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
             present.scatter_add_(0, rows, bearing.to(torch.int32))
             facts["force_bearing_contact_present"].copy_(present > 0)

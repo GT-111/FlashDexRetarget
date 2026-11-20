@@ -878,11 +878,15 @@ def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assista
         next(iter(command.native_objects.values())).data.joint_pos[:] = torch.tensor([[.023, -.4]])
         def applied_interval():
             step = int(command.reference_phase["motion_steps"][0])
+            wrench = torch.zeros(1, 4, 3, 6)
+            wrench[0, 1, :, 0] = step * torch.tensor([3., 2., 1.])
+            wrench[0, 3, :, 4] = step * torch.tensor([.3, .2, .1])
             return dict(entity_names=("loose_prop", "object", "object"),
                         part_body_names=("prop_root", "object_lid", "object_root"), num_substeps=4,
                         authority="post_solve_mjw_xfrc_applied_WORLD_body_COM_wrench",
                         peak_force_n=step * torch.tensor([[3., 2., 1.]]),
                         peak_torque_nm=step * torch.tensor([[.3, .2, .1]]),
+                        substep_wrench_w=wrench, substep_support=torch.full((1, 4), step > 0),
                         measurement_support=torch.tensor([step > 0]))
         env.scene.applied_object_wrench_interval_facts = applied_interval
 
@@ -929,3 +933,9 @@ def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assista
     np.testing.assert_array_equal(recorded.arrays[prefix + "measurement_support"], [False, True, True])
     np.testing.assert_array_equal(recorded.arrays[prefix + "peak_force_n"], [[0, 0, 0], [1, 2, 3], [2, 4, 6]])
     np.testing.assert_allclose(recorded.arrays[prefix + "peak_torque_nm"], [[0, 0, 0], [.1, .2, .3], [.2, .4, .6]])
+    wrench = recorded.arrays[prefix + "substep_wrench_w"]
+    assert wrench.shape == (3, 4, 3, 6)
+    np.testing.assert_array_equal(wrench[2, 1, :, 0], [2., 4., 6.])
+    np.testing.assert_allclose(wrench[2, 3, :, 4], [.2, .4, .6])
+    np.testing.assert_array_equal(recorded.arrays[prefix + "substep_support"],
+                                  [[False] * 4, [True] * 4, [True] * 4])

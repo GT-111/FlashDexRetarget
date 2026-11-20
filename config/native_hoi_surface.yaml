@@ -150,6 +150,7 @@ rewards:
     native_object_articulation: 0.8
     native_source_hand_part_proximity: 0.5
     native_source_hand_part_contact: 0.5
+    native_source_lift_load: 0.5
     native_source_tip_object_bound: 0.25
     native_source_tip_position: 0.2
     native_root_pose: 0.3
@@ -180,6 +181,10 @@ rewards:
       source_digit_distance_m: ${native_surface.source_digit_distance_m}
       digit_contact_distance_m: 0.035
       unmatched_digit_scale: 0.15
+    native_source_lift_load:
+      lookahead_s: 0.10
+      minimum_speed_m_s: 0.020
+      separation_bound_m: 0.02
     native_source_tip_object_bound:
       sigma_m: 0.025
     native_root_pose:

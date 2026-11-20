@@ -183,6 +183,7 @@ def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_
         return SimpleNamespace(public_state=state, applied_joint_effort=torch.zeros(2, model.nv))
 
     facts = {"normal_force_n": torch.tensor([2., 0.]),
+             "force_on_second_w_n": torch.tensor([[0., 1., 2.], [0., 0., 0.]]),
              "force_bearing_contact_present": torch.tensor([True, False]),
              "force_bearing_distance_max_m": torch.tensor([.003, float("nan")])}
     def body_wrench(rows, *, body_ids, forces, torques):
@@ -219,6 +220,7 @@ def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_
     for key, value in facts.items():
         torch.testing.assert_close(plant.contact_facts["left/base"][key], value, equal_nan=True)
     requested = backend.get_body_pair_contact_facts.call_args.args
+    assert backend.get_body_pair_contact_facts.call_args.kwargs == {"include_world_force": True}
     np.testing.assert_array_equal(requested[0], [hand])
     np.testing.assert_array_equal(requested[1], [part])
     qpos, qvel = plant.state()
@@ -238,7 +240,7 @@ def test_newton_execution_clock_tracks_accepted_calls_partial_reset_and_restore(
     plant._world_ids, plant._body_ids = torch.arange(2), torch.arange(1, model.nbody)
     raw_clock = torch.tensor([125., 7.], dtype=torch.float32)
     facts = dict(normal_force_n=torch.ones(2), force_bearing_contact_present=torch.ones(2, dtype=torch.bool),
-                 force_bearing_distance_max_m=torch.full((2,), .001))
+                 force_bearing_distance_max_m=torch.full((2,), .001), force_on_second_w_n=torch.zeros(2, 3))
     calls = []
     def advance(control, *, nsteps):
         calls.append(plant.execution_clock()["steps"].clone())
@@ -254,7 +256,7 @@ def test_newton_execution_clock_tracks_accepted_calls_partial_reset_and_restore(
         return plant._state
     plant.backend = SimpleNamespace(model=model, get_physics_time_torch=lambda: raw_clock.clone(),
         set_body_wrench_w_torch=lambda *args, **kwargs: None, step_torch=advance,
-        get_body_pair_contact_facts=lambda *args: facts, set_state_torch=set_state,
+        get_body_pair_contact_facts=lambda *args, **kwargs: facts, set_state_torch=set_state,
         get_default_qpos=lambda: model.qpos0.copy(), capture_full_physics_state=lambda: raw_clock.clone(),
         restore_full_physics_state_torch=restore)
     plant._bind_execution_clock(dt)
@@ -634,7 +636,9 @@ def test_direct_contact_reduction_uses_actual_body_pairs_and_worst_separation(tm
     geom_by_body = {body: int(np.flatnonzero(model.geom_bodyid == body)[0]) for body in (hand, base, lid, other, prop)}
     body_pairs = ((hand, base), (base, hand), (hand, lid), (other, base), (prop, base), (lid, prop))
     geoms = torch.tensor([[geom_by_body[a], geom_by_body[b]] for a, b in body_pairs] + [[-1, -1]])
-    data = SimpleNamespace(contact=SimpleNamespace(geom=geoms, worldid=torch.tensor([0, 0, 1, 1, 0, 0, -1]),
+    frames = torch.eye(3).repeat(7, 1, 1)
+    frames[0] = torch.tensor([[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]])
+    data = SimpleNamespace(contact=SimpleNamespace(geom=geoms, worldid=torch.tensor([0, 0, 1, 1, 0, 0, -1]), frame=frames,
                            dist=torch.tensor([.002, -.026, -.003, 0., -.008, -.019, 0.])), nacon=torch.tensor([6]))
     plant._wp = SimpleNamespace(to_torch=lambda value: value)
     plant._mjw = SimpleNamespace(contact_force=lambda *args: None)
@@ -643,9 +647,12 @@ def test_direct_contact_reduction_uses_actual_body_pairs_and_worst_separation(tm
     plant._contact_ids = torch.arange(len(geoms))
     plant._contact_forces = torch.zeros(len(geoms), 6)
     plant._contact_forces[:, 0] = torch.tensor([1., 2., .7, 100., 0.1, 0.6, 0.])
+    plant._contact_forces[0, 1] = -.5
     assert not plant.contact_support.any() and torch.isnan(plant.contact_facts["left/base"]["normal_force_n"]).all()
     plant._read_solved_contacts()
     torch.testing.assert_close(plant.contact_facts["left/base"]["normal_force_n"], torch.tensor([3., 0.]))
+    torch.testing.assert_close(plant.contact_facts["left/base"]["force_on_second_w_n"],
+                               torch.tensor([[-2., -.5, 1.], [0., 0., 0.]]))
     torch.testing.assert_close(plant.contact_facts["left/lid"]["normal_force_n"], torch.tensor([0., .7]))
     torch.testing.assert_close(plant.contact_facts["object_pair"]["normal_force_n"], torch.tensor([.7, 0.]))
     assert plant.contact_facts["left/base"]["force_bearing_distance_max_m"][0] == torch.tensor(.026)

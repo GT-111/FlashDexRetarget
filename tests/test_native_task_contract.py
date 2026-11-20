@@ -1920,6 +1920,34 @@ def test_source_contact_credit_requires_the_same_hand_to_load_both_objects_toget
     assert contact(env, "motion", .5, .02).item() == pytest.approx(.75)
 
 
+def test_source_lift_load_uses_signed_force_across_assigned_parts_at_the_installed_clock():
+    command, env, _, _, interval = _source_intent_reward_case()
+    env.scene.gravity_up_w = torch.tensor([0., 1., 0.])
+    env.scene.native_object_weights_n = torch.tensor([2.])
+    parts = command.motion_lib.native_object_part_state_w
+    parts[..., :3].zero_()
+    parts[2, 0, 1] = .01
+    for pair in interval["pairs"].values():
+        pair["force_on_second_w_n"] = torch.tensor([[[100., 2., 0.], [100., 2., 0.]]])
+    interval["pairs"]["arbitrary-0-0"]["force_on_second_w_n"][0, 0, 1] = -3.
+    interval["pairs"]["arbitrary-1-1"]["force_bearing_distance_max_m"].fill_(.01)
+    value = NativeMotionTrackingRewards.native_source_lift_load
+    params = dict(lookahead_s=.02, minimum_speed_m_s=.05, separation_bound_m=.02)
+    assert value(env, "motion", **params).item() == pytest.approx(.625)
+    interval["pairs"]["arbitrary-0-0"]["force_on_second_w_n"].fill_(float("nan"))
+    assert value(env, "motion", **params).item() == 0.
+    interval["pairs"]["arbitrary-0-0"]["force_on_second_w_n"].fill_(1.)
+    interval["measurement_support"][0, -1] = False
+    assert value(env, "motion", **params).item() == 0.
+    interval["measurement_support"][0, -1] = True
+    parts[2, 0, 1] = 0.
+    parts[2, 1, 1] = .01
+    assert value(env, "motion", **params).item() == 0.
+    parts[2, 0, 1] = .01
+    interval["sample_end_time_s"][0, -1] = .04
+    assert value(env, "motion", **params).item() == 0.
+
+
 def test_source_approach_rewards_two_digit_groups_on_the_same_supported_part():
     command, env, _, geometry, _ = _source_intent_reward_case((("right", 3),))
     command.motion_lib.native_source_hand_part_intent["active"][1] = True

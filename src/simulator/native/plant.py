@@ -100,6 +100,7 @@ class NativePlant(ABC):
         self.contact_facts = {
             name: {
                 "normal_force_n": torch.full((self.num_envs,), float("nan"), device=device),
+                "force_on_second_w_n": torch.full((self.num_envs, 3), float("nan"), device=device),
                 "force_bearing_contact_present": torch.zeros(self.num_envs, dtype=torch.bool, device=device),
                 "force_bearing_distance_max_m": torch.full((self.num_envs,), float("nan"), device=device),
             }
@@ -126,6 +127,7 @@ class NativePlant(ABC):
             self.contact_sample_execution_step[rows] = -1
         for facts in self.contact_facts.values():
             facts["normal_force_n"][rows] = float("nan")
+            facts["force_on_second_w_n"][rows] = float("nan")
             facts["force_bearing_contact_present"][rows] = False
             facts["force_bearing_distance_max_m"][rows] = float("nan")
 

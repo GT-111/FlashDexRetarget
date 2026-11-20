@@ -281,6 +281,13 @@ class NativeScene:
         )
         self.sensors = {}
         self.backend_identity = sim.plant.identity
+        model = sim.plant.model
+        gravity = torch.as_tensor(model.opt.gravity, device=sim.device, dtype=torch.float32)
+        gravity_magnitude = gravity.norm()
+        self.gravity_up_w = -gravity / gravity_magnitude.clamp_min(1e-12)
+        root_ids = [model.body(obj.root_body_name).id for obj in layout.objects]
+        mass = torch.as_tensor(model.body_subtreemass[root_ids], device=sim.device, dtype=torch.float32)
+        self.native_object_weights_n = mass * gravity_magnitude
         self.root_wrench_application = {
             "frame": "WORLD", "point": "FREE_body_origin",
             "conversion": "link_COM_torque_plus_rotated_COM_offset_cross_force",
@@ -410,6 +417,8 @@ class NativeScene:
             "part_body_names": tuple(part.body_name for _, part in self.native_layout.part_bindings),
             "peak_force_n": peaks[..., 0],
             "peak_torque_nm": peaks[..., 1],
+            "substep_wrench_w": readback["substep_wrench_w"].index_select(2, self._object_part_body_ids),
+            "substep_support": readback["substep_support"],
             "measurement_support": readback["measurement_support"],
             "num_substeps": readback["num_substeps"],
             "authority": readback["authority"],

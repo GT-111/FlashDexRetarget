@@ -116,7 +116,8 @@ class NewtonPlant(NativePlant):
             raise RuntimeError("Newton did not expose actual solved native effort")
         self.effort.copy_(result.applied_joint_effort)
         for name, (first, second) in self.contact_pairs.items():
-            values = self.backend.get_body_pair_contact_facts(np.asarray(first), np.asarray(second))
+            values = self.backend.get_body_pair_contact_facts(
+                np.asarray(first), np.asarray(second), include_world_force=True)
             for key, value in values.items():
                 self.contact_facts[name][key].copy_(value)
         self.contact_support[:] = True

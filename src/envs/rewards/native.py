@@ -48,6 +48,16 @@ def _matching_source_phase(intent, geometry):
     return execution
 
 
+def _contact_interval_weights(env, interval, execution):
+    endpoint = interval["sample_end_time_s"][:, -1] == env.scene.physics_time_s()
+    valid = (interval["sample_recorded"] & interval["clock_support"]
+             & interval["interval_complete"][:, None] & endpoint[:, None]
+             & execution[:, None])
+    duration = torch.where(valid, interval["sample_end_time_s"] - interval["sample_begin_time_s"], 0.0)
+    total = duration.sum(-1, keepdim=True)
+    return valid, (duration / torch.where(total > 0, total, torch.ones_like(total))).float()
+
+
 def _hand_part_distances(geometry, hand, parts, source_digit_distance_m):
     metadata = geometry["metadata"]
     index = metadata["hand_sides"].index(hand)
@@ -161,13 +171,7 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         active = intent["active"] & intent["known"]
         required = active.any(-1) & execution[:, None]
         # The manager finishes this interval before reward and resets afterwards.
-        endpoint = interval["sample_end_time_s"][:, -1] == env.scene.physics_time_s()
-        valid = (interval["sample_recorded"] & interval["clock_support"]
-                 & interval["interval_complete"][:, None] & endpoint[:, None]
-                 & execution[:, None])
-        duration = torch.where(valid, interval["sample_end_time_s"] - interval["sample_begin_time_s"], 0.0)
-        total = duration.sum(-1, keepdim=True)
-        weights = duration / torch.where(total > 0, total, torch.ones_like(total))
+        valid, weights = _contact_interval_weights(env, interval, execution)
         addresses = {(row["hand_side"], row["hand_body_name"], row["part_entity_name"], row["part_body_name"]): name
                      for name, row in interval["addresses"].items()}
         hands = {hand.side: hand.root_body_name for hand in command.native_layout.hands}
@@ -178,7 +182,7 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         for index, body in enumerate(metadata["part_body_names"]):
             part_columns.setdefault(owners[body], []).append(index)
         for hand, name in enumerate(metadata["hand_sides"]):
-            by_object = {owner: torch.zeros_like(duration, dtype=torch.float32) for owner in part_columns}
+            by_object = {owner: torch.zeros_like(weights) for owner in part_columns}
             if geometry is not None:
                 digit_distance = _hand_part_distances(geometry, name, metadata["part_body_names"], source_digit_distance_m)
                 digit_scale = torch.where(digit_distance <= digit_contact_distance_m, 1.0, unmatched_digit_scale)
@@ -205,8 +209,60 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
                 torch.where(active[:, hand, columns].any(-1, keepdim=True), by_object[owner], 1.0)
                 for owner, columns in part_columns.items()
             ], dim=-1).amin(-1)
-            values.append((credit * weights.to(credit.dtype)).sum(-1))
+            values.append((credit * weights).sum(-1))
         return _source_intent_mean(torch.stack(values, -1), required, intent["metadata"], side)
+
+    @staticmethod
+    def native_source_lift_load(env, command_name, lookahead_s, minimum_speed_m_s, separation_bound_m):
+        """Credit measured upward support only when the commanded source object rises."""
+        command = env.command_manager.get_term(command_name)
+        intent = command.source_hand_part_intent_facts()
+        interval = env.scene.hand_part_contact_interval_facts()
+        if intent is None or interval is None:
+            return torch.zeros(env.num_envs, device=env.device)
+        up, weight = env.scene.gravity_up_w, env.scene.native_object_weights_n
+        objects = command.native_layout.objects
+        metadata = intent["metadata"]
+        columns = {name: index for index, name in enumerate(metadata["part_body_names"])}
+        root_columns = [columns[obj.root_body_name] for obj in objects]
+        query = dict(motion_ids=intent["reference_motion_ids"], motion_steps=intent["reference_motion_steps"])
+        now = command.part_surface_reference(**query)
+        later = command.part_surface_reference(**query, offset=max(1, round(lookahead_s / env.step_dt)))
+        elapsed = (later["reference_time_ns"] - now["reference_time_ns"]) * 1e-9
+        rise = (later["state"][:, root_columns, :3] - now["state"][:, root_columns, :3]) @ up
+        demand = ((rise > minimum_speed_m_s * elapsed[:, None]) & (elapsed[:, None] > 0)
+                  & now["pose_support"][:, root_columns] & later["pose_support"][:, root_columns]
+                  & (weight > 0))
+        active = intent["active"] & intent["known"]
+        valid, weights = _contact_interval_weights(env, interval, intent["execution_valid"])
+        complete = (valid & interval["measurement_support"]).all(-1)
+        object_load = {obj.entity_name: torch.zeros_like(weights) for obj in objects}
+        object_known = {obj.entity_name: torch.ones_like(valid) for obj in objects}
+        sides = {side: i for i, side in enumerate(metadata["hand_sides"])}
+        hands = {hand.side: hand.root_body_name for hand in command.native_layout.hands}
+        owners = {part.body_name: obj.entity_name for obj, part in command.native_layout.part_bindings}
+        for name, address in interval["addresses"].items():
+            side, body = address["hand_side"], address["part_body_name"]
+            owner = address["part_entity_name"]
+            if hands.get(side) != address["hand_body_name"] or owners.get(body) != owner:
+                continue
+            assigned = active[:, sides[side], columns[body], None]
+            pair = interval["pairs"][name]
+            force = pair["force_on_second_w_n"] @ up
+            present = pair["force_bearing_contact_present"]
+            distance = pair["force_bearing_distance_max_m"]
+            known = torch.isfinite(force) & (~present | torch.isfinite(distance))
+            object_known[owner] &= ~assigned | known
+            object_load[owner] += torch.where(assigned & known & present & (distance <= separation_bound_m), force, 0.)
+        required = demand & torch.stack([
+            active[..., [columns[part.body_name] for part in obj.parts]].any(dim=(1, 2)) for obj in objects
+        ], -1)
+        load = torch.stack(list(object_load.values()), -1)
+        credit = (load / weight.clamp_min(1e-12)).clamp(-1.0, 1.0)
+        eligible = torch.stack(list(object_known.values()), -1).all(1)
+        complete &= (~required | eligible).all(-1)
+        simultaneous = torch.where(required[:, None], credit, 1.).amin(-1)
+        return torch.where(required.any(-1) & complete, (simultaneous * weights).sum(-1), 0.)
 
     @staticmethod
     def native_source_tip_position(env, command_name, scale, side=None):

@@ -66,6 +66,8 @@ class _Plant(NativePlant):
         force = 0.75 if slot == 0 else 0.0 if slot == 1 else 0.4
         for facts in self.contact_facts.values():
             facts["normal_force_n"] = torch.tensor([force, force], requires_grad=self.requires_grad)
+            facts["force_on_second_w_n"] = torch.tensor([[0., .5 * force, -force]] * 2,
+                                                       requires_grad=self.requires_grad)
             facts["force_bearing_contact_present"] = torch.tensor([force > 0] * 2)
             distance = 0.01 if slot == 0 else float("nan") if slot == 1 else 0.03
             facts["force_bearing_distance_max_m"] = torch.tensor([distance] * 2)
@@ -155,9 +157,15 @@ def test_applied_wrench_interval_retains_an_early_peak_and_requires_every_solve(
 
     assert readback()["measurement_support"].tolist() == [True, False]
     torch.testing.assert_close(readback()["peaks"][:, 0], torch.tensor([[5.0, 2.0], [5.0, 2.0]]))
+    assert readback()["substep_support"].tolist() == [[True, True, True], [True, False, True]]
+    expected = torch.zeros(3, 6)
+    expected[0] = torch.tensor([3.0, 4.0, 0.0, 0.0, 0.0, 2.0])
+    torch.testing.assert_close(readback()["substep_wrench_w"][0, :, 0], expected)
+    assert not readback()["substep_wrench_w"][1, 1, 0].any()
     plant.invalidate_contacts(torch.tensor([0]))
     assert not readback()["measurement_support"].any()
     assert not readback()["peaks"][0].any()
+    assert not readback()["substep_support"][0].any()
 
 
 def _tensors(interval):
@@ -244,8 +252,10 @@ def test_real_backend_advance_methods_feed_the_same_interval_contact_owner(engin
         clock.add_(0.005)
         return SimpleNamespace(public_state=state, applied_joint_effort=torch.zeros(2, 1))
 
-    def read_contacts(*args):
+    def read_contacts(*args, include_world_force=True):
+        assert include_world_force
         return {"normal_force_n": torch.full((2,), float(index)),
+                "force_on_second_w_n": torch.full((2, 3), float(index)),
                 "force_bearing_contact_present": torch.ones(2, dtype=torch.bool),
                 "force_bearing_distance_max_m": torch.full((2,), 0.003)}
 
@@ -294,6 +304,8 @@ def test_real_backend_advance_methods_feed_the_same_interval_contact_owner(engin
     plant.contact_interval.finish()
     torch.testing.assert_close(plant.contact_interval.pairs["renamed/panel"]["normal_force_n"],
                                torch.tensor([[1.0, 2.0, 3.0]] * 2), rtol=0, atol=0)
+    torch.testing.assert_close(plant.contact_interval.pairs["renamed/panel"]["force_on_second_w_n"],
+                               torch.arange(1., 4.).reshape(1, 3, 1).expand(2, -1, 3))
     assert plant.contact_interval.interval_complete.all()
     assert plant.contact_interval.sample_recorded.all()
     assert plant.execution_clock()["steps"].tolist() == [3, 3]
@@ -438,6 +450,8 @@ def test_recorder_retains_substep_tape_reset_unknown_and_original_phase(tmp_path
                 begin[:] = float("nan")
             return {**facts, "num_substeps": 3, "clock": "synthetic solver begin/end", "sampling": "discrete samples, not continuous force",
                 "pairs": {name: {"normal_force_n": torch.tensor([[0.75, 0.0, 0.4] if known else [float("nan")] * 3]),
+                    "force_on_second_w_n": torch.tensor([[[0., 0., -.75], [0., 0., 0.], [0., 0., -.4]]])
+                    if known else torch.full((1, 3, 3), float("nan")),
                     "force_bearing_contact_present": torch.tensor([[True, False, True] if known else [False] * 3]),
                     "force_bearing_distance_max_m": torch.tensor([[0.01, float("nan"), 0.03] if known else [float("nan")] * 3])} for name in facts["addresses"]},
                 "measurement_support": torch.full((1, 3), known), "sample_recorded": torch.full((1, 3), known),
@@ -451,6 +465,9 @@ def test_recorder_retains_substep_tape_reset_unknown_and_original_phase(tmp_path
     arrays = load_flashdex_rollout(manifest, motion_id=0).arrays
     assert arrays["hand_part_interval_normal_force_n"].shape == (3, 3, 4)
     assert np.isnan(arrays["hand_part_interval_normal_force_n"][0]).all()
+    assert arrays["hand_part_interval_force_on_part_w_n"].shape == (3, 3, 4, 3)
+    assert np.isnan(arrays["hand_part_interval_force_on_part_w_n"][0]).all()
+    np.testing.assert_allclose(arrays["hand_part_interval_force_on_part_w_n"][1, :, 0, 2], [-.75, 0., -.4])
     assert not arrays["hand_part_interval_sample_recorded"][0].any()
     assert not arrays["hand_part_interval_interval_complete"][0]
     np.testing.assert_allclose(arrays["hand_part_interval_normal_force_n"][1, :, 0], [0.75, 0.0, 0.4])
