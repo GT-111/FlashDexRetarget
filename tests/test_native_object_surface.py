@@ -280,19 +280,21 @@ def test_native_surface_replay_rejects_lossy_source_charts(tmp_path, source, los
                         clip=(-.1, .1) if loss == "clip" else None, scale=0. if loss == "zero-scale" else None)
 
 
-def test_native_surface_checkpoint_metadata_does_not_depend_on_replay_compaction(tmp_path):
-    from agents.flashsac import FlashSACAgent
+def test_native_surface_checkpoint_metadata_does_not_depend_on_replay_compaction(tmp_path, monkeypatch):
+    from agents import flashsac
 
     command, _env = _surface_case(tmp_path)
     command.part_surface_points(4, 16)
+    monkeypatch.setattr(flashsac, "_native_policy_columns", lambda env, name: None)
 
-    class MetadataAgent(FlashSACAgent):
+    class MetadataAgent(flashsac.FlashSACAgent):
         @staticmethod
         def _resolved_config(cfg, share_obs):
             return SimpleNamespace(buffer_compact_obs=False)
 
         def __init__(self, observations, actions, env_info, cfg):
             self._encoded_layout, self._obs_terms = [], env_info.get("obs_terms", [])
+            self._native_policy_columns = env_info.get("native_policy_columns")
             self._native_surface_metadata = env_info.get("native_part_surface_metadata", [])
             self._alg = SimpleNamespace(save=lambda: {}, update_step=0)
 
