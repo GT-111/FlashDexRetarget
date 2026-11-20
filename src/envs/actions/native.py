@@ -12,6 +12,7 @@ from mjlab.utils.lab_api.math import (
     quat_apply,
     quat_box_minus,
     quat_box_plus,
+    quat_error_magnitude,
     quat_inv,
     quat_mul,
     unscale_transform,
@@ -21,6 +22,48 @@ from mjlab.utils.lab_api.string import resolve_matching_names_values
 from envs.scene.native import NativeSceneCfg
 
 from .lpf import ema_alpha
+
+
+def _contact_compression(
+    solve, roles, solved, body_hands, body_parts, command_indices, command_count, travel_m,
+):
+    """Project each loaded pad's inward normal travel to the named command coordinates."""
+    bodies = solve["native_bodies"]
+    world = solve["world"].clamp(0, roles.shape[0] - 1)
+    hand, part = body_hands[bodies], body_parts[bodies]
+    orientation = (hand[:, 0] >= 0) & (part[:, 1] >= 0)
+    assigned_hand = torch.where(orientation, hand[:, 0], hand[:, 1])
+    assigned_part = torch.where(orientation, part[:, 1], part[:, 0])
+    hand_body = torch.where(orientation, bodies[:, 0], bodies[:, 1])
+    force = solve["normal_force_n"]
+    eligible = (solve["valid"] & solved[world] & (assigned_hand >= 0) & (assigned_part >= 0)
+                & roles[world, assigned_hand.clamp_min(0), assigned_part.clamp_min(0)] & (force >= .08))
+    slot = world * len(body_hands) + hand_body
+    strongest = force.new_zeros(roles.shape[0] * len(body_hands))
+    strongest.scatter_reduce_(0, slot, torch.where(eligible, force, 0.), reduce="amax")
+    contact = torch.arange(len(force), device=force.device)
+    pick = torch.full_like(strongest, len(force), dtype=torch.long)
+    selected = eligible & (force == strongest[slot])
+    pick.scatter_reduce_(0, slot, torch.where(selected, contact, len(force)), reduce="amin")
+    present = (pick < len(force)).reshape(roles.shape[0], -1)
+    pick = pick.clamp_max(len(force) - 1).reshape_as(present)
+    forward = orientation[pick]
+    solver_body = torch.where(forward, solve["solver_bodies"][pick, 0], solve["solver_bodies"][pick, 1])
+    centers = solve["subtree_com_w"].gather(1, solve["body_root"][solver_body, None].expand(-1, -1, 3))
+    normal = solve["normal_w"][pick] * torch.where(forward[..., None], 1., -1.)
+    arm = solve["point_w"][pick] - centers
+    subspace = solve["motion_subspace"]
+    derivative = (torch.einsum("wbi,wai->wba", normal, subspace[..., 3:])
+                  + torch.einsum("wbi,wai->wba", torch.linalg.cross(arm, normal), subspace[..., :3]))
+    derivative = torch.where(present[..., None] & solve["body_is_dof_ancestor"][solver_body], derivative, 0.)
+    projected = derivative.new_zeros((*derivative.shape[:2], command_count))
+    projected.scatter_add_(-1, command_indices.expand_as(derivative), derivative)
+    pressure = torch.where(present, force[pick], 0.)
+    travel = travel_m * (pressure / .30).clamp(max=1.)
+    transpose = projected.transpose(1, 2)
+    normal = transpose @ projected
+    normal.diagonal(dim1=-2, dim2=-1).add_(.014 ** 2)
+    return torch.linalg.solve_ex(normal, (transpose @ travel[..., None]).squeeze(-1)).result
 
 
 @dataclass(kw_only=True)
@@ -50,6 +93,7 @@ class NativeActionControlContext:
     filter_pending: torch.Tensor
     source_contact_translation: torch.Tensor
     source_contact_part: torch.Tensor
+    source_contact_compression: torch.Tensor
     correction_twist: torch.Tensor
     correction_interval_valid: torch.Tensor
     finger_requested: torch.Tensor
@@ -85,12 +129,16 @@ class NativeResidualAction(ActionTerm):
             raise ValueError("unsupported native wrist target-twist convention")
         self._source_contact_scale = 0.
         self._source_contact_guard = None
+        self._pad_travel_m = 0.
         if cfg.source_contact_approach is not None:
             self._source_contact_guard = dict(cfg.source_contact_approach)
             self._source_contact_scale = self._source_contact_guard.pop("translation_m")
+            self._pad_travel_m = self._source_contact_guard.pop("pad_compression_m", 0.)
             if (not 0. < self._source_contact_scale <= cfg.translation_residual_m
                     or not all(math.isfinite(value) and value > 0. for value in self._source_contact_guard.values())):
                 raise ValueError("source contact approach requires positive pose and tip bounds within the wrist budget")
+            if not 0. <= self._pad_travel_m <= self._source_contact_scale:
+                raise ValueError("pad compression must be between zero and the source contact approach distance")
         self.layout = NativeSceneCfg.from_mapping(cfg.native_scene)
         self.hand_sides = tuple(h.side for h in self.layout.hands)
         self.hand_body_names = tuple(h.root_body_name for h in self.layout.hands)
@@ -105,6 +153,23 @@ class NativeResidualAction(ActionTerm):
         self.actuator_command_indices = torch.tensor(mapping, dtype=torch.long, device=self.device)
         counts = torch.bincount(self.actuator_command_indices, minlength=len(self.finger_command_names))
         self.actuator_command_weights = counts[self.actuator_command_indices].float().reciprocal()
+        if self._pad_travel_m:
+            self._plant = env.sim.plant
+            model = self._plant.model
+            actuators = [model.actuator(name).id for name in self.finger_actuator_names]
+            dofs = torch.as_tensor(model.jnt_dofadr[model.actuator_trnid[actuators, 0]],
+                                   dtype=torch.long, device=self.device)
+            self._plant.configure_contact_differential(dofs)
+            self._pad_body_hand = torch.full((model.nbody,), -1, dtype=torch.long, device=self.device)
+            roots = torch.as_tensor(model.body_rootid, device=self.device)
+            for i, hand in enumerate(self.layout.hands):
+                self._pad_body_hand[roots == model.body(hand.root_body_name).id] = i
+            self._pad_body_part = torch.full_like(self._pad_body_hand, -1)
+            for i, (_, part) in enumerate(self.layout.part_bindings):
+                self._pad_body_part[model.body(part.body_name).id] = i
+            self._pad_command_hand = torch.as_tensor(
+                [i for i, hand in enumerate(self.layout.hands) for _ in range(hand.command_count)],
+                dtype=torch.long, device=self.device)
         self._finger_ids = torch.tensor(
             finger_ids, dtype=torch.long, device=self.device
         )
@@ -152,6 +217,8 @@ class NativeResidualAction(ActionTerm):
         )
         self._source_contact_translation = torch.zeros(self.num_envs, roots, 3, device=self.device)
         self._source_contact_part = torch.full((self.num_envs, roots), -1, dtype=torch.long, device=self.device)
+        self._source_contact_compression = torch.zeros(
+            self.num_envs, len(self.finger_command_names), device=self.device)
         self._control_dt = float(env.step_dt)
         self._correction_twist = torch.zeros(
             self.num_envs, roots, 6, device=self.device
@@ -315,6 +382,48 @@ class NativeResidualAction(ActionTerm):
             translation = (translation + self._source_contact_translation).clamp(-cap, cap)
         return translation
 
+    def _source_loaded_approach(self, command):
+        """Approach from the declared carriers, then preserve achieved pad engagement."""
+        ids = command._motion_flat_ids
+        intent = command.source_hand_part_intent(ids)
+        fallback, nearest = command.source_contact_approach_direction(ids, **self._source_contact_guard)
+        if intent is None:
+            self._source_contact_compression.zero_()
+            return fallback, nearest
+        hands = [intent["metadata"]["hand_sides"].index(side) for side in self.hand_sides]
+        parts = [intent["metadata"]["part_body_names"].index(part.body_name) for _, part in self.layout.part_bindings]
+        roles = (intent["active"] & intent["known"])[:, hands][:, :, parts]
+        roots = torch.stack([command.motion_lib.native_root_state_w[side][ids, :3] for side in self.hand_sides], 1)
+        roots = roots + self._env.scene.env_origins[:, None]
+        live = command.sim_object_part_state_w[:, parts]
+        requested = command.object_part_reference(ids)[:, parts]
+        close_position = ((live[..., :3] - requested[..., :3]).norm(dim=-1)
+                          <= self._source_contact_guard["max_part_position_error_m"])
+        close_rotation = (quat_error_magnitude(live[..., 3:7], requested[..., 3:7])
+                          <= self._source_contact_guard["max_part_rotation_error_rad"])
+        roles &= (close_position & close_rotation)[:, None]
+        part = roles.long().argmax(-1)
+        unique = roles.sum(-1) == 1
+        aim = live[..., :3].gather(1, part[..., None].expand(-1, -1, 3)) - roots
+        if len(self.hand_sides) == 2:
+            paired = unique.all(1) & (part[:, 0] == part[:, 1])
+            opposed = roots.flip(1) - roots
+            gravity = opposed.new_tensor(self.layout.hands[0].root_control.gravity_world_m_per_s2)
+            up = torch.nn.functional.normalize(gravity, dim=0)
+            opposed = opposed - (opposed @ up)[..., None] * up
+            aim = torch.where(paired[:, None, None], opposed, aim)
+        part_columns = nearest.new_tensor(parts)
+        use_grasp_axis = unique & (part_columns[part] == nearest)
+        direction = torch.where(use_grasp_axis[..., None], torch.nn.functional.normalize(aim, dim=-1), fallback)
+        correction = _contact_compression(
+            self._plant.solved_contact_differential(), roles, self._plant.contact_support,
+            self._pad_body_hand, self._pad_body_part, self.actuator_command_indices,
+            len(self.finger_command_names), self._pad_travel_m,
+        )
+        self._source_contact_compression.lerp_(correction, .3)
+        self._source_contact_compression.masked_fill_(~roles.any(-1)[:, self._pad_command_hand], 0.)
+        return direction, nearest
+
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
         processed = actions * self.cfg.action_scale + self.cfg.action_offset
@@ -331,8 +440,11 @@ class NativeResidualAction(ActionTerm):
         self._processed_actions[:] = self._filter_state
         if self._source_contact_guard is not None:
             command = self._env.command_manager.get_term(self.cfg.command_name)
-            direction, part = command.source_contact_approach_direction(
-                command._motion_flat_ids, **self._source_contact_guard)
+            if self._pad_travel_m:
+                direction, part = self._source_loaded_approach(command)
+            else:
+                direction, part = command.source_contact_approach_direction(
+                    command._motion_flat_ids, **self._source_contact_guard)
             self._source_contact_translation.masked_fill_((part != self._source_contact_part)[..., None], 0.0)
             self._source_contact_translation.lerp_(direction * self._source_contact_scale, 0.35)
             self._source_contact_part.copy_(part)
@@ -374,6 +486,11 @@ class NativeResidualAction(ActionTerm):
             requested = unscale_transform(action, self._lower, self._upper)
         else:
             requested = self.ref_command_pos_used + action * self.cfg.finger_residual_rad
+        if self._pad_travel_m:
+            requested = requested + self._source_contact_compression
+            if self.cfg.finger_residual_rad is not None:
+                requested = self.ref_command_pos_used + (requested - self.ref_command_pos_used).clamp(
+                    -self.cfg.finger_residual_rad, self.cfg.finger_residual_rad)
         self._finger_requested[:] = torch.where(support, requested, 0.0)
         self._finger_requested_support[:] = support
         mapping = self.actuator_command_indices
@@ -433,6 +550,7 @@ class NativeResidualAction(ActionTerm):
         self._filter_pending[rows] = True
         self._source_contact_translation[rows] = 0.0
         self._source_contact_part[rows] = -1
+        self._source_contact_compression[rows] = 0.0
         self._correction_twist[rows] = 0.0
         self._correction_interval_valid[rows] = False
         self._installed_valid[rows] = False

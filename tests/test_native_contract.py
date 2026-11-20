@@ -10,7 +10,11 @@ import numpy as np
 import pytest
 import torch
 
-from envs.actions.native import NativeResidualAction, NativeResidualActionCfg
+from envs.actions.native import (
+    NativeResidualAction,
+    NativeResidualActionCfg,
+    _contact_compression,
+)
 from envs.scene.native import NativeSceneCfg
 from simulator.isaacsim.convert_assets import (
     native_mimic_imports,
@@ -19,6 +23,30 @@ from simulator.isaacsim.convert_assets import (
 )
 from simulator.isaacsim.entity import FreeArticulationAdapter, _FreshnessClock
 from simulator.mjcf_meta import load_robot_mjcf_meta
+
+
+def test_pad_normal_travel_respects_endpoint_owner_roles_and_shared_commands():
+    bodies = torch.tensor([[1, 2], [2, 1], [2, 1], [1, 3], [2, 1]])
+    solve = dict(
+        world=torch.tensor([0, 0, 1, 0, 2]), valid=torch.ones(5, dtype=torch.bool),
+        native_bodies=bodies, solver_bodies=bodies,
+        normal_w=torch.tensor([[0., -1., 0.], [0., -1., 0.], [0., -1., 0.], [0., -1., 0.], [0., -1., 0.]]),
+        point_w=torch.tensor([[.05, 0., 0.]]).expand(5, -1),
+        normal_force_n=torch.tensor([.2, 1., 1., 8., 1.]),
+        motion_subspace=torch.tensor([[[0., 0., 1., 0., 0., 0.], [0., 0., 1., 0., 0., 0.],
+                                       [0., 0., -1., 0., 0., 0.]]]).expand(3, -1, -1),
+        body_is_dof_ancestor=torch.tensor([[False, False, False], [True, True, False],
+                                          [False, False, False], [False, False, True]]),
+        body_root=torch.arange(4), subtree_com_w=torch.zeros(3, 4, 3),
+    )
+    assigned = torch.tensor([[[True, False]], [[False, True]], [[True, False]]])
+    result = _contact_compression(
+        solve, assigned, torch.tensor([True, True, False]),
+        torch.tensor([-1, 0, -1, -1]), torch.tensor([-1, -1, 0, 1]),
+        torch.tensor([0, 0, 1]), 2, .004,
+    )
+    expected = .004 * .1 / (.1 ** 2 + .014 ** 2)
+    torch.testing.assert_close(result, torch.tensor([[expected, 0.], [0., 0.], [0., 0.]]))
 
 
 def _scene(tmp_path):

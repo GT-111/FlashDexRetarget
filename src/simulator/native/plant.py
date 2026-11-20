@@ -84,6 +84,7 @@ class NativePlant(ABC):
         self.device = str(device)
         self.contact_pairs = contact_pairs
         self.contact_interval = None
+        self._contact_differential_dofs = None
         # Only a backend with an observed fixed-step installation supplies this
         # clock. Raw solver time remains a separate, unchanged engine state.
         self._execution_steps = None

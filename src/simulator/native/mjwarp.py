@@ -209,6 +209,39 @@ class MjWarpPlant(NativePlant):
             facts["force_bearing_distance_max_m"].zero_().scatter_reduce_(0, rows, torch.where(bearing, distance, 0), reduce="amax")
             facts["force_bearing_distance_max_m"].masked_fill_(present == 0, float("nan"))
         self.contact_support[:] = True
+        interval = self.contact_interval
+        if self._contact_differential_dofs is not None and (
+            interval is None or not interval._active or interval._count + 1 == interval.num_substeps
+        ):
+            self._retain_contact_differential()
+
+    def configure_contact_differential(self, native_dof_ids):
+        self._contact_differential_dofs = native_dof_ids
+        with self._scope():
+            self._retain_contact_differential()
+
+    def _retain_contact_differential(self):
+        # Forward refreshes geometry without solving those contacts.
+        data, model, read = self._data, self._model, self._wp.to_torch
+        dofs = self._contact_differential_dofs
+        geom = read(data.contact.geom).long()
+        bodies = self._geom_body[geom.clamp_min(0)]
+        self._contact_differential = {
+            "valid": (read(self._contact_ids) < read(data.nacon)[0]) & geom.ge(0).all(-1),
+            "world": read(data.contact.worldid).long(),
+            "native_bodies": bodies,
+            "solver_bodies": bodies,
+            "normal_w": read(data.contact.frame)[:, 0].clone(),
+            "point_w": read(data.contact.pos).clone(),
+            "normal_force_n": read(self._contact_forces)[:, 0].clone(),
+            "motion_subspace": read(data.cdof).index_select(1, dofs),
+            "body_is_dof_ancestor": read(model.body_isdofancestor).index_select(1, dofs).bool(),
+            "body_root": self._body_root,
+            "subtree_com_w": read(data.subtree_com).clone(),
+        }
+
+    def solved_contact_differential(self):
+        return self._contact_differential
 
     def body_state(self, body_ids):
         with self._scope():

@@ -128,6 +128,12 @@ class NewtonPlant(NativePlant):
     def body_state(self, body_ids):
         return self.backend.get_body_state_w_torch(np.asarray(body_ids))
 
+    def configure_contact_differential(self, native_dof_ids):
+        self._contact_differential_dofs = native_dof_ids
+
+    def solved_contact_differential(self):
+        return self.backend.get_solved_contact_differential_torch(self._contact_differential_dofs)
+
     def physics_time(self):
         return self.backend.get_physics_time_torch()
 

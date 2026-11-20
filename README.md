@@ -496,8 +496,9 @@ contact-gated rotational `xfrc` scaling (`contact_scale: 0.5`), post-decay wrenc
 perturbations (`require_assist_decayed: true`), and adaptive `xfrc -> 0` decay
 with the hand actuators and contact sites declared in the prepared scene.
 Pairing `envs/simulator@simulator=newton` with CoACD convex hulls capped at `<= 16` hulls and `<= 32` vertices/hull runs
-native `SolverMuJoCo` contacts. `NativeRolloutRecord` measures the post-solve force and torque peaks
-over each supported interval from `mjw_data.xfrc_applied`.
+native `SolverMuJoCo` contacts. `NativeRolloutRecord` retains post-solve WORLD
+force and torque vectors and support for each substep from `mjw_data.xfrc_applied`.
+Interval peaks are derived from the same vectors.
 Native object disturbances use known source hand-part engagement. An object's
 burst can start after its configured engagement lag and the same delay after
 reset. The wrench acts on its FREE root and clears when source engagement
@@ -512,6 +513,13 @@ It clears as soon as the source engagement, pose tolerance, or nearby
 surface support fails at a control decision. The same action runs in training
 and evaluation. Wrist feedforward differentiates the effective translation
 after this guide and the wrist cap, on the actual control interval.
+On native Newton and MuJoCo Warp, set
+`++actions.source_contact_approach.pad_compression_m=<meters>` to evaluate a
+bounded pad preload. The guide follows the declared carrier axes and projects
+normal travel at each loaded pad through the solved point Jacobian into the
+named finger command coordinates. Use the same setting for training and both
+frozen evaluations. Grip adjustment acts through hand position targets and
+retains the original source roles, installed actuator bounds, and perturbation.
 The HOI recipe treats a take that exceeds 5 cm of part translation or 20° of
 part rotation as a training failure. The part-position reward uses the same
 5 cm scale. Frozen evaluation still records the entire source take so the
