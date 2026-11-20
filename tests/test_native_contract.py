@@ -742,6 +742,7 @@ def _native_action_case(
         motion_ids=torch.tensor([2, 3]),
         motion_steps=torch.tensor([4, 5]),
         ref_joint_pos=torch.zeros(2, 4),
+        source_hand_part_intent=lambda _: None,
         source_contact_approach_direction=lambda *args, **kwargs: command.approach_dir_and_part,
     )
     env = SimpleNamespace(
@@ -791,7 +792,8 @@ def _native_action_case(
     return env, action, command, accepted
 
 
-def test_loaded_contact_outlives_approach_guard_until_contact_or_role_ends(tmp_path):
+@pytest.mark.parametrize("pad_travel", (0., .004))
+def test_loaded_contact_outlives_approach_guard_until_contact_or_role_ends(tmp_path, pad_travel):
     import mujoco
 
     env, ordinary, command, _ = _native_action_case(tmp_path, wrist_target_twist="filtered_correction_feedforward")
@@ -812,6 +814,13 @@ def test_loaded_contact_outlives_approach_guard_until_contact_or_role_ends(tmp_p
         model=model, contact_support=torch.ones(2, dtype=torch.bool),
         configure_contact_differential=lambda _: None, solved_contact_differential=lambda: solve,
     ))
+    pairs = {f"{side}/{obj.entity_name}/{part.name}": {
+        "normal_force_n": (solve["normal_force_n"] if side == "left" and part.body_name == "base"
+                           else torch.zeros(2)),
+    } for side in ordinary.hand_sides for obj, part in ordinary.layout.part_bindings}
+    env.scene.hand_part_contact_facts = lambda: {
+        "measurement_support": env.sim.plant.contact_support, "pairs": pairs,
+    }
     source_active = torch.zeros(2, 2, 2, dtype=torch.bool)
     source_active[:, 0, 0] = True
     command.source_hand_part_intent = lambda _: dict(active=source_active, known=torch.ones_like(source_active),
@@ -822,25 +831,29 @@ def test_loaded_contact_outlives_approach_guard_until_contact_or_role_ends(tmp_p
     requested[..., 3] = 1.
     command.object_part_reference = lambda _: requested
     command.sim_object_part_state_w = requested.clone()
-    command.approach_dir_and_part = (torch.zeros(2, 2, 3), torch.tensor([[0, -1], [0, -1]]))
+    command.approach_dir_and_part = (
+        torch.tensor([[[1., 0., 0.], [0., 0., 0.]]]).expand(2, 2, 3),
+        torch.tensor([[0, -1], [0, -1]]),
+    )
     action = NativeResidualAction(replace(
         ordinary.cfg, finger_residual_rad=.5,
         source_contact_approach=dict(translation_m=.012, max_part_position_error_m=.02,
                                      max_part_rotation_error_rad=.35, max_tip_distance_m=.042,
-                                     pad_compression_m=.004),
+                                     pad_compression_m=pad_travel),
     ), env)
     raw = torch.zeros_like(action.raw_action)
     action.process_actions(raw)
     action.apply_actions()
     before = action.installed_control["root_state_w"][:, 0, :3].clone()
     initial_finger = action.installed_control["finger_target_rad"][:, 0].clone()
-    assert (initial_finger > 0.).all()
+    assert (initial_finger > 0.).all().item() == bool(pad_travel)
 
     command.sim_object_part_state_w[:, 0, 0] += .03
     command.approach_dir_and_part = (torch.zeros(2, 2, 3), torch.full((2, 2), -1))
     action.process_actions(raw)
     action.apply_actions()
-    assert (action.installed_control["finger_target_rad"][:, 0] > initial_finger).all()
+    if pad_travel:
+        assert (action.installed_control["finger_target_rad"][:, 0] > initial_finger).all()
     torch.testing.assert_close(action.installed_control["root_state_w"][:, 0, :3], before)
     torch.testing.assert_close(action.installed_control["root_state_w"][:, 0, 7:10], torch.zeros(2, 3))
 
@@ -936,8 +949,9 @@ def test_native_logical_residual_expands_to_independently_limited_drives(tmp_pat
     torch.testing.assert_close(action._entity.data.joint_pos_target[:, 1], torch.full((2,), .3))
 
 
-def test_native_wrist_twist_follows_the_installed_guide_and_translation_cap(tmp_path):
-    _env, action, command, _accepted = _native_action_case(
+@pytest.mark.parametrize("next_part", (-1, 1))
+def test_native_wrist_guide_stays_rate_limited_across_release_and_role_change(tmp_path, next_part):
+    env, action, command, _accepted = _native_action_case(
         tmp_path, wrist_target_twist="filtered_correction_feedforward",
         source_contact_approach={"translation_m": .08, "guard": 1.},
     )
@@ -948,15 +962,31 @@ def test_native_wrist_twist_follows_the_installed_guide_and_translation_cap(tmp_
     raw[:, (0, 3)] = .9
     action.process_actions(raw)
     action.apply_actions()
-    first = action.installed_control["root_state_w"][..., :3].clone()
     assert not action._correction_twist.any()
+    for _ in range(8):
+        action.process_actions(raw)
+        action.apply_actions()
+    previous = action.installed_control["root_state_w"][..., :3].clone()
+    torch.testing.assert_close(
+        previous[..., 0] - env.scene.env_origins[:, 0, None], torch.full((2, 2), .1))
 
-    command.approach_dir_and_part = -direction, torch.ones(2, 2, dtype=torch.long)
-    action.process_actions(raw)
-    action.apply_actions()
+    command.approach_dir_and_part = (
+        -direction if next_part >= 0 else torch.zeros_like(direction),
+        torch.full((2, 2), next_part),
+    )
+    for _ in range(65):
+        action.process_actions(raw)
+        action.apply_actions()
+        installed = action.installed_control["root_state_w"]
+        speed = installed[..., 7:10]
+        assert (speed.norm(dim=-1) <= .12 + 1e-5).all()
+        torch.testing.assert_close(speed, (installed[..., :3] - previous) / .02, atol=3e-5, rtol=1e-5)
+        previous = installed[..., :3].clone()
     installed = action.installed_control["root_state_w"]
-    torch.testing.assert_close(installed[..., 7:10], (installed[..., :3] - first) / .02, atol=2e-5, rtol=1e-5)
-    torch.testing.assert_close(action._correction_twist[..., 0], torch.full((2, 2), -1.9))
+    torch.testing.assert_close(
+        installed[..., 0] - env.scene.env_origins[:, 0, None],
+        torch.full((2, 2), .01 if next_part >= 0 else .09),
+    )
 
 
 def test_stationary_hold_pressure_requires_solved_support_and_retains_wrist_feedforward(tmp_path):
@@ -975,7 +1005,7 @@ def test_stationary_hold_pressure_requires_solved_support_and_retains_wrist_feed
     action.apply_actions()
     first = action.installed_control["root_state_w"][..., :3].clone()
     torch.testing.assert_close(first[0, 0] - env.scene.env_origins[0], torch.tensor([0., 0., -.0007]))
-    torch.testing.assert_close(first[1, 0] - env.scene.env_origins[1], torch.tensor([.0084, 0., 0.]))
+    torch.testing.assert_close(first[1, 0] - env.scene.env_origins[1], torch.tensor([.0024, 0., 0.]))
     assert action._source_hold_offset_m[0, 1] == 0.
     carry = action.capture_control_context()
     action.process_actions(raw)

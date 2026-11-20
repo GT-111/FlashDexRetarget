@@ -16,6 +16,7 @@ import simulator.isaacsim  # noqa: F401
 from omegaconf import OmegaConf
 from test_native_task_contract import _command
 
+from evaluation.callbacks.motion_tracking_eval_setup import MotionTrackingEvalSetup
 from evaluation.callbacks.tracking_performance import NativeReferenceTrackingPerformance
 from evaluation.evaluate import evaluate, write_current_policy_outcomes
 from evaluation.shared import build_eval_plan
@@ -25,6 +26,17 @@ from runner.off_policy_runner import OffPolicyRunner
 class _Scene(dict):
     def tracking_contact_metadata(self):
         return {"force": "net_link_force", "association": "SDF", "pair_force_supported": False}
+
+
+def test_eval_remainder_world_does_not_steal_a_replica_from_the_next_batch():
+    command = SimpleNamespace(motion_ids=torch.zeros(3, dtype=torch.int64),
+                              motion_lib=SimpleNamespace(_motion_num_frames=torch.tensor([3, 4])))
+    env = SimpleNamespace(num_envs=3, device="cpu", command_manager=SimpleNamespace(get_term=lambda _: command))
+    setup = MotionTrackingEvalSetup("motion", num_per_motion=2)
+    for batch in (0, 1):
+        setup.set_batch(batch, k=1, num_motions=2)
+        setup.on_eval_setup(env)
+        assert command.motion_ids[setup.active_mask].tolist() == [batch, batch]
 
 
 class _EvaluationEnv:

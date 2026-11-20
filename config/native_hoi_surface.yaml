@@ -14,9 +14,9 @@ native_tracking_tolerances:
   part_position_error_m: 0.05
   part_rotation_error_rad: 0.3490658503988659
   joint_position_error_rad: 0.35
-  joint_position_error_m: null
+  joint_position_error_m: 0.025
   command_position_error_rad: 1.80
-  command_position_error_m: null
+  command_position_error_m: 0.04
 
 # Right-sized compact FP16 replay buffer (~11.8 GiB VRAM) enabling 2-3 co-packed H200 jobs.
 runner:
@@ -37,7 +37,7 @@ terminations:
       linear_m_per_s: 100.0
       angular_rad_per_s: 200.0
       joint_rad_per_s: 600.0
-      joint_m_per_s: null
+      joint_m_per_s: 20.0
 
 eval:
   interval: 500_000
@@ -53,6 +53,7 @@ actions:
   wrist_target_twist: filtered_correction_feedforward
   source_contact_approach:
     translation_m: 0.024
+    max_speed_m_s: 0.12
     max_part_position_error_m: 0.020
     max_part_rotation_error_rad: 0.3490658503988659
     max_tip_distance_m: ${native_surface.source_digit_distance_m}
@@ -124,6 +125,7 @@ obs:
       - native_root_reference_error
       - native_source_tip_reference_error
       - native_source_hand_part_intent
+      - native_solved_contact_feedback
       - native_object_parts_wrist
       - native_reference_parts_wrist
       - native_object_joint_state
@@ -143,7 +145,7 @@ obs:
       n_obj_verts: ${native_surface.n_obj_verts}
 
 rewards:
-  shared_terms: [native_object_part_pose, native_part_surface_displacement, native_object_articulation, native_contact_overload, termination_penalty]
+  shared_terms: [native_object_part_pose, native_part_surface_displacement, native_object_articulation, native_source_joint_drive, native_contact_overload, termination_penalty]
   reward_weights:
     native_object_part_pose: 0.5
     native_part_surface_displacement: 1.0
@@ -151,6 +153,7 @@ rewards:
     native_source_hand_part_proximity: 0.5
     native_source_hand_part_contact: 0.5
     native_source_lift_load: 0.5
+    native_source_joint_drive: 0.35
     native_source_tip_object_bound: 0.25
     native_source_tip_position: 0.2
     native_root_pose: 0.3
@@ -185,6 +188,7 @@ rewards:
       lookahead_s: 0.10
       minimum_speed_m_s: 0.020
       separation_bound_m: 0.02
+      rotation_scale_rad: ${native_tracking_tolerances.part_rotation_error_rad}
     native_source_tip_object_bound:
       sigma_m: 0.025
     native_root_pose:
@@ -195,4 +199,4 @@ rewards:
       rotation_scale_rad: 0.3333333333333333
     native_object_articulation:
       scale_rad: 0.1
-      scale_m: null
+      scale_m: ${native_tracking_tolerances.joint_position_error_m}

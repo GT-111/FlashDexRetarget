@@ -4,6 +4,7 @@ import functools
 import inspect
 from typing import Any
 
+import torch
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from omegaconf import DictConfig, OmegaConf
 
@@ -58,6 +59,17 @@ def action_term(env: Any) -> Any:
     if len(terms) != 1:
         raise ValueError(f"expected one action term, got {list(terms)}")
     return next(iter(terms.values()))
+
+
+def contact_interval_weights(env, interval, execution):
+    """Duration weights on a complete interval ending at actual simulation time."""
+    endpoint = interval["sample_end_time_s"][:, -1] == env.scene.physics_time_s()
+    valid = (interval["sample_recorded"] & interval["clock_support"]
+             & interval["interval_complete"][:, None] & endpoint[:, None]
+             & execution[:, None])
+    duration = torch.where(valid, interval["sample_end_time_s"] - interval["sample_begin_time_s"], 0.0)
+    total = duration.sum(-1, keepdim=True)
+    return valid, (duration / torch.where(total > 0, total, torch.ones_like(total))).float()
 
 
 # Keep old name for any callers that haven't been updated yet.

@@ -136,11 +136,14 @@ class NativeResidualAction(ActionTerm):
             raise ValueError("unsupported native wrist target-twist convention")
         self._source_contact_scale = 0.
         self._source_contact_guard = None
+        self._source_contact_speed_m_s = 0.12
         self._pad_travel_m = 0.
         self._stationary_hold_force_n = 0.
         if cfg.source_contact_approach is not None:
             self._source_contact_guard = dict(cfg.source_contact_approach)
             self._source_contact_scale = self._source_contact_guard.pop("translation_m")
+            self._source_contact_speed_m_s = self._source_contact_guard.pop(
+                "max_speed_m_s", self._source_contact_speed_m_s)
             self._pad_travel_m = self._source_contact_guard.pop("pad_compression_m", 0.)
             self._stationary_hold_force_n = self._source_contact_guard.pop("stationary_hold_force_n", 0.)
             if (not 0. < self._source_contact_scale <= cfg.translation_residual_m
@@ -148,6 +151,8 @@ class NativeResidualAction(ActionTerm):
                 raise ValueError("source contact approach requires positive pose and tip bounds within the wrist budget")
             if not 0. <= self._pad_travel_m <= self._source_contact_scale:
                 raise ValueError("pad compression must be between zero and the source contact approach distance")
+            if not math.isfinite(self._source_contact_speed_m_s) or self._source_contact_speed_m_s <= 0.:
+                raise ValueError("source contact approach requires a finite positive speed")
             if not math.isfinite(self._stationary_hold_force_n) or self._stationary_hold_force_n < 0.:
                 raise ValueError("stationary hold force requires a finite nonnegative load")
         self.layout = NativeSceneCfg.from_mapping(cfg.native_scene)
@@ -320,7 +325,9 @@ class NativeResidualAction(ActionTerm):
             "backend": getattr(env.scene, "backend_identity", None),
         }
         if cfg.source_contact_approach is not None:
-            self._action_recipe["source_contact_approach"] = dict(cfg.source_contact_approach)
+            self._action_recipe["source_contact_approach"] = {
+                **cfg.source_contact_approach, "max_speed_m_s": self._source_contact_speed_m_s,
+            }
         self.ref_command_pos_used = None
 
     @property
@@ -414,6 +421,27 @@ class NativeResidualAction(ActionTerm):
         hands = [intent["metadata"]["hand_sides"].index(side) for side in self.hand_sides]
         parts = [intent["metadata"]["part_body_names"].index(part.body_name) for _, part in self.layout.part_bindings]
         roles = (intent["active"] & intent["known"])[:, hands][:, :, parts]
+        if self._pad_travel_m:
+            direction, bearing = self._compress_loaded_pads(command, ids, roles, parts, fallback, nearest)
+        else:
+            direction = fallback
+            solved = self._env.scene.hand_part_contact_facts()
+            normal = torch.stack([
+                torch.stack([
+                    solved["pairs"][f"{side}/{obj.entity_name}/{part.name}"]["normal_force_n"]
+                    for obj, part in self.layout.part_bindings
+                ], dim=-1) for side in self.hand_sides
+            ], dim=1)
+            bearing = roles & solved["measurement_support"][:, None, None] & (normal >= .08)
+        # Pose and tip proximity admit new guidance. They cannot revoke a loaded role.
+        part_columns = nearest.new_tensor(parts)
+        retained = (bearing & (self._source_contact_part[..., None] == part_columns)).any(-1)
+        retain_guide = retained & (nearest != self._source_contact_part)
+        direction = torch.where(retain_guide[..., None],
+                                self._source_contact_translation / self._source_contact_scale, direction)
+        return direction, torch.where(retain_guide, self._source_contact_part, nearest)
+
+    def _compress_loaded_pads(self, command, ids, roles, parts, fallback, nearest):
         roots = torch.stack([command.motion_lib.native_root_state_w[side][ids, :3] for side in self.hand_sides], 1)
         roots = roots + self._env.scene.env_origins[:, None]
         live = command.sim_object_part_state_w[:, parts]
@@ -443,12 +471,7 @@ class NativeResidualAction(ActionTerm):
         )
         self._source_contact_compression.lerp_(correction, .3)
         self._source_contact_compression.masked_fill_(~bearing.any(-1)[:, self._pad_command_hand], 0.)
-        # Pose and tip proximity admit new guidance. They cannot revoke a loaded role.
-        retained = (bearing & (self._source_contact_part[..., None] == part_columns)).any(-1)
-        retain_guide = retained & (nearest != self._source_contact_part)
-        direction = torch.where(retain_guide[..., None], self._source_contact_translation / self._source_contact_scale,
-                                direction)
-        return direction, torch.where(retain_guide, self._source_contact_part, nearest)
+        return direction, bearing
 
     def _supported_hold_translation(self, command, part, fallback):
         """Bound wrist motion using observed hand load on a stationary supported part."""
@@ -496,20 +519,16 @@ class NativeResidualAction(ActionTerm):
         self._processed_actions[:] = self._filter_state
         if self._source_contact_guard is not None:
             command = self._env.command_manager.get_term(self.cfg.command_name)
-            if self._pad_travel_m:
-                direction, part = self._source_loaded_approach(command)
-            else:
-                direction, part = command.source_contact_approach_direction(
-                    command._motion_flat_ids, **self._source_contact_guard)
-            changed_part = part != self._source_contact_part
-            restart = changed_part & (part >= 0) if self._pad_travel_m else changed_part
-            self._source_contact_translation.masked_fill_(restart[..., None], 0.0)
-            self._source_contact_translation.lerp_(direction * self._source_contact_scale, 0.35)
+            direction, part = self._source_loaded_approach(command)
+            desired = self._source_contact_translation.lerp(direction * self._source_contact_scale, 0.35)
             if self._source_hold_pairs:
+                changed_part = part != self._source_contact_part
                 self._source_hold_offset_m.masked_fill_(changed_part, 0.)
                 self._source_hold_force_n.masked_fill_(changed_part, 0.)
-                self._source_contact_translation.copy_(self._supported_hold_translation(
-                    command, part, self._source_contact_translation))
+                desired = self._supported_hold_translation(command, part, desired)
+            step = desired - self._source_contact_translation
+            limit = self._source_contact_speed_m_s * self._control_dt
+            self._source_contact_translation.add_(step * (limit / step.norm(dim=-1, keepdim=True).clamp_min(limit)))
             self._source_contact_part.copy_(part)
         if self.cfg.wrist_target_twist == "filtered_correction_feedforward":
             self._correction_twist[..., :3] = (

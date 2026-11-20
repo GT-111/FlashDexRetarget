@@ -1296,8 +1296,8 @@ def _wrist_control_case(widths=(("left", 5), ("right", 5)), **action_options):
     return command, env, action
 
 
-def test_native_wrist_approach_clears_when_source_pose_or_engagement_ends():
-    command, _, action = _wrist_control_case((("right", 3), ("left", 5)), translation_residual_m=.04,
+def test_native_wrist_approach_releases_from_unsupported_or_unloaded_source_parts():
+    command, env, action = _wrist_control_case((("right", 3), ("left", 5)), translation_residual_m=.04,
         source_contact_approach=dict(translation_m=.024, max_part_position_error_m=.02,
             max_part_rotation_error_rad=math.radians(20.), max_tip_distance_m=.042))
     library = command.motion_lib
@@ -1318,6 +1318,9 @@ def test_native_wrist_approach_clears_when_source_pose_or_engagement_ends():
     direction[..., 1, 0] = 1.
     support = torch.ones_like(distance, dtype=torch.bool)
     command.sdf_query_parts = lambda *args, **kwargs: (distance, direction, support)
+    pairs = {f"{hand.side}/{obj.entity_name}/{part.name}": {"normal_force_n": torch.zeros(1)}
+             for hand in command.native_layout.hands for obj, part in command.native_layout.part_bindings}
+    env.scene.hand_part_contact_facts = lambda: {"pairs": pairs, "measurement_support": torch.ones(1, dtype=torch.bool)}
     raw = torch.zeros(1, action.action_dim)
 
     def residual():
@@ -1327,32 +1330,39 @@ def test_native_wrist_approach_clears_when_source_pose_or_engagement_ends():
         assert torch.equal(installed["reference_motion_steps"], command.motion_steps)
         return installed["root_state_w"][..., :3] - command.ref_native_root_state_w[..., :3]
 
-    torch.testing.assert_close(residual()[0], torch.tensor([[-.0084, 0., 0.], [0., 0., 0.]]))
+    def released():
+        for _ in range(32):
+            remaining = residual()
+        torch.testing.assert_close(remaining, torch.zeros_like(remaining), atol=1e-6, rtol=0.)
+
+    torch.testing.assert_close(residual()[0], torch.tensor([[-.0024, 0., 0.], [0., 0., 0.]]))
     object_data.body_link_pos_w[0, 1, 2] -= .025
-    assert not residual().any()
+    released()
     object_data.body_link_pos_w.copy_(target[..., :3])
-    torch.testing.assert_close(residual()[0, 0], torch.tensor([-.0084, 0., 0.]))
+    torch.testing.assert_close(residual()[0, 0], torch.tensor([-.0024, 0., 0.]))
     object_data.body_link_quat_w[0, 1] = torch.tensor([math.cos(.2), 0., math.sin(.2), 0.])
-    assert not residual().any()
+    released()
     object_data.body_link_quat_w.copy_(target[..., 3:7])
     assert residual().any()
     distance[:, :, 1] = .05
-    assert not residual().any()
+    released()
     distance[:, :, 1] = .01
     assert residual().any()
     support[:, :, 1] = False
-    assert not residual().any()
+    released()
     support[:, :, 1] = True
     assert residual().any()
     active[1, 0, 1] = False
-    assert not residual().any()
+    released()
     active[1, 0, 1] = True
     assert residual().any()
     active[1, 0] = torch.tensor([True, False])
-    torch.testing.assert_close(residual()[0, 0], torch.tensor([0., -.0084, 0.]))
+    for _ in range(33):
+        moved = residual()
+    torch.testing.assert_close(moved[0, 0], torch.tensor([0., -.024, 0.]), atol=1e-6, rtol=0.)
     active[1, 0] = torch.tensor([False, True])
     action.reset(torch.tensor([0]))
-    torch.testing.assert_close(residual()[0, 0], torch.tensor([-.0084, 0., 0.]))
+    torch.testing.assert_close(residual()[0, 0], torch.tensor([-.0024, 0., 0.]))
     action.reset(torch.tensor([0]))
     raw[0, 0] = -1.0
     torch.testing.assert_close(residual()[0, 0], torch.tensor([-.04, 0., 0.]))
@@ -1804,7 +1814,7 @@ def _source_intent_reward_case(widths=(("right", 3), ("left", 5))):
     pairs["unrelated"] = dict(normal_force_n=torch.full((1, 2), 1e6),
         force_bearing_contact_present=torch.ones(1, 2, dtype=torch.bool),
         force_bearing_distance_max_m=torch.zeros(1, 2))
-    interval = dict(addresses=addresses, pairs=dict(reversed(tuple(pairs.items()))),
+    interval = dict(addresses=addresses, pairs=dict(reversed(tuple(pairs.items()))), num_substeps=2,
         sample_recorded=torch.ones(1, 2, dtype=torch.bool),
         measurement_support=torch.ones(1, 2, dtype=torch.bool),
         clock_support=torch.ones(1, 2, dtype=torch.bool), interval_complete=torch.ones(1, dtype=torch.bool),
@@ -1934,6 +1944,11 @@ def test_source_lift_load_uses_signed_force_across_assigned_parts_at_the_install
     value = NativeMotionTrackingRewards.native_source_lift_load
     params = dict(lookahead_s=.02, minimum_speed_m_s=.05, separation_bound_m=.02)
     assert value(env, "motion", **params).item() == pytest.approx(.625)
+    root = env.scene["renamed_item"].data.body_link_quat_w[:, 0]
+    original = root.clone()
+    root[:] = torch.tensor([0., 1., 0., 0.])
+    assert value(env, "motion", **params).item() < 0.
+    root.copy_(original)
     interval["pairs"]["arbitrary-0-0"]["force_on_second_w_n"].fill_(float("nan"))
     assert value(env, "motion", **params).item() == 0.
     interval["pairs"]["arbitrary-0-0"]["force_on_second_w_n"].fill_(1.)
@@ -1946,6 +1961,64 @@ def test_source_lift_load_uses_signed_force_across_assigned_parts_at_the_install
     parts[2, 0, 1] = .01
     interval["sample_end_time_s"][0, -1] = .04
     assert value(env, "motion", **params).item() == 0.
+
+
+def test_source_joint_drive_requires_signed_solved_effort_and_achieved_motion():
+    command, env, _, _, interval = _source_intent_reward_case()
+    obj = env.scene["renamed_item"]
+    _declare_joint_coordinates(obj, ("hinge", "slide"))
+    command._bind_native_reference()
+    ml = command.motion_lib
+    ml.native_object_joint_vel[1] = torch.tensor([
+        -.04 if name == "hinge_b" else .2 for name in ml.native_object_joint_names])
+    ml.native_object_joint_velocity_support[1] = True
+    obj.data.joint_vel[:] = torch.tensor([.1, -.04])
+    env.scene.native_object_weights_n = torch.tensor([2.])
+    for pair in interval["pairs"].values():
+        pair["joint_effort_on_second"] = torch.zeros(1, 2, 2)
+    drive = interval["pairs"]["arbitrary-0-0"]["joint_effort_on_second"]
+    drive[:] = torch.tensor([.05, -2.])
+    reward = NativeMotionTrackingRewards.native_source_joint_drive
+    assert reward(env, "motion").item() == pytest.approx(.5)
+
+    drive[0, 1] *= -1.
+    assert reward(env, "motion").item() == pytest.approx(.125)
+    obj.data.joint_vel[:, 1] *= -1.
+    assert reward(env, "motion").item() == 0.
+    obj.data.joint_vel[:, 1] *= -1.
+    drive[0, 1, 1] = torch.nan
+    assert reward(env, "motion").item() == 0.
+    drive[:] = torch.tensor([.05, -2.])
+
+    # The named source scope may select closing even when a local rate is positive.
+    ml.native_task_phases = dict(joint_declared=torch.ones(3, 2, dtype=torch.bool),
+        joint_direction=torch.tensor([[0, 0], [-1, -1], [0, 0]], dtype=torch.int8))
+    assert reward(env, "motion").item() == 0.
+    obj.data.joint_vel[:, 0] *= -1.
+    drive[..., 0] *= -1.
+    assert reward(env, "motion").item() == pytest.approx(.5)
+
+
+def test_solved_contact_observation_retains_support_and_wrist_force_direction():
+    command, env, _, _, interval = _source_intent_reward_case()
+    env.scene.gravity_up_w = torch.tensor([0., 0., 1.])
+    env.scene.native_object_weights_n = torch.tensor([2.])
+    del interval["addresses"]["unrelated"]
+    for pair in interval["pairs"].values():
+        pair["force_on_second_w_n"] = torch.tensor([[[2., 0., 1.], [2., 0., 1.]]])
+        pair["force_bearing_tangent_speed_max_m_s"] = torch.full((1, 2), .1)
+        pair["joint_effort_on_second"] = torch.zeros(1, 2, 2)
+    key = next(iter(command.native_layout.support_pair_bindings))
+    env.scene.support_contact_interval_pairs = lambda: {
+        key: {"force_on_second_w_n": torch.tensor([[[0., 0., 2.], [0., 0., 2.]]])},
+    }
+    observe = NativeMotionTrackingObs.native_solved_contact_feedback
+    observation = observe(env, "motion")
+    assert observation.shape == (1, 44)
+    torch.testing.assert_close(observation[0, :3], torch.tanh(torch.tensor([0., -1., .5])))
+    torch.testing.assert_close(observation[0, -4:], torch.tensor([math.tanh(1.), 1., 0., 0.]))
+    interval["measurement_support"][0, -1] = False
+    assert not observe(env, "motion").any()
 
 
 def test_source_approach_rewards_two_digit_groups_on_the_same_supported_part():

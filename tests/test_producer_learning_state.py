@@ -789,6 +789,34 @@ def _curriculum_step(curriculum, env, step):
     curriculum.on_step(env)
 
 
+def test_assist_waits_for_observed_clip_completions():
+    curriculum, env = _curriculum()
+    for step in range(1, 9):
+        _curriculum_step(curriculum, env, step)
+    assert curriculum.curr_gains == curriculum.init_gains
+
+    for step in range(9, 21):
+        env.termination_manager.time_outs[:] = step in (12, 20)
+        _curriculum_step(curriculum, env, step)
+        if step < 20:
+            assert curriculum.curr_gains == curriculum.init_gains
+    assert curriculum.curr_gains["kp"] < curriculum.init_gains["kp"]
+
+
+def test_assist_does_not_credit_the_horizon_as_the_source_endpoint():
+    curriculum, env = _curriculum()
+    curriculum.completion_term = "source_ended"
+    ended = torch.zeros(2, dtype=torch.bool)
+    env.termination_manager.get_term = lambda name: {"source_ended": ended}[name]
+    for step in range(1, 17):
+        env.termination_manager.time_outs[:] = step % 4 == 0
+        ended[:] = step in (12, 16)
+        _curriculum_step(curriculum, env, step)
+        if step < 16:
+            assert curriculum.curr_gains == curriculum.init_gains
+    assert curriculum.curr_gains["kp"] < curriculum.init_gains["kp"]
+
+
 def test_curriculum_dials_back_only_after_a_decay_and_poor_completion():
     curriculum, env = _curriculum()
     curriculum.dialback_min_epochs = 1
@@ -835,6 +863,7 @@ def test_hoi_zero_hold_requires_fifteen_actual_epochs_after_adaptive_decay():
     curriculum.dialback_min_epochs = 1
     curriculum.upper_ratios = dict.fromkeys(curriculum.decay_terms, 0.01)
     curriculum.kp_zero_thres = 1.0
+    env.termination_manager.time_outs[:] = True
     for step in range(1, 17):
         _curriculum_step(curriculum, env, step)
         if curriculum.has_zero_gains():
@@ -842,6 +871,7 @@ def test_hoi_zero_hold_requires_fifteen_actual_epochs_after_adaptive_decay():
     assert curriculum.has_zero_gains()
     assert curriculum.hoi_zero_receipt() is None
     first_zero_step = step
+    env.termination_manager.time_outs[:] = False
     env.termination_manager.terminated[:] = True
     for step in range(first_zero_step + 1, first_zero_step + 14 * 4 + 1):
         _curriculum_step(curriculum, env, step)

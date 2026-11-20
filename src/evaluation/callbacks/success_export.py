@@ -50,11 +50,34 @@ def _write_rollout(path: Path, arrays: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+def _measure_hoi_perturbation(arrays, plan, mode):
+    if plan["status"] != "planned":
+        return dict(status=plan["status"])
+    prefix = "applied_object_wrench_interval_"
+    support = arrays.get(prefix + "measurement_support")
+    if support is None or not support[1:].size or not support[1:].all():
+        return dict(status="no_complete_solver_wrench")
+    metadata = json.loads(str(arrays[prefix + "metadata_json"]))
+    parts = list(zip(metadata["entity_names"], metadata["part_body_names"], strict=True))
+    wrench = arrays[prefix + "substep_wrench_w"][1:].reshape(-1, len(parts), 6)
+    expected = np.zeros(wrench.shape[:-1], dtype=bool)
+    if mode == "perturbed":
+        for burst in plan["bursts"]:
+            column = parts.index((burst["entity_name"], burst["root_body_name"]))
+            begin, end = burst["start_substep"], burst["stop_substep_exclusive"]
+            if not 0 <= begin < end <= len(expected):
+                return dict(status="solver_wrench_schedule_mismatch")
+            expected[begin:end, column] = True
+    actual = np.any(wrench != 0., axis=-1)
+    return dict(status="verified" if np.array_equal(actual, expected) else "solver_wrench_schedule_mismatch",
+                planned_substep_parts=int(expected.sum()), measured_substep_parts=int(actual.sum()))
+
+
 def export_current_attempts(
     out_dir: str | Path,
     rec_cb: Any,
     rec_states: list[dict[str, Any]],
-    attempt_rows: list[dict[str, int]],
+    attempt_rows: list[dict[str, Any]],
     *,
     evaluation_id: str,
     env_step: int,
@@ -71,7 +94,7 @@ def export_current_attempts(
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=False)
-    actual: dict[int, list[dict[str, int]]] = {motion_id: [] for motion_id in range(len(motion_names))}
+    actual: dict[int, list[dict[str, Any]]] = {motion_id: [] for motion_id in range(len(motion_names))}
     for row in attempt_rows:
         actual[row["motion_id"]].append(row)
     motions = []
@@ -111,8 +134,16 @@ def export_current_attempts(
                 # All existing native facts and dtypes pass unchanged. This
                 # identity is metadata, never an inferred phase/clock or target.
                 arrays = {**arrays, "evaluation_attempt_json": np.asarray(json.dumps(identity))}
+                plan = row.get("hoi_evaluation_perturbation_plan")
+                if plan is not None:
+                    if plan["replica_index"] != replica_index:
+                        raise ValueError("HOI perturbation plan differs from its original-motion replica")
+                    arrays["hoi_evaluation_perturbation_plan_json"] = np.asarray(json.dumps(plan))
                 recording.update(_write_rollout(out_dir / relative, arrays),
                                  status="recorded", rollout=relative, reason=None)
+                if plan is not None:
+                    recording["hoi_evaluation_perturbation"] = _measure_hoi_perturbation(
+                        arrays, plan, frozen_authority["hoi_qualification"]["mode"])
             entry["recording"] = recording
             attempts.append(entry)
         motions.append({"motion_id": motion_id, "motion_name": motion_name, "attempts": attempts})

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import math
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import cached_property
+from random import Random
 
+import numpy as np
 import torch
 from mjlab.managers import CommandTerm
 from mjlab.utils.lab_api.math import quat_apply_inverse
@@ -15,6 +18,8 @@ from envs.scene.native import NativeSceneCfg
 
 from .motion_tracking import MotionTrackingCommand
 from .motion_tracking_cfg import MotionTrackingCommandCfg
+
+_PERTURBATION_PHASES = {"interaction", "opening", "closing", "articulate", "hold", "lift", "carry", "support_transfer"}
 
 
 @dataclass
@@ -299,6 +304,18 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             "velocity": ml.native_object_joint_vel[ids][..., columns],
             "position_support": ml.native_object_joint_position_support[ids][..., columns],
             "velocity_support": ml.native_object_joint_velocity_support[ids][..., columns],
+        }
+
+    def task_phase_reference(self, ids):
+        """Declared interaction on the exact consumed source frame, in native scene order."""
+        facts = getattr(self.motion_lib, "native_task_phases", None)
+        if facts is None:
+            return None
+        source_objects = tuple(self.motion_lib.native_object_root_body_names)
+        columns = [source_objects.index(obj.entity_name) for obj in self.native_layout.objects]
+        return {
+            field: values[ids][:, self._object_joint_columns if field.startswith("joint_") else columns]
+            for field, values in facts.items()
         }
 
     @property
@@ -822,7 +839,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             (self.num_envs, len(self.native_layout.objects), 6), device=self.device,
         )
         self._assist_perturb_active = torch.zeros_like(self._assist_perturb_wrench[..., 0], dtype=torch.bool)
-        self._eval_hoi_perturbed = False
+        self.hoi_evaluation_mode = None
         self._perturb_inverse_inertia_body = None
         perturb = getattr(self.cfg.object, "perturb", None)
         if perturb is not None and perturb.enabled:
@@ -862,10 +879,109 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         elapsed_ns = ml.native_time_ns[:, None] - ml.native_time_ns[start]
         return active & (elapsed_ns >= self._perturb_lag_ns)
 
-    def enable_hoi_evaluation_perturbation(self):
+    def enable_hoi_evaluation_perturbation(self, mode):
         if not self._eval_mode or self.cfg.object.pin_objects or not self.cfg.object.perturb.enabled:
             raise ValueError("HOI perturbation evaluation needs unassisted eval with authored disturbances")
-        self._eval_hoi_perturbed = True
+        if mode not in ("nominal", "perturbed"):
+            raise ValueError("HOI evaluation requires nominal or perturbed mode")
+        perturb = self.cfg.object.perturb
+        if (not 0. <= perturb.continue_prob <= 1.
+                or not all(math.isfinite(scale) and scale >= 0. for scale in (perturb.force_scale, perturb.torque_scale))
+                or not (perturb.force_scale or perturb.torque_scale)):
+            raise ValueError("HOI qualification requires positive finite disturbance amplitude and a burst duration")
+        self.hoi_evaluation_mode = mode
+        self._assist_eval_start = torch.zeros_like(self._assist_perturb_active, dtype=torch.int64)
+        self._assist_eval_stop = torch.zeros_like(self._assist_eval_start)
+        self._assist_eval_wrench = torch.zeros_like(self._assist_perturb_wrench)
+        self._assist_eval_tick = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+
+    def plan_hoi_evaluation_attempts(self, env_ids, replica_indices):
+        """Assign each evaluated original motion a fixed, recorded disturbance from its reset."""
+        ml, perturb = self.motion_lib, self.cfg.object.perturb
+        control_ns = round(self._env.step_dt * 1e9)
+        physics_ns = round(self._env.physics_dt * 1e9)
+        substeps, clock_remainder = divmod(control_ns, physics_ns)
+        if clock_remainder or substeps < 1:
+            raise ValueError("HOI perturbation requires an integer solver/control clock")
+        self._assist_eval_start.zero_()
+        self._assist_eval_stop.zero_()
+        self._assist_eval_wrench.zero_()
+        self._assist_eval_tick.zero_()
+        intent = ml.native_source_hand_part_intent
+        role_active = (intent["active"] & intent["known"]).detach().cpu().numpy()
+        source_frames = intent["source_frame_index"].detach().cpu().numpy()
+        root_gate = (self._perturb_source_gate
+                     & ml.native_object_part_pose_support[:, self._object_root_columns]).detach().cpu().numpy()
+        motion_starts = ml.length_starts.tolist()
+        motion_lengths = ml._motion_num_frames.tolist()
+        receipts = []
+        motion_ids = self.motion_ids[env_ids].tolist()
+        first_steps = self.motion_steps[env_ids].tolist()
+        for env_id, motion, first_step, replica in zip(env_ids.tolist(), motion_ids, first_steps, replica_indices, strict=True):
+            source = ml.source_lineage[motion]
+            original = source["selected_source_frame_index"]
+            identity = {key: source[key] for key in ("source_id", "source_revision", "source_unit_id")}
+            identity.update(prepared_name=ml.motion_files[motion].rsplit("#", 1)[-1],
+                            source_frame_range_inclusive=[int(original[0]), int(original[-1])], replica_index=int(replica))
+            start = motion_starts[motion]
+            # Reset metrics can advance the command once before the first control solve.
+            length = motion_lengths[motion]
+            rows = slice(start + first_step, start + min(length, length - 1 + first_step))
+            frames = source_frames[rows]
+            eligible = root_gate[rows] & (np.arange(len(frames))[:, None] * control_ns >= self._perturb_lag_ns)
+            phases = source.get("processing", {}).get("source_task_phases", ())
+            provenance = getattr(ml, "native_reference_provenance", None)
+            objects = {} if provenance is None else provenance[motion].get("objects", {})
+            bursts = []
+            for column, binding in enumerate(self.native_layout.objects):
+                entity = binding.entity_name
+                raw_id = objects.get(entity, {}).get("object_id", entity)
+                windows = []
+                for phase in (phases or (None,)):
+                    mask = eligible[:, column].copy()
+                    if phase is not None:
+                        if (phase["kind"] not in _PERTURBATION_PHASES
+                                or phase.get("object_id", raw_id) != raw_id):
+                            continue
+                        first, stop = phase["source_frame_range_half_open"]
+                        mask &= (frames >= first) & (frames < stop)
+                        if (side := phase.get("hand_side")) is not None:
+                            part_columns = self._object_part_columns[entity]
+                            hand = ml.hand_sides.index(side)
+                            mask &= role_active[rows, hand][:, part_columns].any(axis=1)
+                    steps = np.flatnonzero(mask)
+                    for run in np.split(steps, np.flatnonzero(np.diff(steps) != 1) + 1):
+                        if len(run):
+                            windows.append((int(run[0]), int(run[-1]) + 1, phase))
+                if not windows:
+                    continue
+                windows.sort(key=lambda window: (window[0], window[1], json.dumps(window[2], sort_keys=True)))
+                rng = Random(json.dumps([identity, entity], sort_keys=True, separators=(",", ":")))
+                begin, end, phase = rng.choice(windows)
+                clock_capacity = (end - begin) * substeps
+                duration = clock_capacity if perturb.continue_prob == 1. else min(
+                    clock_capacity, round(1. / (1. - perturb.continue_prob)))
+                begin_tick = begin * substeps + rng.randrange(clock_capacity - duration + 1)
+                if phase is None:
+                    phase = dict(kind="source_contact_support", authority="prepared_source_hand_part_intent",
+                                 source_frame_range_half_open=[int(frames[begin]), int(frames[end - 1]) + 1])
+                vectors = []
+                for scale in (perturb.force_scale, perturb.torque_scale):
+                    direction = [rng.gauss(0., 1.) for _ in range(3)]
+                    vectors.append([value * scale / math.hypot(*direction) for value in direction])
+                force, torque = vectors
+                stop_tick = begin_tick + duration
+                self._assist_eval_start[env_id, column] = begin_tick
+                self._assist_eval_stop[env_id, column] = stop_tick
+                self._assist_eval_wrench[env_id, column] = torch.tensor(force + torque, device=self.device)
+                bursts.append(dict(entity_name=entity, root_body_name=binding.root_body_name, phase=phase,
+                                   start_substep=begin_tick, stop_substep_exclusive=stop_tick,
+                                   force_world_n=force, requested_torque_world_nm=torque))
+            receipts.append(dict(schema="native_hoi_evaluation_perturbation_v1", **identity,
+                                 control_period_ns=control_ns, physics_period_ns=physics_ns,
+                                 first_reference_motion_step=first_step,
+                                 status="planned" if bursts else "no_usable_source_phase", bursts=bursts))
+        return receipts
 
     def _object_tracking_wrench(self, state, support):
         from .objects.assist import object_pose_pd_wrench
@@ -931,7 +1047,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
 
     def _apply_object_assist(self, *, advance_perturbation=False):
         pin = self.cfg.object.pin_objects
-        eval_perturbed = self._eval_hoi_perturbed and self._eval_mode
+        eval_perturbed = self.hoi_evaluation_mode == "perturbed" and self._eval_mode
         if not pin and not eval_perturbed:
             self._assist_force_w.zero_()
             self._assist_torque_w.zero_()
@@ -949,23 +1065,29 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             torque = torch.zeros_like(self._assist_torque_w)
         perturb = self.cfg.object.perturb
         if advance_perturbation and perturb.enabled and (zero_gains or eval_perturbed):
-            active = self._assist_perturb_active
             columns = self._object_root_columns
-            reset_elapsed_ns = self._env.episode_length_buf * round(self._env.step_dt * 1e9)
-            eligible = (self._perturb_source_gate[self._motion_flat_ids] & support[:, columns]
-                        & (reset_elapsed_ns[:, None] >= self._perturb_lag_ns))
-            u = torch.rand(active.shape, device=self.device)
-            start = eligible & ~active & (u < float(perturb.start_prob))
-            active.copy_(start | (eligible & active & (u < float(perturb.continue_prob))))
-            wrench = self._assist_perturb_wrench
-            if start.any():
-                count = int(start.sum().item())
-                direction = torch.randn((count, 2, 3), device=self.device, dtype=force.dtype)
-                direction /= direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                direction[..., 0, :] *= float(perturb.force_scale)
-                direction[..., 1, :] *= float(perturb.torque_scale)
-                wrench[start] = direction.flatten(-2)
-            wrench[~active] = 0.0
+            if eval_perturbed:
+                tick = self._assist_eval_tick[:, None]
+                active = (tick >= self._assist_eval_start) & (tick < self._assist_eval_stop)
+                wrench = torch.where(active[..., None], self._assist_eval_wrench, 0.)
+                self._assist_eval_tick += 1
+            else:
+                active = self._assist_perturb_active
+                reset_elapsed_ns = self._env.episode_length_buf * round(self._env.step_dt * 1e9)
+                eligible = (self._perturb_source_gate[self._motion_flat_ids] & support[:, columns]
+                            & (reset_elapsed_ns[:, None] >= self._perturb_lag_ns))
+                u = torch.rand(active.shape, device=self.device)
+                start = eligible & ~active & (u < float(perturb.start_prob))
+                active.copy_(start | (eligible & active & (u < float(perturb.continue_prob))))
+                wrench = self._assist_perturb_wrench
+                if start.any():
+                    count = int(start.sum().item())
+                    direction = torch.randn((count, 2, 3), device=self.device, dtype=force.dtype)
+                    direction /= direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                    direction[..., 0, :] *= float(perturb.force_scale)
+                    direction[..., 1, :] *= float(perturb.torque_scale)
+                    wrench[start] = direction.flatten(-2)
+                wrench[~active] = 0.0
             # One independent wrench per FREE object, regardless of its passive part count.
             force[:, columns] += wrench[..., :3]
             disturbance_torque = wrench[..., 3:]
@@ -1031,6 +1153,9 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                       self._assist_clock_support, self._assist_perturb_active):
             value[rows] = False
         self._assist_sample_time_s[rows] = float("nan")
+        if self.hoi_evaluation_mode is not None:
+            for value in (self._assist_eval_start, self._assist_eval_stop, self._assist_eval_wrench, self._assist_eval_tick):
+                value[rows] = 0
 
     def _init_object_sdf(self, cfg):
         from utils.sdf import bake_object_sdf_grid

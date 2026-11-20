@@ -83,6 +83,28 @@ def _reader(path, *, joint_names=("left_a", "left_mimic", "right_b")):
     return module.MotionLibrary(str(path), robot, finger_names=C.FINGERS, device="cpu")
 
 
+def test_source_task_directions_follow_original_frame_scope_after_crop(tmp_path):
+    clip = _clip()
+    clip["source_query_ordinal"] = np.array((.2, 1.5, 2.))
+    clip["native_reference"]["provenance"]["source"] = dict(
+        selected_source_frame_index=[10, 40, 53],
+        prepared_source_ordinal=clip["source_query_ordinal"].tolist(),
+        processing=dict(task_phases=[
+            dict(kind="articulate", joint_name="hinge_b", native_direction=1,
+                 requested_progress=.3, source_frame_range_half_open=[10, 11]),
+            dict(kind="articulate", joint_name="hinge_b", native_direction=-1,
+                 requested_progress=.3, source_frame_range_half_open=[40, 41]),
+            dict(kind="lift", entity_name="articulated_object", requested_progress=.12,
+                 source_frame_range_half_open=[40, 54]),
+        ]),
+    )
+    library = _reader(_pack(tmp_path, _crop(clip, 1)))
+    phases = library.native_task_phases
+    assert phases["joint_direction"].tolist() == [[-1, 0], [0, 0]]
+    assert phases["joint_declared"].tolist() == [[True, False], [True, False]]
+    assert phases["lift"].tolist() == [[True], [True]]
+
+
 def _with_source_point_support(clip):
     native = clip["native_reference"]
     native["source_point_names"], native["source_point_position_support"] = {}, {}

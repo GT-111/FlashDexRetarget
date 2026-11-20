@@ -184,18 +184,26 @@ class MjWarpPlant(NativePlant):
         active = (wp.to_torch(self._contact_ids) < wp.to_torch(data.nacon)[0]) & geom.ge(0).all(-1)
         body = self._geom_body[geom.clamp(0, self.model.ngeom - 1)]
         world = wp.to_torch(data.contact.worldid).long()
-        contact_force = wp.to_torch(self._contact_forces)[:, :3]
-        normal = contact_force[:, 0].clamp_min(0)
+        contact_wrench = wp.to_torch(self._contact_forces)
+        normal = contact_wrench[:, 0].clamp_min(0)
         frame = wp.to_torch(data.contact.frame)
-        force_w = (frame.transpose(-2, -1) @ contact_force[..., None]).squeeze(-1)
+        force_w = (frame.transpose(-2, -1) @ contact_wrench[:, :3, None]).squeeze(-1)
         distance = wp.to_torch(data.contact.dist).abs()
+        rows = world.clamp(0, self.num_envs - 1)
+        if self.hand_part_feedback_dofs:
+            point = wp.to_torch(data.contact.pos)
+            cvel = wp.to_torch(data.cvel)[rows[:, None], body]
+            centers = wp.to_torch(data.subtree_com)[rows[:, None], self._body_root[body]]
+            linear, _ = body_origin_velocity(cvel, point[:, None], centers)
+            relative = linear[:, 1] - linear[:, 0]
+            slip = ((frame[:, 1:] @ relative[..., None]).squeeze(-1)).norm(dim=-1)
+            couple_w = (frame.transpose(-2, -1) @ contact_wrench[:, 3:, None]).squeeze(-1)
         for name, (first, second) in self.contact_pairs.items():
             a = torch.as_tensor(first, device=self.device)
             b = torch.as_tensor(second, device=self.device)
             forward = torch.isin(body[:, 0], a) & torch.isin(body[:, 1], b)
             reverse = torch.isin(body[:, 0], b) & torch.isin(body[:, 1], a)
             selected = active & (forward | reverse)
-            rows = world.clamp(0, self.num_envs - 1)
             facts = self.contact_facts[name]
             facts["normal_force_n"].zero_().scatter_add_(0, rows, torch.where(selected, normal, 0))
             bearing = selected & (normal > 0)
@@ -208,12 +216,37 @@ class MjWarpPlant(NativePlant):
             facts["force_bearing_contact_present"].copy_(present > 0)
             facts["force_bearing_distance_max_m"].zero_().scatter_reduce_(0, rows, torch.where(bearing, distance, 0), reduce="amax")
             facts["force_bearing_distance_max_m"].masked_fill_(present == 0, float("nan"))
+            if name in self.hand_part_feedback_dofs:
+                speed = facts["force_bearing_tangent_speed_max_m_s"]
+                speed.zero_().scatter_reduce_(0, rows, torch.where(bearing, slip, 0.0), reduce="amax")
+                speed.masked_fill_(present == 0, torch.nan)
+                dof_list = self.hand_part_feedback_dofs[name]
+                if dof_list:
+                    self._read_joint_contact_effort(
+                        facts["joint_effort_on_second"], dof_list, point, rows, body,
+                        forward, bearing, force_on_second, couple_w,
+                    )
         self.contact_support[:] = True
         interval = self.contact_interval
         if self._contact_differential_dofs is not None and (
             interval is None or not interval._active or interval._count + 1 == interval.num_substeps
         ):
             self._retain_contact_differential()
+
+    def _read_joint_contact_effort(self, out, dof_list, point, rows, body, forward, bearing, force, couple_w):
+        import mujoco
+
+        read, data, model = self._wp.to_torch, self._data, self._model
+        dofs = torch.as_tensor(dof_list, device=self.device)
+        joints = read(model.dof_jntid).long()[dofs]
+        slide = read(model.jnt_type)[joints] == int(mujoco.mjtJoint.mjJNT_SLIDE)
+        axes, anchors = (read(field)[rows[:, None], joints] for field in (data.xaxis, data.xanchor))
+        second = torch.where(forward, body[:, 1], body[:, 0])
+        supported = bearing[:, None] & read(model.body_isdofancestor)[second][:, dofs].bool()
+        couple = torch.where(forward[:, None], couple_w, -couple_w)
+        moment = torch.linalg.cross(point[:, None] - anchors, force[:, None]) + couple[:, None]
+        effort = (axes * torch.where(slide[None, :, None], force[:, None], moment)).sum(-1)
+        out.zero_().scatter_add_(0, rows[:, None].expand_as(effort), torch.where(supported, effort, 0.0))
 
     def configure_contact_differential(self, native_dof_ids):
         self._contact_differential_dofs = native_dof_ids

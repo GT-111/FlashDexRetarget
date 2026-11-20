@@ -47,10 +47,9 @@ def _recorded_wrench_summary(outcome_dir):
     report, = outcome_dir.glob("current-policy-*.json")
     outcome = json.loads(report.read_text())
     manifest = (outcome_dir / outcome["factual_recording_manifest"]).resolve()
-    records = [
-        attempt["recording"].get("applied_wrench_interval")
-        for motion in json.loads(manifest.read_text())["motions"] for attempt in motion["attempts"]
-    ]
+    recordings = [attempt["recording"] for motion in json.loads(manifest.read_text())["motions"]
+                  for attempt in motion["attempts"]]
+    records = [recording.get("applied_wrench_interval") for recording in recordings]
     measured = [record for record in records if record is not None]
     complete = bool(records and len(measured) == len(records) and all(record["complete"] for record in measured))
     measured_intervals = sum(record["measured_intervals"] for record in measured)
@@ -60,6 +59,16 @@ def _recorded_wrench_summary(outcome_dir):
         status = "MEASURED_PARTIAL_POST_SOLVE" if measured_intervals else "MEASURED_NO_SUPPORTED_STEPS"
     else:
         status = "MEASURED_ZERO_POST_SOLVE" if force == 0.0 and torque == 0.0 else "MEASURED_NONZERO_POST_SOLVE"
+    qualification = outcome.get("frozen_authority", {}).get("hoi_qualification")
+    schedule = {}
+    if qualification is not None:
+        proof = [row.get("hoi_evaluation_perturbation", {}) for row in recordings]
+        schedule = {
+            "verified_perturbation_attempts": sum(row.get("status") == "verified" for row in proof),
+            "unusable_source_phases": sum(row.get("status") == "no_usable_source_phase" for row in proof),
+        }
+        if schedule["verified_perturbation_attempts"] != len(recordings):
+            status = "MEASURED_INCOMPLETE_DETERMINISTIC_PERTURBATION"
     return status, {
         "manifest": str(manifest),
         "attempts": len(records),
@@ -67,6 +76,7 @@ def _recorded_wrench_summary(outcome_dir):
         "measured_intervals": measured_intervals,
         "max_force_n": force,
         "max_torque_nm": torque,
+        **schedule,
     }
 
 
@@ -173,8 +183,8 @@ def run(args: argparse.Namespace) -> None:
             authority["configured_disable_object_pin"] = bool(cfg.eval.env.disable_object_pin)
             authority["pin_before_eval"] = bool(command.cfg.object.pin_objects)
             eval_env.enter_eval()
-            if qualification_mode == "perturbed":
-                command.enable_hoi_evaluation_perturbation()
+            if qualification_mode is not None:
+                command.enable_hoi_evaluation_perturbation(qualification_mode)
             authority["pin_during_eval"] = bool(command.cfg.object.pin_objects)
             authority["shared_eval_wrench_clear"] = "Ordinary enter_eval called its existing object-wrench clear; this is a submitted clear, not force measurement."
             authority["evaluation_plan"] = {

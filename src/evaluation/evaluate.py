@@ -5,6 +5,7 @@ import math
 import os
 import tempfile
 import traceback
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -217,7 +218,7 @@ def write_current_policy_outcomes(
 # ─── rollout ───────────────────────────────────────────────────────────────────
 def _rollout(
     agent: Policy, eval_env: RslRlVecEnvWrapper, callbacks: list, device: str,
-    *, attempt_rows: list[dict[str, int]] | None = None,
+    *, attempt_rows: list[dict[str, Any]] | None = None,
     states: dict[int, list] | None = None,
 ) -> dict[int, list]:
     """Reset + deterministic inference over every eval batch;
@@ -227,6 +228,7 @@ def _rollout(
     metric_cbs = [cb for cb in callbacks if hasattr(cb, "reduce_state")]
     eval_k, num_motions = raw_eval.eval_k, raw_eval.eval_num_motions
     states = {id(cb): [] for cb in metric_cbs} if states is None else states
+    replica_counts = Counter()
     try:
         with torch.no_grad():
             for b in range(raw_eval.eval_num_batches):
@@ -245,9 +247,17 @@ def _rollout(
                     selected = (torch.arange(raw_eval.num_envs, device=raw_eval.device) if active_mask is None
                                 else torch.nonzero(active_mask, as_tuple=False).flatten())
                     motion_ids = command.motion_ids[selected].detach().cpu().tolist()
-                    for env_index, motion_id in zip(selected.detach().cpu().tolist(), motion_ids, strict=True):
+                    replicas = []
+                    for motion in motion_ids:
+                        replicas.append(replica_counts[motion])
+                        replica_counts[motion] += 1
+                    plans = ([None] * len(motion_ids) if getattr(command, "hoi_evaluation_mode", None) is None
+                             else command.plan_hoi_evaluation_attempts(selected, replicas))
+                    for env_index, motion_id, plan in zip(selected.detach().cpu().tolist(), motion_ids, plans, strict=True):
                         attempt_rows.append({"evaluation_row": len(attempt_rows), "batch_index": b,
                                              "env_index": int(env_index), "motion_id": int(motion_id)})
+                        if plan is not None:
+                            attempt_rows[-1]["hoi_evaluation_perturbation_plan"] = plan
                 completed = False
                 try:
                     for _ in range(n_steps):

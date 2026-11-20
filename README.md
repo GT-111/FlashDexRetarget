@@ -503,6 +503,13 @@ Native object disturbances use known source hand-part engagement. An object's
 burst can start after its configured engagement lag and the same delay after
 reset. The wrench acts on its FREE root and clears when source engagement
 ends. This also covers objects manipulated on a support surface.
+Training samples Markov bursts. Frozen HOI qualification assigns a fixed burst
+to each eligible FREE root using the original prepared window, named object and
+replica ordinal. It limits each burst to supported source action or contact
+phases and keeps batching and motion order out of the draw. Both takes store the
+same plan. Nominal measures zero disturbance and perturbed must measure the
+planned named roots and solved substeps. A motion without a usable phase
+retains an explicit unqualified result.
 Each burst applies 1.5 N of force and up to 0.03 N·m of directed torque. At
 each substep, the struck root's installed COM inertia and current orientation
 bound the torque's angular acceleration contribution to 1000 rad/s².

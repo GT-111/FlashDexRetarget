@@ -186,11 +186,11 @@ def test_native_assist_uses_named_parts_preserves_passive_hinge_and_clears_eval_
     assert command._assist_submission_support.tolist() == [False, True]
 
 
-def test_native_eval_perturbs_only_free_root_and_resets_disturbance_carry(tmp_path):
+def test_native_training_perturbs_only_free_root_and_resets_disturbance_carry(tmp_path):
     command, env, plant, model = _native_assist(tmp_path)
     command._object_root_columns = torch.tensor([0])
-    command._eval_mode = True
-    command.cfg.object.pin_objects = False
+    command._eval_mode = False
+    command._xfrc_curr_ctrl = SimpleNamespace(has_zero_gains=lambda: True)
     perturb = command.cfg.object.perturb
     perturb.enabled, perturb.start_prob, perturb.gate_lag_s = True, 1.0, 0.0
     perturb.force_scale, perturb.torque_scale = 1.5, 0.03
@@ -201,7 +201,6 @@ def test_native_eval_perturbs_only_free_root_and_resets_disturbance_carry(tmp_pa
     active = torch.ones(2, 2, 2, dtype=torch.bool)
     ml.native_source_hand_part_intent = dict(active=active, known=active.clone())
     command._init_native_object_assist()
-    command.enable_hoi_evaluation_perturbation()
     command.apply_substep()
 
     root = model.body("base").id
@@ -213,12 +212,13 @@ def test_native_eval_perturbs_only_free_root_and_resets_disturbance_carry(tmp_pa
     assert plant.external_body_wrench_w[1, root].any()
 
 
-def test_native_eval_disturbs_only_the_source_engaged_object_after_lag():
+def test_native_training_disturbs_only_the_source_engaged_object_after_lag():
     command, env, calls = _command()
     _add_loose_object(command, env, calls)
-    command.cfg.object = ObjectCfg(pin_objects=False)
+    command.cfg.object = ObjectCfg(pin_objects=True)
     command._init_object_assist()
-    command._eval_mode = True
+    command._eval_mode = False
+    command._xfrc_curr_ctrl = SimpleNamespace(has_zero_gains=lambda: True)
     perturb = command.cfg.object.perturb
     perturb.enabled, perturb.start_prob, perturb.continue_prob = True, 1.0, 1.0
     perturb.gate_lag_s, perturb.force_scale, perturb.torque_scale = .02, 1.5, .03
@@ -238,7 +238,6 @@ def test_native_eval_disturbs_only_the_source_engaged_object_after_lag():
         obj.write_external_wrench_to_sim = lambda f, t, *, body_ids, name=name: submitted.update(
             {name: torch.cat((f, t), -1).clone()})
     command._init_native_object_assist()
-    command.enable_hoi_evaluation_perturbation()
 
     for frame, expected in enumerate(((False, False), (True, False), (False, True))):
         command.motion_steps[:] = frame
@@ -261,9 +260,10 @@ def test_native_perturbation_preserves_linear_force_and_bounds_root_angular_acce
     command, env, calls = _command()
     heavy = _add_loose_object(command, env, calls)
     light = env.scene["object"]
-    command.cfg.object = ObjectCfg(pin_objects=False)
+    command.cfg.object = ObjectCfg(pin_objects=True)
     command._init_object_assist()
-    command._eval_mode = True
+    command._eval_mode = False
+    command._xfrc_curr_ctrl = SimpleNamespace(has_zero_gains=lambda: True)
     perturb = command.cfg.object.perturb
     perturb.enabled, perturb.start_prob, perturb.continue_prob, perturb.gate_lag_s = True, 1., 1., 0.
     perturb.force_scale, perturb.torque_scale = 1.5, .03
@@ -287,7 +287,6 @@ def test_native_perturbation_preserves_linear_force_and_bounds_root_angular_acce
     directions = torch.tensor([[1., -2., 3.], [0., 1., .5]])
     monkeypatch.setattr(torch, "randn", lambda size, **kwargs: directions.expand(size).clone())
     command._init_native_object_assist()
-    command.enable_hoi_evaluation_perturbation()
     command.apply_substep()
 
     expected_force = directions[0] * (1.5 / directions[0].norm())
@@ -308,6 +307,80 @@ def test_native_perturbation_preserves_linear_force_and_bounds_root_angular_acce
     perturb.start_prob = 0.
     command.apply_substep()
     torch.testing.assert_close(submitted["object"][0, 0, 3:], full_torque)
+
+
+def test_native_pair_plans_are_stable_for_source_roles_across_batches(tmp_path):
+    command, env, plant, model = _native_assist(tmp_path)
+    command._object_root_columns = torch.tensor([0])
+    command._eval_mode = True
+    command.cfg.object.pin_objects = False
+    env.physics_dt = .005
+    env.episode_length_buf = torch.zeros(2, dtype=torch.long)
+    perturb = command.cfg.object.perturb
+    perturb.enabled, perturb.start_prob, perturb.continue_prob, perturb.gate_lag_s = True, 0., .5, .02
+    perturb.force_scale = 1.5
+    ml = command.motion_lib
+    rows = 8
+    ml.length_starts = torch.tensor([0, rows])
+    ml._motion_num_frames = torch.tensor([rows, rows])
+    ml.num_trajectories = 2
+    ml.motion_files = ["anywhere/motion.pt#one", "elsewhere/motion.pt#two"]
+    ml.hand_sides = ("left", "right")
+    ml.native_time_ns = (torch.arange(rows) * 20_000_000).repeat(2)
+    ml.native_object_part_pose_support = torch.ones(2 * rows, 2, dtype=torch.bool)
+    ml.native_object_part_linear_velocity_support = torch.zeros_like(ml.native_object_part_pose_support)
+    ml.native_object_part_angular_velocity_support = torch.zeros_like(ml.native_object_part_pose_support)
+    engaged = torch.zeros(2 * rows, 2, 2, dtype=torch.bool)
+    engaged[:, 0, 1] = True     # Movable body has a hand role, FREE root takes the disturbance.
+    source_frames = torch.arange(100, 100 + rows)
+    ml.native_source_hand_part_intent = dict(
+        active=engaged, known=engaged.clone(), source_frame_index=source_frames.repeat(2))
+    ml.source_lineage = [
+        dict(source_id="source", source_revision="release", source_unit_id=f"capture_{index}",
+             selected_source_frame_index=source_frames.tolist(), processing=dict(source_task_phases=[
+                 dict(kind=phase, source_frame_range_half_open=[103, 106], authority="annotated", hand_side="left")
+             ])) for index, phase in enumerate(("interaction", "retreat"))]
+    command._init_native_object_assist()
+    command.enable_hoi_evaluation_perturbation("perturbed")
+    command.motion_ids[:] = torch.tensor([0, 1])
+    command.motion_steps[:] = 1
+    first, unusable = command.plan_hoi_evaluation_attempts(torch.tensor([0, 1]), [0, 0])
+    assert unusable["status"] == "no_usable_source_phase" and not unusable["bursts"]
+    burst, = first["bursts"]
+    assert burst["root_body_name"] == "base"
+    assert burst["phase"] == ml.source_lineage[0]["processing"]["source_task_phases"][0]
+    assert first["first_reference_motion_step"] == 1
+    assert 8 <= burst["start_substep"] < burst["stop_substep_exclusive"] <= 20
+
+    applied = []
+    for control in range(rows - 1):
+        command.motion_steps[:] = control + 1
+        env.episode_length_buf[:] = control
+        for _ in range(4):
+            command.apply_substep()
+            applied.append(plant.external_body_wrench_w[:, model.body("base").id].clone())
+            assert not plant.external_body_wrench_w[:, model.body("lid").id].any()
+    acquired = torch.stack(applied)
+    assert not acquired[:, 1].any()
+    corrected = torch.nonzero(acquired[:, 0].any(-1), as_tuple=False).flatten().tolist()
+    assert corrected == list(range(burst["start_substep"], burst["stop_substep_exclusive"]))
+    torch.testing.assert_close(acquired[corrected, 0, :3], torch.tensor(burst["force_world_n"]).expand(len(corrected), 3))
+
+    command.clear_object_wrenches()
+    command.motion_ids[:] = torch.tensor([1, 0])
+    command.motion_steps[:] = 1
+    second, = command.plan_hoi_evaluation_attempts(torch.tensor([1]), [0])
+    replica, = command.plan_hoi_evaluation_attempts(torch.tensor([1]), [1])
+    assert second == first
+    assert replica["replica_index"] == 1 and replica["bursts"] != first["bursts"]
+
+    command.enable_hoi_evaluation_perturbation("nominal")
+    nominal, = command.plan_hoi_evaluation_attempts(torch.tensor([1]), [0])
+    assert nominal == first
+    command._assist_eval_tick[1] = burst["start_substep"]
+    command.motion_steps[1] = 1 + burst["start_substep"] // 4
+    command.apply_substep()
+    assert not plant.external_body_wrench_w.any()
 
 
 def test_unsupported_object_rates_do_not_add_velocity_drag(tmp_path, monkeypatch):

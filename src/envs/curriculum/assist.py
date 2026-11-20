@@ -242,17 +242,16 @@ class XfrcAssistCurriculum:
             k: self._epoch_rew_sum[k] / self._epoch_steps for k in self.reward_terms
         }
 
-        # An epoch without resets counts as fully completed, so it never blocks the decay.
         achieved_length = (
-            float(np.mean(self._epoch_achieved)) if self._epoch_achieved else 0.0
+            float(np.mean(self._epoch_achieved)) if self._epoch_achieved else None
         )
         total_resets = self._epoch_timeout + self._epoch_terminated
         completion_rate = (
-            self._epoch_timeout / total_resets if total_resets > 0 else 1.0
+            self._epoch_timeout / total_resets if total_resets else None
         )
 
         self._update_progress(reward, achieved_length, completion_rate)
-        self._set_curriculum(env, epoch_num)
+        self._set_curriculum(epoch_num, observed_completion=completion_rate is not None)
 
         self._epoch_rew_sum = {k: 0.0 for k in self.reward_terms}
         self._epoch_steps = 0
@@ -265,14 +264,13 @@ class XfrcAssistCurriculum:
             self._epoch_rew_sum[k] += v
         self._epoch_steps += 1
 
-        # Completed = time-out or completion_term; any other termination failed.
+        # A configured clip endpoint distinguishes an actual finish from the time limit.
         tm = getattr(env, "termination_manager", None)
         if tm is not None:
-            done_ok = tm.time_outs
-            if self.completion_term is not None:
-                done_ok = done_ok | tm.get_term(self.completion_term)
+            ended = tm.time_outs | tm.terminated
+            done_ok = tm.time_outs if self.completion_term is None else tm.get_term(self.completion_term)
             self._epoch_timeout += int(done_ok.sum().item())
-            self._epoch_terminated += int((tm.terminated & ~done_ok).sum().item())
+            self._epoch_terminated += int((ended & ~done_ok).sum().item())
 
         # An env whose length dropped just reset: its previous length is one episode.
         ep_len = env.episode_length_buf
@@ -286,12 +284,14 @@ class XfrcAssistCurriculum:
     # ── decay / dial-back ────────────────────────────────────────────────
 
     def _update_progress(
-        self, rewards: dict, achieved_length: float, completion_rate: float
+        self, rewards: dict, achieved_length: float | None, completion_rate: float | None
     ) -> None:
         for k, val in rewards.items():
             self.rew_deques[k].append(val)
-        self.ep_lens.append(achieved_length)
-        self.completion_rates.append(completion_rate)
+        if achieved_length is not None:
+            self.ep_lens.append(achieved_length)
+        if completion_rate is not None:
+            self.completion_rates.append(completion_rate)
 
     def _determine_decay(self, epoch_num: int) -> bool:
         reduce_gains = True
@@ -353,7 +353,7 @@ class XfrcAssistCurriculum:
                 for k in self.decay_terms:
                     self.curr_gains_lower[k] = 0.0
 
-    def _set_curriculum(self, env: "ManagerBasedRlEnv", epoch_num: int) -> None:
+    def _set_curriculum(self, epoch_num: int, *, observed_completion: bool) -> None:
         self.num_epoch_since_last_decay += 1
         self._last_decayed = False
 
@@ -363,6 +363,8 @@ class XfrcAssistCurriculum:
             for k in self.decay_terms:
                 self.curr_gains[k] = 0.0
                 self.curr_gains_lower[k] = 0.0
+        elif not observed_completion:
+            return
         elif not self._dial_back():
             if not self._determine_decay(epoch_num):
                 return

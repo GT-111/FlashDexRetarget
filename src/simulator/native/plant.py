@@ -107,6 +107,17 @@ class NativePlant(ABC):
             }
             for name in contact_pairs
         }
+        self.hand_part_feedback_dofs: dict[str, tuple[int, ...]] = {}
+
+    def configure_hand_part_feedback(self, pair_dofs):
+        """Bind optional contact feedback before creating the interval buffers."""
+        self.hand_part_feedback_dofs = dict(pair_dofs)
+        for name, dofs in self.hand_part_feedback_dofs.items():
+            facts = self.contact_facts[name]
+            facts["force_bearing_tangent_speed_max_m_s"] = torch.full_like(facts["normal_force_n"], torch.nan)
+            if dofs:
+                facts["joint_effort_on_second"] = facts["normal_force_n"].new_full(
+                    (self.num_envs, len(dofs)), torch.nan)
 
     def configure_control_interval(self, num_substeps):
         self.contact_interval = ControlIntervalContacts(self, num_substeps)
@@ -127,10 +138,8 @@ class NativePlant(ABC):
         if self.contact_sample_execution_step is not None:
             self.contact_sample_execution_step[rows] = -1
         for facts in self.contact_facts.values():
-            facts["normal_force_n"][rows] = float("nan")
-            facts["force_on_second_w_n"][rows] = float("nan")
-            facts["force_bearing_contact_present"][rows] = False
-            facts["force_bearing_distance_max_m"][rows] = float("nan")
+            for value in facts.values():
+                value[rows] = False if value.dtype == torch.bool else torch.nan
 
     @abstractmethod
     def state(self):

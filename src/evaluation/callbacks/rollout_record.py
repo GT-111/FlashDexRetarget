@@ -153,7 +153,7 @@ _CONTACT_INTERVAL_ARRAYS = (
 _APPLIED_WRENCH_INTERVAL_ARRAYS = (
     "peak_force_n", "peak_torque_nm", "substep_wrench_w", "substep_support", "measurement_support",
 )
-_OBJECT_PAIR_INTERVAL_ARRAYS = ("normal_force_n", "peak_normal_force_n", "measurement_support")
+_OBJECT_PAIR_INTERVAL_ARRAYS = ("normal_force_n", "force_on_second_w_n", "peak_normal_force_n", "measurement_support")
 _SOURCE_TIP_GEOMETRY_ARRAYS = (
     "reference_motion_ids", "reference_motion_steps", "reference_time_ns", "execution_valid",
     "source_position_w", "source_position_support", "achieved_position_w", "achieved_position_support",
@@ -373,9 +373,11 @@ class NativeRolloutRecord(RolloutRecord):
                 schema="solver_object_pair_control_interval_v1", pairs=object_pair_interval["pairs"],
                 num_substeps=object_pair_interval["num_substeps"],
                 normal_force_authority="actual_solver_object_subtree_pair_positive_normal_force",
+                force_authority="actual_solver_WORLD_force_on_second_object_subtree_from_first",
                 clock="shared hand_part_interval_* physical and accepted-step clock arrays",
                 sampling="sum positive collider normal forces at every configured substep; peak is the maximum substep sum",
                 normal_force_axes="recorded endpoint, configured substep, named pair",
+                force_axes="recorded endpoint, configured substep, named pair, xyz N",
                 peak_axes="recorded endpoint, named pair",
                 absent_contact="measured zero normal force",
                 unsupported="reset or incomplete solved interval returns NaN forces and false pair support",

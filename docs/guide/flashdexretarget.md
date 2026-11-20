@@ -530,8 +530,9 @@ positive-force samples contribute `min(normal_force_n / force_scale_n, 1)` only
 when an actual force-bearing contact has supported separation no greater than
 `separation_bound_m`. The HOI recipe discounts credit if the achieved source
 groups exceed `digit_contact_distance_m`. Missing source group evidence earns
-zero credit. The best candidate part is used for each hand/substep;
-substeps are weighted by their supported solver durations. Extra force above
+zero credit. Within one object, the best candidate part is used for each
+hand and substep. Independent required objects must be loaded in the same
+substep. Substeps are weighted by their supported solver durations. Extra force above
 the configured physical scale earns no extra credit. Named addresses, not part
 ordinals or fixed asset names, bind the measurements.
 
@@ -552,11 +553,32 @@ int64 capture/availability/cell-end clocks, masks and source provenance through
 the ordinary native carrier. Proximity-derived source intent must retain that
 label. The fork does not infer source force from achieved contact.
 
-Changed credit also changes replay reward targets. Ordinary compatible agent
-state can be warm initialized with an explicitly fresh replay/collector; old
-stored rewards must not be relabeled as if they contained the new credit.
-Training assistance/curriculum and evaluation's zero-assistance selection stay
-explicit. These methods establish no source feasibility or successful teacher.
+### Solved contact feedback in the HOI recipe
+
+The actor and critic receive the last complete solver interval. Each named
+hand–part pair contributes force in the wrist frame, normal load, bearing
+duration and tangential slip speed. An articulated object's named scalar
+coordinates also receive signed contact effort. For a hinge the solver uses
+the actual world pivot and axis to project force and contact couple into N·m.
+For a slide it projects force into N along the actual translation axis. A
+separate support bit distinguishes an unavailable sample from a measured
+zero. Fixed collision supports and named independent object pairs contribute
+their achieved upward or downward load on the same clock.
+
+The optional guide follows the known source hand role. Existing solved load
+can preserve guidance through the approach pose guard. When a role changes
+or contact is lost, guidance moves at up to `max_speed_m_s` while the installed
+wrist feedforward follows the actual bounded change. Source-phase rewards use
+the action's consumed original source frame. Upward load credit is reduced
+when the object tilts away from the source pose. Articulation credit requires
+both useful signed effort and achieved joint motion in the requested direction.
+Declared phase direction takes precedence over local reference velocity.
+
+Adaptive assistance reduces gains only when observed episode endings provide
+completion evidence. With a configured clip endpoint, a time-limit reset is
+an incomplete episode. Start a fresh HOI run for this action and observation
+configuration. Its new actor inputs and effective wrist guidance change the
+checkpoint contract, and each new run collects its own replay rewards.
 
 ### Installed dynamics and gravity
 

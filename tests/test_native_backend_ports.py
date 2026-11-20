@@ -49,6 +49,66 @@ def _mechanics(tmp_path):
     return layout, mapping, model
 
 
+def test_direct_plant_records_scalar_contact_effort_and_slip_on_the_solved_clock(tmp_path):
+    pytest.importorskip("warp")
+    pytest.importorskip("mujoco_warp")
+    path = tmp_path / "mixed.xml"
+    path.write_text("""<mujoco>
+      <worldbody>
+        <geom type="plane" size="1 1 .01"/>
+        <body pos="0 0 .04"><joint name="rail" type="slide" axis="0 0 1"/>
+          <geom type="sphere" size=".01" mass="1" contype="0" conaffinity="0"/>
+          <body name="lever"><joint name="pivot" type="hinge" axis="0 -1 0"/>
+            <geom type="sphere" size=".05" pos=".08 0 0" mass=".1"/>
+          </body>
+        </body>
+      </worldbody>
+    </mujoco>""")
+    model = mujoco.MjModel.from_xml_path(str(path))
+    model.opt.timestep = .005
+    data = mujoco.MjData(model)
+    data.qvel[:] = (.02, .3)
+    mujoco.mj_forward(model, data)
+    contact = data.contact[0]
+    wrench = np.zeros(6)
+    mujoco.mj_contactForce(model, data, 0, wrench)
+    force_w, couple_w = wrench.reshape(2, 3) @ contact.frame.reshape(3, 3)
+    lever = model.body("lever").id
+    jacobian = np.zeros((3, model.nv))
+    angular = np.zeros_like(jacobian)
+    mujoco.mj_jac(model, data, jacobian, angular, contact.pos, lever)
+    if model.geom_bodyid[contact.geom[1]] != lever:
+        force_w, couple_w = -force_w, -couple_w
+    expected = jacobian.T @ force_w + angular.T @ couple_w
+    slip = np.linalg.norm(contact.frame.reshape(3, 3)[1:] @ (jacobian @ data.qvel))
+    assert np.all(expected > 0.) and slip > 0.
+
+    name = "support/leverage"
+    plant = MjWarpPlant(scene_xml_path=str(path), num_envs=2, sim_dt=.005, device="cpu",
+                        contact_pairs={name: ([0], [lever])}, nconmax=16, njmax=64)
+    q, v = (torch.as_tensor(value).float().repeat(2, 1) for value in (data.qpos, data.qvel))
+    q[1, 0] += .2
+    plant.set_state(torch.arange(2), q, v)
+    plant.configure_hand_part_feedback({name: (0, 1)})
+    plant.configure_control_interval(1)
+    sim = NativeSim(plant)
+    sim.begin_control_step()
+    sim.step()
+    sim.end_control_step()
+
+    interval = plant.contact_interval
+    assert interval.interval_complete.all()
+    facts = interval.pairs[name]
+    effort = facts["joint_effort_on_second"]
+    torch.testing.assert_close(effort[0, 0], effort.new_tensor(expected), atol=2e-4, rtol=1e-4)
+    assert not effort[1, 0].any()
+    measured_slip = facts["force_bearing_tangent_speed_max_m_s"]
+    assert measured_slip[0, 0].item() == pytest.approx(slip, abs=1e-6)
+    assert torch.isnan(measured_slip[1, 0])
+    plant.reset(torch.tensor([0]))
+    assert torch.isnan(effort[0, 0]).all() and not interval.interval_complete[0]
+
+
 def test_native_config_dispatch_and_runtime_do_not_boot_kit_or_require_usd(tmp_path):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
@@ -741,8 +801,9 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
 
         def object_interval():
             row = int(command.reference_phase["motion_steps"].item())
-            forces = (0., 1.5, 0.25, 0.) if row == 1 else (0., 0., 0., 0.)
-            return {**interval(), "pairs": {key: {"normal_force_n": torch.tensor([forces])}}}
+            forces = torch.tensor([[0., 1.5, 0.25, 0.]]) if row == 1 else torch.zeros((1, 4))
+            vectors = torch.stack((forces * 0.1, torch.zeros_like(forces), -forces), dim=-1)
+            return {**interval(), "pairs": {key: {"normal_force_n": forces, "force_on_second_w_n": vectors}}}
 
         receiver = SimpleNamespace(
             sim=SimpleNamespace(plant=SimpleNamespace(contact_interval=SimpleNamespace(facts=object_interval))),
@@ -771,12 +832,16 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
     assert len(metadata["pairs"]) == 6 and "not original" in metadata["provenance"]
     pair = json.loads(str(arrays["object_pair_interval_metadata_json"]))
     assert pair["schema"] == "solver_object_pair_control_interval_v1"
+    assert pair["force_authority"] == "actual_solver_WORLD_force_on_second_object_subtree_from_first"
     assert pair["pairs"] == [dict(first_entity_name="object", first_root_body_name="object_root",
         second_entity_name="loose_prop", second_root_body_name="prop_root")]
     np.testing.assert_array_equal(arrays["object_pair_interval_measurement_support"][:, 0], [False, True, True])
     np.testing.assert_allclose(arrays["object_pair_interval_peak_normal_force_n"][:, 0], [np.nan, 1.5, 0.])
     np.testing.assert_allclose(arrays["object_pair_interval_normal_force_n"][:, :, 0],
                                [[np.nan] * 4, [0., 1.5, 0.25, 0.], [0.] * 4])
+    assert np.isnan(arrays["object_pair_interval_force_on_second_w_n"][0]).all()
+    np.testing.assert_allclose(arrays["object_pair_interval_force_on_second_w_n"][1, 1, 0],
+                               [.15, 0., -1.5])
     assert json.loads(str(arrays["native_backend_metadata_json"]))["backend"] == "synthetic_port_protocol_not_physics"
 
 
@@ -1106,7 +1171,8 @@ def test_native_factory_keeps_multiple_objects_and_duplicate_local_part_labels(t
             world.remove(geom)
         ET.SubElement(world, "geom", name="table", type="plane", size="1 1 .1")
         if support_mode == "mixed":
-            ET.SubElement(world, "geom", name="fixture", type="box", size=".1 .1 .1")
+            fixture = ET.SubElement(world, "body", name="fixture")
+            ET.SubElement(fixture, "geom", type="box", size=".1 .1 .1")
     for hand in layout.hands:
         for axis, gear in enumerate(np.eye(6, dtype=int)):
             ET.SubElement(document.getroot().find("actuator"), "motor",
@@ -1135,19 +1201,20 @@ def test_native_factory_keeps_multiple_objects_and_duplicate_local_part_labels(t
         commands=dict(object=dict(pin_objects=False, support_disks=dict(enable=False))), curriculum={},
         sim=dict(dt=.005, plant={"_target_": "explicit_cpu_protocol"}), scene=dict(num_envs=2),
         decimation=4, episode_length_s=1., seed=1, eval={}))
-    if support_mode != "default":
-        cfg.actions = {"source_contact_approach": {"stationary_hold_force_n": 1.}}
     env, _ = native_create.create_native_envs(cfg, "cpu")
     scene, plant = env.scene, env.sim.plant
     key = "objects/object/loose_prop"
-    support_pairs = {key: ([0], [plant.model.body(part.body_name).id])
-                     for key, (_, part) in layout.support_pair_bindings.items()} if support_mode == "plane" else {}
+    fixed_bodies = [0, plant.model.body("fixture").id] if support_mode == "mixed" else [0]
+    support_pairs = {key: (fixed_bodies, [plant.model.body(part.body_name).id])
+                     for key, (_, part) in layout.support_pair_bindings.items()}
     assert len(plant.contact_facts) == 7 + len(support_pairs)
     assert {key: pair for key, pair in plant.contact_pairs.items() if key.startswith("support/")} == support_pairs
     assert plant.contact_pairs[key] == ([plant.model.body("base").id, plant.model.body("lid").id],
                                        [plant.model.body("prop_root").id])
     assert key not in scene.hand_part_contact_facts()["pairs"]
     assert key not in scene.hand_part_contact_interval_facts()["pairs"]
+    assert plant.hand_part_feedback_dofs["left/object/lid"] != ()
+    assert plant.hand_part_feedback_dofs["left/loose_prop/base"] == ()
     assert {a["part_entity_name"] for a in scene.hand_part_contact_facts()["addresses"].values()} == {"object", "loose_prop"}
     assert "left/object/base" in plant.contact_facts and "left/loose_prop/base" in plant.contact_facts
     assert set(scene.object_parts) == {"object/base", "object/lid", "loose_prop/base"}

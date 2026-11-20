@@ -7,7 +7,7 @@ import math
 import torch
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_error_magnitude
 
-from .._common import action_term
+from .._common import action_term, contact_interval_weights
 from . import _SIDES
 from .motion_tracking import MotionTrackingRewards, _worst_k_mean
 
@@ -46,16 +46,6 @@ def _matching_source_phase(intent, geometry):
     for key in ("reference_motion_ids", "reference_motion_steps", "reference_time_ns"):
         execution &= intent[key] == geometry[key]
     return execution
-
-
-def _contact_interval_weights(env, interval, execution):
-    endpoint = interval["sample_end_time_s"][:, -1] == env.scene.physics_time_s()
-    valid = (interval["sample_recorded"] & interval["clock_support"]
-             & interval["interval_complete"][:, None] & endpoint[:, None]
-             & execution[:, None])
-    duration = torch.where(valid, interval["sample_end_time_s"] - interval["sample_begin_time_s"], 0.0)
-    total = duration.sum(-1, keepdim=True)
-    return valid, (duration / torch.where(total > 0, total, torch.ones_like(total))).float()
 
 
 def _hand_part_distances(geometry, hand, parts, source_digit_distance_m):
@@ -171,7 +161,7 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         active = intent["active"] & intent["known"]
         required = active.any(-1) & execution[:, None]
         # The manager finishes this interval before reward and resets afterwards.
-        valid, weights = _contact_interval_weights(env, interval, execution)
+        valid, weights = contact_interval_weights(env, interval, execution)
         addresses = {(row["hand_side"], row["hand_body_name"], row["part_entity_name"], row["part_body_name"]): name
                      for name, row in interval["addresses"].items()}
         hands = {hand.side: hand.root_body_name for hand in command.native_layout.hands}
@@ -213,8 +203,9 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         return _source_intent_mean(torch.stack(values, -1), required, intent["metadata"], side)
 
     @staticmethod
-    def native_source_lift_load(env, command_name, lookahead_s, minimum_speed_m_s, separation_bound_m):
-        """Credit measured upward support only when the commanded source object rises."""
+    def native_source_lift_load(env, command_name, lookahead_s, minimum_speed_m_s, separation_bound_m,
+                                rotation_scale_rad=.35):
+        """Credit simultaneous upward load that preserves the source orientation during lift."""
         command = env.command_manager.get_term(command_name)
         intent = command.source_hand_part_intent_facts()
         interval = env.scene.hand_part_contact_interval_facts()
@@ -233,8 +224,12 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         demand = ((rise > minimum_speed_m_s * elapsed[:, None]) & (elapsed[:, None] > 0)
                   & now["pose_support"][:, root_columns] & later["pose_support"][:, root_columns]
                   & (weight > 0))
+        ids = command.motion_lib.length_starts[intent["reference_motion_ids"]] + intent["reference_motion_steps"]
+        phase = command.task_phase_reference(ids)
+        if phase is not None:
+            demand &= ~phase["lift_declared"] | phase["lift"]
         active = intent["active"] & intent["known"]
-        valid, weights = _contact_interval_weights(env, interval, intent["execution_valid"])
+        valid, weights = contact_interval_weights(env, interval, intent["execution_valid"])
         complete = (valid & interval["measurement_support"]).all(-1)
         object_load = {obj.entity_name: torch.zeros_like(weights) for obj in objects}
         object_known = {obj.entity_name: torch.ones_like(valid) for obj in objects}
@@ -259,10 +254,77 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         ], -1)
         load = torch.stack(list(object_load.values()), -1)
         credit = (load / weight.clamp_min(1e-12)).clamp(-1.0, 1.0)
+        rotation = quat_error_magnitude(now["state"][:, root_columns, 3:7],
+                                       command.sim_object_part_state_w[:, root_columns, 3:7])
+        orientation = torch.exp(-(rotation / rotation_scale_rad).square())
+        credit = torch.where(credit > 0., credit * orientation[:, None], credit)
         eligible = torch.stack(list(object_known.values()), -1).all(1)
         complete &= (~required | eligible).all(-1)
         simultaneous = torch.where(required[:, None], credit, 1.).amin(-1)
         return torch.where(required.any(-1) & complete, (simultaneous * weights).sum(-1), 0.)
+
+    @staticmethod
+    def native_source_joint_drive(env, command_name, hinge_effort_scale_nm=.05,
+                                  min_hinge_speed_rad_s=.05, min_slide_speed_m_s=.003,
+                                  separation_bound_m=.02):
+        """Credit contact effort in the moving source direction and actual joint progress."""
+        command = env.command_manager.get_term(command_name)
+        intent = command.source_hand_part_intent_facts()
+        interval = env.scene.hand_part_contact_interval_facts()
+        if intent is None or interval is None or not command.object_joint_coordinate_metadata["joint_names"]:
+            return torch.zeros(env.num_envs, device=env.device)
+        ids = command.motion_lib.length_starts[intent["reference_motion_ids"]] + intent["reference_motion_steps"]
+        ref = command.object_joint_reference(ids)
+        velocity = ref["velocity"]
+        units = ref["position_units"]
+        owners = ref["entity_names"]
+        floor = velocity.new_tensor([min_hinge_speed_rad_s if unit == "rad" else min_slide_speed_m_s
+                                     for unit in units])
+        direction = velocity.sign()
+        phase = command.task_phase_reference(ids)
+        if phase is not None:
+            direction = torch.where(phase["joint_declared"], phase["joint_direction"], direction)
+        required = ref["velocity_support"] & (velocity.abs() > floor) & (direction != 0)
+        valid, dt = contact_interval_weights(env, interval, intent["execution_valid"])
+        measured = valid & interval["measurement_support"]
+        load = velocity.new_zeros(env.num_envs, interval["num_substeps"], len(units))
+        known = measured[..., None].expand_as(load).clone()
+        assigned = torch.zeros_like(required)
+        active = intent["active"] & intent["known"]
+        hands = intent["metadata"]["hand_sides"]
+        parts = intent["metadata"]["part_body_names"]
+        roots = {hand.side: hand.root_body_name for hand in command.native_layout.hands}
+        part_owners = {part.body_name: obj.entity_name for obj, part in command.native_layout.part_bindings}
+        for name, address in interval["addresses"].items():
+            owner = address["part_entity_name"]
+            side, part = address["hand_side"], address["part_body_name"]
+            if roots.get(side) != address["hand_body_name"] or part_owners.get(part) != owner:
+                continue
+            coordinates = command._object_joint_slices[owner]
+            if coordinates.start == coordinates.stop:
+                continue
+            role = active[:, hands.index(side), parts.index(part)]
+            assigned[:, coordinates] |= role[:, None]
+            pair = interval["pairs"][name]
+            effort = pair.get("joint_effort_on_second")
+            if effort is None:
+                known[..., coordinates] &= ~role[:, None, None]
+                continue
+            present = pair["force_bearing_contact_present"]
+            distance = pair["force_bearing_distance_max_m"]
+            supported = torch.isfinite(effort) & (~present | torch.isfinite(distance))[..., None]
+            known[..., coordinates] &= ~role[:, None, None] | supported
+            eligible = role[:, None] & present & (distance <= separation_bound_m)
+            load[..., coordinates] += torch.where(eligible[..., None] & supported, effort, 0.)
+        object_weights = {obj.entity_name: env.scene.native_object_weights_n[i].clamp_min(.1)
+                          for i, obj in enumerate(command.native_layout.objects)}
+        scale = torch.stack([velocity.new_tensor(hinge_effort_scale_nm) if unit == "rad" else object_weights[owner]
+                             for owner, unit in zip(owners, units, strict=True)])
+        directed = ((load * direction[:, None]) / scale).clamp(0., 1.)
+        movement = (command.native_object_joint_vel * direction / velocity.abs().clamp_min(floor)).clamp(0., 1.)
+        simultaneous = torch.where(required[:, None], directed * movement[:, None], 1.).amin(-1)
+        complete = (~required | (assigned & known.all(1))).all(-1)
+        return torch.where(required.any(-1) & complete, (simultaneous * dt).sum(-1), 0.)
 
     @staticmethod
     def native_source_tip_position(env, command_name, scale, side=None):

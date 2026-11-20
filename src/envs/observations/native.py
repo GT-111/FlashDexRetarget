@@ -11,7 +11,7 @@ from mjlab.utils.lab_api.math import (
     quat_mul,
 )
 
-from .._common import action_term
+from .._common import action_term, contact_interval_weights
 from ..object_points import (
     native_part_reference,
     native_part_surface_cloud,
@@ -216,6 +216,71 @@ class NativeMotionTrackingObs(MotionTrackingObs):
         if facts is None:
             raise ValueError("source hand/part intent observation requires an explicit source carrier")
         return torch.cat((facts["active"].flatten(1).float(), facts["known"].flatten(1).float()), -1)
+
+    @staticmethod
+    @torch.no_grad()
+    def native_solved_contact_feedback(env, command_name, hinge_scale_nm=.05, slip_scale_m_s=.1):
+        """Previous physical interval in declared pair and scalar-joint order, with support bits."""
+        command = env.command_manager.get_term(command_name)
+        scene, layout = env.scene, command.native_layout
+        interval = scene.hand_part_contact_interval_facts()
+        valid, dt = contact_interval_weights(env, interval, interval["interval_complete"])
+        complete = (valid & interval["measurement_support"]).all(-1)
+        object_weights = {
+            obj.entity_name: scene.native_object_weights_n[i].clamp_min(.1)
+            for i, obj in enumerate(layout.objects)
+        }
+        fields = []
+
+        def append(value, supported):
+            fields.append(torch.where(supported[:, None], value, 0.0))
+            fields.append(supported[:, None].float())
+
+        def weighted_force(pair):
+            force = pair["force_on_second_w_n"]
+            return (torch.nan_to_num(force) * dt[..., None]).sum(1), torch.isfinite(force).all(dim=(1, 2))
+
+        for name, address in interval["addresses"].items():
+            pair = interval["pairs"][name]
+            force, supported = weighted_force(pair)
+            side = command._side_list.index(address["hand_side"])
+            owner = address["part_entity_name"]
+            weight = object_weights[owner]
+            local = quat_apply_inverse(command.robot_wrist_quat_w[:, side], force)
+            normal = pair["normal_force_n"]
+            bearing = pair["force_bearing_contact_present"]
+            slip = pair["force_bearing_tangent_speed_max_m_s"]
+            supported &= (complete & torch.isfinite(normal).all(-1)
+                          & (~bearing | torch.isfinite(slip)).all(-1))
+            mean_normal = (torch.nan_to_num(normal) * dt).sum(1)
+            mean_bearing = (bearing * dt).sum(1)
+            max_slip = torch.nan_to_num(slip).amax(1)
+            append(torch.cat((torch.tanh(local / weight),
+                              torch.tanh(mean_normal / weight)[:, None], mean_bearing[:, None],
+                              torch.tanh(max_slip / slip_scale_m_s)[:, None]), -1), supported)
+            if "joint_effort_on_second" in pair:
+                effort = pair["joint_effort_on_second"]
+                columns = command._object_joint_slices[owner]
+                units = command.object_joint_coordinate_metadata["position_units"][columns]
+                scale = torch.stack([weight.new_tensor(hinge_scale_nm) if unit == "rad" else weight
+                                     for unit in units])
+                value = (torch.nan_to_num(effort) * dt[..., None]).sum(1)
+                append(torch.tanh(value / scale), complete & torch.isfinite(effort).all(dim=(1, 2)))
+
+        support_pairs = scene.support_contact_interval_pairs()
+        for name, (obj, _) in layout.support_pair_bindings.items():
+            pair = support_pairs.get(name)
+            if pair is None:
+                append(dt.new_zeros(env.num_envs, 1), torch.zeros_like(complete))
+            else:
+                force, supported = weighted_force(pair)
+                upward = (force @ scene.gravity_up_w) / object_weights[obj.entity_name]
+                append(torch.tanh(upward[:, None]), complete & supported)
+        for name, (first, second) in layout.object_pair_bindings.items():
+            force, supported = weighted_force(support_pairs[name])
+            scale = torch.minimum(object_weights[first.entity_name], object_weights[second.entity_name])
+            append(torch.tanh((force @ scene.gravity_up_w / scale)[:, None]), complete & supported)
+        return torch.cat(fields, -1)
 
     @staticmethod
     @torch.no_grad()

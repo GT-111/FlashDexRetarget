@@ -46,7 +46,7 @@ class MotionTrackingEvalSetup:
             + torch.arange(n, device=env.device, dtype=torch.long)
             // self.num_per_motion
         )
-        self.active_mask = raw_id < num_motions
+        self.active_mask = (raw_id < offset + k) & (raw_id < num_motions)
         cmd.motion_ids[:] = torch.clamp(raw_id, max=num_motions - 1)
         # Per-batch rollout length: the longest active trajectory in THIS batch, so
         # short batches don't over-run to the global max length.

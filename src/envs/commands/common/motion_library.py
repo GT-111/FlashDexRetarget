@@ -49,6 +49,7 @@ class MotionLibrary:
         # Independent source masks are unavailable in older native and stock clips.
         self.native_source_point_position_support: dict[str, torch.Tensor] | None = None
         self.native_source_hand_part_intent: dict[str, torch.Tensor] | None = None
+        self.native_task_phases: dict[str, torch.Tensor] | None = None
         self._parse_robot_data(motion_dicts)
         self._parse_mano_data(motion_dicts, motion_files)
         self._parse_contact_data(motion_dicts, motion_files)
@@ -154,6 +155,48 @@ class MotionLibrary:
             setattr(self, "native_" + field,
                     _concat([reference[field] for reference in references], self.device, dtype=dtype))
         self._parse_source_hand_part_intent(references)
+        self._parse_native_task_phases(references)
+
+    def _parse_native_task_phases(self, references: list[dict]) -> None:
+        """Join typed source phase declarations to their lower original-frame operand."""
+        sources = [reference["provenance"].get("source") or {} for reference in references]
+        declarations = [source.get("processing", {}).get("task_phases", ()) for source in sources]
+        if not any(declarations):
+            return
+        joints, objects = self.native_object_joint_names, tuple(self.native_object_root_body_names)
+        rows = []
+        for reference, source, phases, ordinal in zip(
+                references, sources, declarations, self.source_query_ordinal, strict=True):
+            count = len(reference["time_ns"])
+            direction_shape = (count, len(joints))
+            positive, negative, declared = (np.zeros(direction_shape, dtype=bool) for _ in range(3))
+            lift, lift_declared = (np.zeros((count, len(objects)), dtype=bool) for _ in range(2))
+            if phases:
+                selected = np.asarray(source["selected_source_frame_index"])
+                lower = np.floor(source["prepared_source_ordinal"] if ordinal is None else ordinal).astype(np.int64)
+                original = selected[lower]
+                for phase in phases:
+                    begin, end = phase["source_frame_range_half_open"]
+                    within = (begin <= original) & (original < end)
+                    usable = (phase.get("requested_progress") or 0.) > 0.
+                    if "native_direction" in phase:
+                        column = joints.index(phase["joint_name"])
+                        declared[:, column] = True
+                        if usable:
+                            direction = positive if phase["native_direction"] > 0 else negative
+                            direction[:, column] |= within
+                    elif phase["kind"] == "lift":
+                        column = objects.index(phase["entity_name"])
+                        lift_declared[:, column] = True
+                        if usable:
+                            lift[:, column] |= within
+            rows.append(dict(joint_direction=positive.astype(np.int8) - negative.astype(np.int8),
+                             joint_declared=declared, lift=lift, lift_declared=lift_declared))
+        self.native_task_phases = {
+            name: _concat([row[name] for row in rows], self.device,
+                          dtype=torch.int8 if name == "joint_direction" else torch.bool)
+            for name in rows[0]
+        }
 
     def _parse_source_hand_part_intent(self, references: list[dict]) -> None:
         """Resolve causal cells once; all runtime gathers use exact prepared rows."""

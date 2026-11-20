@@ -397,12 +397,21 @@ class NativeScene:
         if "execution_interval_complete" not in facts:
             return None
         force = torch.stack([facts["pairs"][key]["normal_force_n"] for key in addresses], dim=-1)
+        force_on_second = torch.stack([facts["pairs"][key]["force_on_second_w_n"] for key in addresses], dim=-2)
         complete = (facts["interval_complete"] & facts["execution_interval_complete"]
                     & facts["measurement_support"].all(-1))
-        support = complete[:, None] & torch.isfinite(force).all(dim=1)
+        support = complete[:, None] & torch.isfinite(force).all(dim=1) & torch.isfinite(force_on_second).all(-1).all(1)
         force = torch.where(support[:, None, :], force, torch.nan)
+        force_on_second = torch.where(support[:, None, :, None], force_on_second, torch.nan)
         return dict(pairs=list(addresses.values()), num_substeps=facts["num_substeps"],
-                    normal_force_n=force, peak_normal_force_n=force.amax(dim=1), measurement_support=support)
+                    normal_force_n=force, force_on_second_w_n=force_on_second,
+                    peak_normal_force_n=force.amax(dim=1), measurement_support=support)
+
+    def support_contact_interval_pairs(self):
+        """Fixed-world and independent object contacts from the same hand/part solve interval."""
+        pairs = self.sim.plant.contact_interval.pairs
+        names = (*self.native_layout.support_pair_bindings, *self.native_layout.object_pair_bindings)
+        return {name: pairs[name] for name in names if name in pairs}
 
     def applied_object_wrench_interval_facts(self):
         interval = self.sim.plant.contact_interval
