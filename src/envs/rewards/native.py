@@ -138,7 +138,7 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         env, command_name, force_scale_n, separation_bound_m, side=None,
         source_digit_distance_m=None, digit_contact_distance_m=0.028, unmatched_digit_scale=0.15,
     ):
-        """Bounded solved-force credit on installed source candidates, not a task score."""
+        """Bounded solved-force credit across objects required in the same substep."""
         if (not math.isfinite(force_scale_n) or force_scale_n <= 0
                 or not math.isfinite(separation_bound_m) or separation_bound_m < 0
                 or not math.isfinite(digit_contact_distance_m) or digit_contact_distance_m <= 0
@@ -174,8 +174,11 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         owners = {part.body_name: obj.entity_name for obj, part in command.native_layout.part_bindings}
         values = []
         metadata = intent["metadata"]
+        part_columns = {}
+        for index, body in enumerate(metadata["part_body_names"]):
+            part_columns.setdefault(owners[body], []).append(index)
         for hand, name in enumerate(metadata["hand_sides"]):
-            credit = torch.zeros_like(duration, dtype=torch.float32)
+            by_object = {owner: torch.zeros_like(duration, dtype=torch.float32) for owner in part_columns}
             if geometry is not None:
                 digit_distance = _hand_part_distances(geometry, name, metadata["part_body_names"], source_digit_distance_m)
                 digit_scale = torch.where(digit_distance <= digit_contact_distance_m, 1.0, unmatched_digit_scale)
@@ -194,7 +197,14 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
                 bounded = (torch.where(known, force, 0.0) / force_scale_n).clamp(0.0, 1.0)
                 if geometry is not None:
                     bounded = bounded * digit_scale[:, part, None]
-                credit = torch.maximum(credit, torch.where(eligible, bounded, 0.0))
+                owner = owners[body]
+                by_object[owner] = torch.maximum(by_object[owner], torch.where(eligible, bounded, 0.0))
+            # Alternate parts of one object can serve the same grasp. Independent
+            # objects must be loaded together in the actual solver interval.
+            credit = torch.stack([
+                torch.where(active[:, hand, columns].any(-1, keepdim=True), by_object[owner], 1.0)
+                for owner, columns in part_columns.items()
+            ], dim=-1).amin(-1)
             values.append((credit * weights.to(credit.dtype)).sum(-1))
         return _source_intent_mean(torch.stack(values, -1), required, intent["metadata"], side)
 

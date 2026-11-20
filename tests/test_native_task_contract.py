@@ -1899,6 +1899,27 @@ def test_source_intent_reward_unavailable_stale_and_measured_absence_stay_distin
     assert contact(env, "motion", .5, .02).item() == 0.
 
 
+def test_source_contact_credit_requires_the_same_hand_to_load_both_objects_together():
+    from dataclasses import replace
+
+    command, env, _, _, interval = _source_intent_reward_case((("right", 3),))
+    original, = command.native_layout.objects
+    first, second = original.parts
+    command.native_layout = replace(command.native_layout, objects=(
+        replace(original, parts=(first,)),
+        replace(original, entity_name="second_object", root_body_name=second.body_name,
+                root_joint_name="second_free", parts=(second,)),
+    ))
+    command.motion_lib.native_source_hand_part_intent["active"][1, 0] = True
+    interval["addresses"]["arbitrary-1-0"]["part_entity_name"] = "second_object"
+    interval["pairs"]["arbitrary-0-0"]["normal_force_n"][:] = torch.tensor([1., 0.])
+    interval["pairs"]["arbitrary-1-0"]["normal_force_n"][:] = torch.tensor([0., 1.])
+    contact = NativeMotionTrackingRewards.native_source_hand_part_contact
+    assert contact(env, "motion", .5, .02).item() == 0.
+    interval["pairs"]["arbitrary-0-0"]["normal_force_n"][0, 1] = .5
+    assert contact(env, "motion", .5, .02).item() == pytest.approx(.75)
+
+
 def test_source_approach_rewards_two_digit_groups_on_the_same_supported_part():
     command, env, _, geometry, _ = _source_intent_reward_case((("right", 3),))
     command.motion_lib.native_source_hand_part_intent["active"][1] = True
