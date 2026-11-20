@@ -247,10 +247,11 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         command = env.command_manager.get_term(command_name)
         term = action_term(env)
         installed = term.installed_control
-        if term.ref_joint_pos_used is None:
+        if term.ref_command_pos_used is None:
             return torch.zeros(env.num_envs, device=env.device)
-        reference = term.ref_joint_pos_used[:, command.native_command_joint_ids]
-        limits = term.finger_command_limits
+        mapping = term.actuator_command_indices
+        reference = term.ref_command_pos_used[:, mapping]
+        limits = term.finger_actuator_limits
         error = (
             0.5
             * (installed["finger_target_rad"] - reference).square()
@@ -258,13 +259,15 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         )
         value = torch.exp(-scale * error)
         support = installed["finger_source_support"] & installed["installed_valid"][:, None]
+        weight = term.actuator_command_weights
+        denominator = (support * weight).sum(-1).clamp_min(1)
         if side is None:
-            return _supported_mean(value, support)
+            return torch.where(support, value * weight, 0.0).sum(-1) / denominator
         # Existing split_sides divides the term weight across declared hands.
-        # Retain the global support denominator, including unequal/missing support.
+        # A command driving several A slots contributes the same mass as a single drive.
         own = NativeMotionTrackingRewards._side_action_mask(env, side)[term._finger_slice]
-        contribution = torch.where(support & own, value, 0.0).sum(-1)
-        return len(command._side_list) * contribution / support.sum(-1).clamp_min(1)
+        contribution = torch.where(support & own[mapping], value * weight, 0.0).sum(-1)
+        return len(command._side_list) * contribution / denominator
 
     @staticmethod
     def native_root_pose(env, command_name, position_scale_m, rotation_scale_rad, side=None):

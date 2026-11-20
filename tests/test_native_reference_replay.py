@@ -1,5 +1,6 @@
 """Native replay/clock software contracts; no scene construction or physics."""
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -90,7 +91,9 @@ def _replay_case(*, rigid, joint_order=(2, 0, 1), source_entity="robot"):
         obj.joint_vel = torch.tensor([[0.125, -0.5], [0.25, 0.5]])
     # Both native independent-command order and object-reference order differ
     # from the full physical scalar order; the passive hand column stays factual.
+    command.native_layout = replace(command.native_layout, hands=command.native_layout.hands[::-1])
     command._finger_joint_ids = torch.tensor([2, 0])
+    command._bind_native_reference()
     command.motion_ids = torch.tensor([1, 0])
     command.motion_steps = torch.tensor([0, 1])
     if source_entity != "robot":

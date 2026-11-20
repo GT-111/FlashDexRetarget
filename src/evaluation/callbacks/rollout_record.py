@@ -139,6 +139,7 @@ _INSTALLED_ARRAYS = (
     "finger_target_rad", "finger_source_support", "root_state_w", "root_pose_support",
     "root_linear_velocity_support", "root_angular_velocity_support", "installed_valid",
     "reference_motion_ids", "reference_motion_steps", "root_force_n", "root_torque_nm",
+    "finger_requested", "finger_requested_support",
 )
 _CONTACT_ARRAYS = (
     "normal_force_n", "force_bearing_contact_present",
@@ -241,18 +242,29 @@ class NativeRolloutRecord(RolloutRecord):
                     raise ValueError("FlashDex installed root body differs from its recorded native hand")
             self.installed_metadata = {field: control[field] for field in (
                 "hand_sides", "hand_body_names", "finger_actuator_names", "finger_joint_names",
-                "root_control", "action_recipe")}
+                "finger_command_names", "actuator_command_indices", "root_control", "action_recipe")}
             self.installed_metadata.update(term_name=installed[0][0],
                 coordinate_frame="env-local p/WXYZ; WORLD link twist and hand-root force/torque",
                 effort_sampling="actual last physics substep; not interval-mean effort")
-        self.object_joint_metadata = None
+        self.object_joint_metadata = self.joint_effort_metadata = None
         if hasattr(self.cmd, "native_objects"):
             self.object_joint_metadata = dict(object_root_body_names=self.cmd.native_layout.object_root_body_names,
                 **self.cmd.object_joint_coordinate_metadata,
                 authority="observed simulator scalar state; independent from reference support")
             if self.installed_metadata is not None:
                 # Target/limit arrays retain raw scalar SI values despite their field names.
-                self.installed_metadata["finger_joint_coordinates"] = self.cmd.command_joint_coordinate_metadata
+                coordinates = self.cmd.robot_joint_coordinate_metadata
+                driven = [self.joint_names.index(name) for name in control["finger_joint_names"]]
+                self.installed_metadata["finger_joint_coordinates"] = {
+                    key: tuple(values[i] for i in driven) for key, values in coordinates.items()
+                }
+                self.installed_metadata["finger_command_coordinates"] = self.cmd.command_joint_coordinate_metadata
+                if hasattr(robot.data, "qfrc_actuator"):
+                    self.joint_effort_metadata = dict(
+                        joint_names=self.joint_names,
+                        units=tuple("N" if unit == "m" else "N m" for unit in coordinates["position_units"]),
+                        authority="post-solve generalized actuator effort at the final substep",
+                    )
         self._object_assist_reader = getattr(self.cmd, "object_assist_facts", None)
         self.object_assist_metadata = None
         if self._object_assist_reader is not None:
@@ -425,6 +437,11 @@ class NativeRolloutRecord(RolloutRecord):
             frame["installed"] = {field: control[field].detach().to("cpu").clone()
                                   for field in _INSTALLED_ARRAYS}
             frame["installed"]["root_state_w"][..., :3] -= self._env_origins.cpu()[:, None]
+            if self.joint_effort_metadata is not None:
+                effort = robot.data.qfrc_actuator
+                support = control["installed_valid"][:, None] & torch.isfinite(effort)
+                frame["joint_effort"] = torch.where(support, effort, 0.0).detach().cpu().clone()
+                frame["joint_effort_support"] = support.detach().cpu().clone()
         if self.object_joint_metadata is not None:
             frame["object_joint_pos"] = self.cmd.native_object_joint_pos.detach().to("cpu").clone()
             frame["object_joint_vel"] = self.cmd.native_object_joint_vel.detach().to("cpu").clone()
@@ -515,6 +532,9 @@ class NativeRolloutRecord(RolloutRecord):
                 }
             if "installed" in frame:
                 selected["installed"] = {field: value[select] for field, value in frame["installed"].items()}
+            if "joint_effort" in frame:
+                selected["joint_effort"] = frame["joint_effort"][select]
+                selected["joint_effort_support"] = frame["joint_effort_support"][select]
             if "object_joint_pos" in frame:
                 selected["object_joint_pos"] = frame["object_joint_pos"][select]
                 selected["object_joint_vel"] = frame["object_joint_vel"][select]
@@ -596,10 +616,17 @@ class NativeRolloutRecord(RolloutRecord):
                         ])
                 if self.installed_metadata is not None:
                     result["installed_control_metadata_json"] = np.asarray(json.dumps(self.installed_metadata))
+                    names = {"installed_valid": "installed_control_valid",
+                             "finger_requested": "requested_finger_command",
+                             "finger_requested_support": "requested_finger_command_support"}
                     for field in _INSTALLED_ARRAYS:
-                        key = "installed_control_valid" if field == "installed_valid" else "installed_" + field
+                        key = names.get(field, "installed_" + field)
                         result[key] = np.stack([
                             frame["installed"][field][row].numpy() for frame in frames])
+                if self.joint_effort_metadata is not None:
+                    result["joint_effort_metadata_json"] = np.asarray(json.dumps(self.joint_effort_metadata))
+                    for field in ("joint_effort", "joint_effort_support"):
+                        result[field] = np.stack([frame[field][row].numpy() for frame in frames])
                 if self.object_joint_metadata is not None:
                     result["object_joint_metadata_json"] = np.asarray(json.dumps(self.object_joint_metadata))
                     for field in ("object_joint_pos", "object_joint_vel"):

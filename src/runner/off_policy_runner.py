@@ -31,6 +31,7 @@ class OffPolicyRunner:
     (``runner.agent.class_name``), and evaluates and checkpoints on absolute env-step grids."""
 
     _hoi_curriculum = None
+    _hoi_zero_actor_start: int | None = None
 
     def __init__(
         self,
@@ -167,6 +168,9 @@ class OffPolicyRunner:
         try:
             for step in tqdm.tqdm(range(1, n_steps + 1), smoothing=0.1, mininterval=0.5):
                 env_step = self._step_offset + step * n_envs
+                if (self._hoi_curriculum is not None and self._hoi_zero_actor_start is None
+                        and self._hoi_curriculum.has_zero_gains()):
+                    self._hoi_zero_actor_start = agent.actor_optimizer_steps
                 if timing_f:
                     torch.cuda.synchronize()
                     iter_t0 = time.perf_counter()
@@ -204,7 +208,7 @@ class OffPolicyRunner:
                     continue
 
                 if self._hoi_curriculum is not None and not self._started_at_hoi_zero:
-                    if self._hoi_curriculum.hoi_zero_receipt() is not None:
+                    if self._hoi_zero_qualification() is not None:
                         checkpoint = self._write_checkpoint(env_step, f"hoi-zero-{env_step}", full=True)
                         self._write_hoi_zero_ready(checkpoint, env_step)
                         return
@@ -432,18 +436,36 @@ class OffPolicyRunner:
             self._prune_buffers(keep="")
             print(f"[runner] finished: dropped replay_buffer.pt under {self._save_path_base}", flush=True)
 
-    def _write_hoi_zero_ready(self, checkpoint: Path, env_step: int) -> None:
+    def _hoi_zero_optimization(self) -> dict[str, int] | None:
+        if self._hoi_zero_actor_start is None:
+            return None
+        return {
+            "actor_steps_at_zero_start": self._hoi_zero_actor_start,
+            "actor_steps_at_checkpoint": self._agent.actor_optimizer_steps,
+        }
+
+    def _hoi_zero_qualification(self) -> dict | None:
         if self._hoi_curriculum is None:
-            return
+            return None
         zero = self._hoi_curriculum.hoi_zero_receipt()
         if zero is None:
+            return None
+        optimization = self._hoi_zero_optimization()
+        if (optimization is None
+                or optimization["actor_steps_at_checkpoint"] <= optimization["actor_steps_at_zero_start"]):
+            return None
+        return {"zero_curriculum": zero, "zero_optimization": optimization}
+
+    def _write_hoi_zero_ready(self, checkpoint: Path, env_step: int) -> None:
+        qualification = self._hoi_zero_qualification()
+        if qualification is None:
             return
         path = self._save_path_base / "hoi-zero-ready.json"
         temporary = path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps({
             "checkpoint": str(checkpoint.resolve()),
             "training_env_step": env_step,
-            "zero_curriculum": zero,
+            **qualification,
         }, indent=2) + "\n")
         os.replace(temporary, path)
 
@@ -462,6 +484,7 @@ class OffPolicyRunner:
         }
         if self._hoi_curriculum is not None:
             state["native_hoi_zero"] = self._hoi_curriculum.hoi_zero_receipt()
+            state["native_hoi_zero_optimization"] = self._hoi_zero_optimization()
             state["native_hoi_source_revision"] = os.environ.get("FLASH_SOURCE_REF")
         torch.save(state, ckpt / LEARNING_STATE_FILE)
 
@@ -474,6 +497,10 @@ class OffPolicyRunner:
             raise ValueError("FULL adaptive-curriculum owner differs from the selected run")
         if xf is not None:
             xf.load_state_dict(state["curriculum"], self._train_env.unwrapped.common_step_counter)
+            optimization = state.get("native_hoi_zero_optimization")
+            if (optimization is not None and xf.has_zero_gains()
+                    and optimization["actor_steps_at_checkpoint"] == self._agent.actor_optimizer_steps):
+                self._hoi_zero_actor_start = optimization["actor_steps_at_zero_start"]
         self._agent.reset_collection()
         self._nonfinite_steps = state["nonfinite_steps"]
         self._restored_loop_wall_clock = state["loop_wall_clock_s"]

@@ -318,24 +318,17 @@ class XfrcAssistCurriculum:
                 reduce_gains = False
         return reduce_gains
 
-    def _determine_dialback(self, epoch_num: int) -> bool:
-        dialed = False
-        if len(self.completion_rates) < self.deque_len:
-            return dialed
-        completion = float(np.mean(self.completion_rates))
-        if completion < self.dialback_completion_thres:
-            if self.num_epoch_since_last_decay > self.dialback_min_epochs:
-                upper_gains = self.gain_history[-1]["gains"]
-                lower_gains = self.gain_history[-1]["lower"]
-                for k in self.decay_terms:
-                    if k in upper_gains:
-                        ratio = self.dialback_ratios.get(k, 1.0)
-                        upper_gains[k] *= ratio
-                        lower_gains[k] *= ratio
-                self.curr_gains = upper_gains
-                self.curr_gains_lower = lower_gains
-                dialed = True
-        return dialed
+    def _dial_back(self) -> bool:
+        if (not self.gain_history or len(self.completion_rates) < self.deque_len
+                or self.num_epoch_since_last_decay <= self.dialback_min_epochs
+                or float(np.mean(self.completion_rates)) >= self.dialback_completion_thres):
+            return False
+        previous = self.gain_history.pop()
+        for k in self.decay_terms:
+            ratio = self.dialback_ratios.get(k, 1.0)
+            self.curr_gains[k] = max(self.curr_gains[k], previous["gains"][k] * ratio)
+            self.curr_gains_lower[k] = max(self.curr_gains_lower[k], previous["lower"][k] * ratio)
+        return True
 
     def _set_auto_uniform_decay(self) -> None:
         """upper *= upper_ratio; lower = upper * lower_ratio, both clamped at the floors."""
@@ -364,35 +357,27 @@ class XfrcAssistCurriculum:
         self.num_epoch_since_last_decay += 1
         self._last_decayed = False
 
-        learning_stabilized = self._determine_decay(epoch_num)
-        zero_gains = self.has_zero_gains()
-        if self.zero_epoch >= 0 and epoch_num > self.zero_epoch and not zero_gains:
+        if self.has_zero_gains():
+            return
+        if self.zero_epoch >= 0 and epoch_num > self.zero_epoch:
             for k in self.decay_terms:
                 self.curr_gains[k] = 0.0
                 self.curr_gains_lower[k] = 0.0
-            self._last_decayed = True
-            self._reset_object_gains()
-            return
-        if zero_gains or not learning_stabilized:
-            return
-
-        dialed_back = self._determine_dialback(epoch_num)
-        if dialed_back:
-            self._last_decayed = True
-        else:
+        elif not self._dial_back():
+            if not self._determine_decay(epoch_num):
+                return
             self.gain_history.append(
                 dict(gains=self.curr_gains.copy(), lower=self.curr_gains_lower.copy())
             )
             self._set_auto_uniform_decay()
-            self._last_decayed = True
 
-        if self._last_decayed:
-            self._reset_object_gains()
-            for key in self.rew_deques.keys():
-                self.rew_deques[key].clear()
-            self.ep_lens.clear()
-            self.completion_rates.clear()
-            self.num_epoch_since_last_decay = 0
+        self._last_decayed = True
+        self._reset_object_gains()
+        for history in self.rew_deques.values():
+            history.clear()
+        self.ep_lens.clear()
+        self.completion_rates.clear()
+        self.num_epoch_since_last_decay = 0
 
     def _reset_object_gains(self) -> None:
         """Per-env assist gains drawn uniformly from [lower, upper]."""

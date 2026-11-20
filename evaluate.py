@@ -16,7 +16,8 @@ import hydra  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
 
 
-def _restore_hoi_zero_curriculum(command, checkpoint, env_step, source_revision, control_step):
+def _restore_hoi_zero_curriculum(command, checkpoint, env_step, source_revision, control_step,
+                                 actor_optimizer_steps):
     import torch
 
     from agents.flashsac import REPLAY_BUFFER_FILE
@@ -33,7 +34,13 @@ def _restore_hoi_zero_curriculum(command, checkpoint, env_step, source_revision,
     ctrl.load_state_dict(state["curriculum"], control_step)
     if ctrl.hoi_zero_receipt() != saved:
         raise ValueError("actual restored FULL curriculum disagrees with its zero-hold receipt")
-    return {**saved, "restored": True}
+    optimization = state.get("native_hoi_zero_optimization")
+    if (optimization is None or optimization["actor_steps_at_checkpoint"] != actor_optimizer_steps
+            or optimization["actor_steps_at_zero_start"] >= actor_optimizer_steps):
+        raise ValueError("FULL checkpoint does not bind an actor optimizer update during the zero hold")
+    return {**saved, "restored": True, "zero_assist_actor_optimizer_steps": (
+        actor_optimizer_steps - optimization["actor_steps_at_zero_start"]
+    )}
 
 
 def _recorded_wrench_summary(outcome_dir):
@@ -160,7 +167,8 @@ def run(args: argparse.Namespace) -> None:
                 if not hasattr(command, "native_layout"):
                     raise ValueError("HOI qualification requires a prepared native scene")
                 zero = _restore_hoi_zero_curriculum(command, checkpoint, env_step, source_revision,
-                                                    raw_eval.common_step_counter)
+                                                    raw_eval.common_step_counter,
+                                                    authority["policy"]["actor_optimizer_steps"])
                 authority["hoi_qualification"] = {"mode": qualification_mode, "zero_curriculum": zero}
             authority["configured_disable_object_pin"] = bool(cfg.eval.env.disable_object_pin)
             authority["pin_before_eval"] = bool(command.cfg.object.pin_objects)

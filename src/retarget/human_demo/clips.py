@@ -23,6 +23,7 @@ _NATIVE_FRAME_ARRAYS = (
 _NATIVE_ROOT_ARRAYS = (
     "root_state_w", "root_pose_support", "root_linear_velocity_support", "root_angular_velocity_support",
 )
+_NATIVE_COMMAND_ARRAYS = ("command_pos", "command_position_support")
 
 
 def mano_reference(joints: np.ndarray, verts: np.ndarray, global_rot: np.ndarray, side: str,
@@ -57,7 +58,8 @@ def native_reference(clip: dict) -> dict | None:
     """Read explicit prepared native facts; never derive state or support from MANO.
 
     The nested carrier is preserved in the author's trusted NPZ/PT formats.
-    Q/Qvel describe named physical scalar joints; FREE roots are separate
+    Q/Qvel describe named physical scalar joints. Optional named logical
+    command targets are authored independently of Q. FREE roots are separate
     p/WXYZ/world-link-velocity/world-omega states. Unknown rates are zero with
     independent false support. ``time_ns`` is the actual prepared query clock,
     retaining its original phase after crop, rather than a capture-time claim.
@@ -102,6 +104,13 @@ def native_reference(clip: dict) -> dict | None:
     velocity_support = array("joint_velocity_support", velocity.shape, support=True)
     if np.any(velocity[~velocity_support] != 0):
         raise ValueError("native unknown joint velocities require zero values and false support")
+    command_fields = ("command_names", *_NATIVE_COMMAND_ARRAYS)
+    if any(field in reference for field in command_fields):
+        if not all(field in reference for field in command_fields) or not names("command_names"):
+            raise ValueError("native logical commands require named positions and boolean support")
+        shape = (frames, len(reference["command_names"]))
+        array("command_pos", shape)
+        array("command_position_support", shape, support=True)
     roots = dict(reference["root_body_names"])
     if set(roots) != set(sides(clip)) or len(set(roots.values())) != len(roots):
         raise ValueError("native roots must name the distinct actual bodies for the available hand sides")
@@ -215,6 +224,9 @@ def crop_native_reference(reference: dict, start: int) -> dict:
     result = dict(reference)
     for field in _NATIVE_FRAME_ARRAYS:
         result[field] = reference[field][start:]
+    if "command_names" in reference:
+        for field in _NATIVE_COMMAND_ARRAYS:
+            result[field] = reference[field][start:]
     for field in _NATIVE_ROOT_ARRAYS:
         result[field] = {side: value[start:] for side, value in reference[field].items()}
     if "source_point_position_support" in reference:

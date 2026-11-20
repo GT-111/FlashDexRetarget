@@ -4,6 +4,7 @@ import importlib.util
 import json
 import xml.etree.ElementTree as ET
 from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -164,7 +165,8 @@ def _pipeline_config(dataset, *, prepared=True):
         return compose(config_name="kinematic_retargeting", overrides=overrides)
 
 
-def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_command(tmp_path):
+@pytest.mark.parametrize("fanout", (False, True), ids=("one-to-one", "logical-fanout"))
+def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_command(tmp_path, fanout):
     from envs.commands.common.motion_library import MotionLibrary
     from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
     from envs.scene.native import NativeSceneCfg
@@ -172,6 +174,13 @@ def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_co
     from simulator.native.entity import NamedArticulationView
 
     dataset, clip = _prepared_native_dataset(tmp_path)
+    if fanout:
+        clip["native_reference"].update(
+            command_names=("right_grip", "left_grip"),
+            command_pos=np.tile(np.array([.65, .71], np.float32), (3, 1)),
+            command_position_support=np.array([[True, False], [True, True], [False, True]]),
+        )
+        C.save_clip(dataset / "native_reference/synthetic-stage.npz", clip)
     # A stale human-demo directory and an unselected carrier must not choose the route or population.
     (dataset / "human_demo").mkdir()
     (dataset / "human_demo/rejected-by-stock-route.npz").write_text("unselected human demo")
@@ -202,6 +211,15 @@ def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_co
         objects=(dict(entity_name=next(iter(native["object_root_body_names"])), root_body_name=next(iter(native["object_root_body_names"].values())),
             root_joint_name="synthetic_object_free", parts=[dict(name=body, body_name=body, mesh_path="synthetic.obj")
                 for body in native["object_part_body_names"]]),)))
+    if fanout:
+        mapping = asdict(layout)
+        left, right = mapping["hands"]
+        left.update(command_names=["left_grip"], command_actuator_names=["command_left", "command_follower"],
+                    actuator_command_indices=[0, 0], command_limits=[[0., 1.]],
+                    command_state_joint_names=[["left_a", "left_mimic"]])
+        right.update(command_names=["right_grip"], actuator_command_indices=[0], command_limits=[[0., 1.]],
+                     command_state_joint_names=[["right_b"]])
+        layout = NativeSceneCfg.from_mapping(mapping)
     obj = SimpleNamespace(joint_names=("hinge_a", "hinge_b"), body_names=("base", "lid"))
     robot = SimpleNamespace(joint_names=joint_names)
     for entity in (obj, robot):
@@ -212,12 +230,20 @@ def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_co
     command.native_layout, command.motion_lib, command.robot = layout, library, robot
     command._env = SimpleNamespace(device="cpu", num_envs=1, step_dt=0.02,
         scene={next(iter(native["object_root_body_names"])): obj})
-    command._finger_joint_ids = torch.tensor([0, 2])
+    command._finger_joint_ids = torch.tensor([0, 1, 2] if fanout else [0, 2])
     command.motion_ids, command.motion_steps = torch.tensor([0]), torch.tensor([1])
     command._bind_native_reference()
     torch.testing.assert_close(command.object_joint_reference()["position"], torch.tensor([[.15, .1]]))
-    torch.testing.assert_close(command.command_reference()["position"], torch.tensor([[.5, .3]]))
-    assert command.command_reference()["position_support"].tolist() == [[True, False]]
+    ref = command.command_reference()
+    if fanout:
+        assert ref["joint_names"] == ("left_grip", "right_grip")
+        torch.testing.assert_close(ref["position"], torch.tensor([[.71, .65]]))
+        assert ref["position_support"].tolist() == [[True, True]]
+        assert ref["velocity_support"].tolist() == [[False, True]]
+        torch.testing.assert_close(command.project_command_state(library.robot_joint_pos[1:2]), torch.tensor([[.45, .3]]))
+    else:
+        torch.testing.assert_close(ref["position"], torch.tensor([[.5, .3]]))
+        assert ref["position_support"].tolist() == [[True, False]]
     assert not command.motion_lib.native_root_pose_support["left"][1]
     assert command.motion_lib.native_root_angular_velocity_support["left"][1]
 

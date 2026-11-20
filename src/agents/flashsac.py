@@ -27,6 +27,12 @@ CHECKPOINT_FILE = "flashsac.pt"
 REPLAY_BUFFER_FILE = "replay_buffer.pt"
 
 
+def _optimizer_steps(parameter_state) -> int:
+    # Adam's step advances only when the update is applied.
+    first = next(iter(parameter_state.values()), None)
+    return 0 if first is None else int(first["step"])
+
+
 # ─── config ────────────────────────────────────────────────────────────────────
 @dataclass
 class FlashSACConfig:
@@ -238,12 +244,41 @@ def _action_affine(action_space: gym.spaces.Space) -> tuple[torch.Tensor, torch.
     return 0.5 * (high + low), 0.5 * (high - low)
 
 
-def _check_observation_layout(path: str, encoded_layout: list, obs_terms: list) -> None:
+def _native_policy_columns(env: Any, command_name: str) -> dict[str, Any] | None:
+    commands = getattr(getattr(env, "unwrapped", None), "command_manager", None)
+    if commands is None:
+        return None
+    command = commands.get_term(command_name)
+    layout = getattr(command, "native_layout", None)
+    if layout is None:
+        return None
+    from envs._common import action_term
+
+    action = action_term(env.unwrapped)
+    installed = action.installed_control
+    joint_metadata = command.robot_joint_coordinate_metadata
+    return {
+        "actions": list(action.action_names),
+        "action_sides": list(action.action_sides),
+        "actuators": list(installed["finger_actuator_names"]),
+        "actuator_command_indices": list(installed["actuator_command_indices"]),
+        "joint_names": list(command.robot.joint_names),
+        "joint_types": list(joint_metadata["joint_types"]),
+        "command_state_joint_names": [list(names) for names in command.native_command_state_joint_names],
+        "hand_roots": [[hand.side, hand.root_body_name, hand.root_joint_name] for hand in layout.hands],
+        "object_parts": [[obj.entity_name, part.name, part.body_name] for obj, part in layout.part_bindings],
+        "object_joints": list(command.object_joint_coordinate_metadata["joint_names"]),
+        "object_joint_types": list(command.object_joint_coordinate_metadata["joint_types"]),
+    }
+
+
+def _check_observation_layout(path: str, encoded_layout: list, obs_terms: list,
+                              native_columns: dict | None = None) -> None:
     """Use the same saved column authority for full-agent and policy-only loads."""
     f = os.path.join(path, "obs_layout.json")
     saved = json.load(open(f)) if os.path.exists(f) else {}
     enc = saved.get("encoded_obs_dims")
-    if enc is None and not any(n == "future_traj" for n, _ in encoded_layout):
+    if native_columns is None and enc is None and not any(n == "future_traj" for n, _ in encoded_layout):
         return  # checkpoints without obs_layout.json predate future_traj (split windows)
     if enc != encoded_layout:
         raise ValueError(
@@ -251,7 +286,13 @@ def _check_observation_layout(path: str, encoded_layout: list, obs_terms: list) 
             f"{encoded_layout}; split-window runs need envs/obs@obs=flashdexretarget_split."
         )
     terms = saved.get("obs_terms")
-    if terms is not None and obs_terms:
+    if native_columns is not None:
+        if terms != obs_terms:
+            raise ValueError(f"checkpoint {path} native observation order differs from the environment")
+        saved_columns = saved.get("native_policy_columns")
+        if saved_columns is not None and saved_columns != native_columns:
+            raise ValueError(f"checkpoint {path} native action or state columns differ from the environment")
+    elif terms is not None and obs_terms:
         widths = [[g, w] for g, _, w in terms]
         if widths != [[g, w] for g, _, w in obs_terms]:
             raise ValueError(
@@ -337,6 +378,7 @@ class FlashSACAgent(Agent):
 
         self._encoded_layout = [[str(n), int(d)] for n, d in (env_info.get("encoded_obs_dims") or [])]
         self._obs_terms = [list(t) for t in (env_info.get("obs_terms") or [])]
+        self._native_policy_columns = env_info.get("native_policy_columns")
         self._native_surface_metadata = env_info.get("native_part_surface_metadata", [])
         head_names = self._reward_head_names(cfg, env_info)
         side_action_ids = self._side_action_ids(cfg, env_info, head_names)
@@ -372,6 +414,7 @@ class FlashSACAgent(Agent):
         cls, cfg: DictConfig, env: Any, env_info: dict[str, Any], command_name: str
     ) -> FlashSACAgent:
         agent_cfg = cls._resolved_config(cfg, env.share_obs)
+        env_info = {**env_info, "native_policy_columns": _native_policy_columns(env, command_name)}
         if agent_cfg.buffer_compact_obs:
             from .storage.obs_compact import build_obs_compactor  # needs mjlab
 
@@ -404,11 +447,10 @@ class FlashSACAgent(Agent):
         Live observations already contain the full network inputs. Replay compaction
         therefore requires no buffer or auxiliary reconstruction for this path.
         """
-        del command_name
         agent_cfg = cls._resolved_config(cfg, env.share_obs)
         encoded = [[str(n), int(d)] for n, d in (env_info.get("encoded_obs_dims") or [])]
         terms = [list(t) for t in (env_info.get("obs_terms") or [])]
-        _check_observation_layout(checkpoint, encoded, terms)
+        _check_observation_layout(checkpoint, encoded, terms, _native_policy_columns(env, command_name))
         full_dim = int(env.single_observation_space.shape[-1])
         actor_dim = int(env_info["actor_observation_size"][-1]) if agent_cfg.asymmetric_observation else None
         layout = ReplayObsLayout(full_dim, actor_dim)
@@ -427,6 +469,7 @@ class FlashSACAgent(Agent):
             "checkpoint_directory": os.path.abspath(checkpoint),
             "model_file": model_file,
             "algorithm_update_step": int(saved["update_step"]),
+            "actor_optimizer_steps": _optimizer_steps(saved.get("actor_optimizer_state_dict", {}).get("state", {})),
             "normalization": "Strict actor state includes BatchNorm running statistics and trajectory encoder; no renormalization after load.",
             "loaded_owner": "Only actor_state_dict is installed. The common model container is CPU-mapped, including nonactor tensor metadata; no other owner is restored or copied to device.",
             "replay_loaded": False, "critic_constructed": False,
@@ -519,6 +562,10 @@ class FlashSACAgent(Agent):
     def update(self) -> dict[str, float]:
         return self._alg.update()
 
+    @property
+    def actor_optimizer_steps(self) -> int:
+        return _optimizer_steps(self._alg.actor_optimizer.state)
+
     # ─── checkpoints ───────────────────────────────────────────────────────────
 
     def initialize_actor_input_extension(
@@ -561,11 +608,11 @@ class FlashSACAgent(Agent):
                 or NativeSceneCfg.from_mapping(current["actions"]["native_scene"]) != current_scene
                 or old_action != new_action):
             raise ValueError("actor input extension requires the unchanged named native action/scene contract")
-        # NativeResidualAction groups translations, rotations, then named finger
-        # actuators; MotionLibrary orders admitted source sides right then left.
+        # NativeResidualAction groups translations, rotations, then logical finger
+        # commands; MotionLibrary orders admitted source sides right then left.
         sides = [hand.side for hand in scene.hands]
         owners = ([side for side in sides for _ in "xyz"] * 2
-                  + [hand.side for hand in scene.hands for _ in hand.command_actuator_names])
+                  + [hand.side for hand in scene.hands for _ in range(hand.command_count)])
         head_names = [side for side in ("right", "left") if side in sides]
         expected_ids = [[i for i, owner in enumerate(owners) if owner == side] for side in head_names]
         if (len(owners) != self._action_bias.numel()
@@ -668,12 +715,13 @@ class FlashSACAgent(Agent):
         torch.save(self._alg.save(), os.path.join(path, CHECKPOINT_FILE))
         with open(os.path.join(path, "obs_layout.json"), "w") as f:
             json.dump({"encoded_obs_dims": self._encoded_layout, "obs_terms": self._obs_terms,
+                       "native_policy_columns": self._native_policy_columns,
                        "native_part_surface_metadata": self._native_surface_metadata}, f)
         print(f"\033[32m[FlashSAC]\033[0m Successfully saved checkpoint {self._alg.update_step} at {path}.")
 
     def load(self, path: str) -> None:
         """Load our checkpoint, or a flash_rl one (per-network .pt files) through utils/legacy.py."""
-        _check_observation_layout(path, self._encoded_layout, self._obs_terms)
+        _check_observation_layout(path, self._encoded_layout, self._obs_terms, self._native_policy_columns)
         ckpt = os.path.join(path, CHECKPOINT_FILE)
         if os.path.exists(ckpt):
             loaded = torch.load(ckpt, map_location=self._device)

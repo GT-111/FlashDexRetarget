@@ -52,6 +52,8 @@ class NativeActionControlContext:
     source_contact_part: torch.Tensor
     correction_twist: torch.Tensor
     correction_interval_valid: torch.Tensor
+    finger_requested: torch.Tensor
+    finger_requested_support: torch.Tensor
     finger_target: torch.Tensor
     finger_source_support: torch.Tensor
     root_target: torch.Tensor
@@ -63,14 +65,14 @@ class NativeActionControlContext:
     reference_motion_steps: torch.Tensor
     root_force: torch.Tensor
     root_torque: torch.Tensor
-    reference_joint_position: torch.Tensor | None
+    reference_command_position: torch.Tensor | None
 
 
 class NativeResidualAction(ActionTerm):
     """WORLD-left SE(3) root residuals plus independent native finger commands.
 
     Layout is all named root translations, all named root rotation vectors,
-    then the declared independent finger actuators. Passive mimic coordinates
+    then the declared independent logical commands. Passive mimic coordinates
     never become policy outputs. The source root is already registered to the
     physical target body; raw MANO wrist poses are not accepted here.
     """
@@ -98,26 +100,44 @@ class NativeResidualAction(ActionTerm):
         finger_ids, self.finger_joint_names = (
             self._entity.find_joints_by_actuator_names(self.finger_actuator_names)
         )
+        self.finger_command_names, _, mapping = self.layout.command_coordinates(self.finger_joint_names)
+        self._actuator_command_mapping = mapping
+        self.actuator_command_indices = torch.tensor(mapping, dtype=torch.long, device=self.device)
+        counts = torch.bincount(self.actuator_command_indices, minlength=len(self.finger_command_names))
+        self.actuator_command_weights = counts[self.actuator_command_indices].float().reciprocal()
         self._finger_ids = torch.tensor(
             finger_ids, dtype=torch.long, device=self.device
         )
-        limits = torch.as_tensor(
+        self.finger_actuator_limits = torch.as_tensor(
             self._entity.native_command_limits(self.finger_actuator_names),
             dtype=torch.float32,
             device=self.device,
         )
+        limits, action_names = [], []
+        start = 0
+        for hand in self.layout.hands:
+            end = start + len(hand.command_actuator_names)
+            actuator_limits = self.finger_actuator_limits[start:end]
+            limits.append(torch.as_tensor(hand.command_limits, device=self.device,
+                                          dtype=actuator_limits.dtype) if hand.command_limits else actuator_limits)
+            # Keep exact one-actuator policy columns named as in existing checkpoints.
+            exact_order = hand.actuator_command_indices == tuple(range(hand.command_count))
+            action_names.extend(hand.command_actuator_names if exact_order or not hand.command_names
+                                else hand.command_names)
+            start = end
+        limits = torch.cat(limits)
         self._lower, self._upper = limits.unbind(-1)
         roots = len(self.hand_sides)
         trans_names = [
             f"{s}_root_translation_{a}" for s in self.hand_sides for a in "xyz"
         ]
         rot_names = [f"{s}_root_rotation_{a}" for s in self.hand_sides for a in "xyz"]
-        self.action_names = (*trans_names, *rot_names, *self.finger_actuator_names)
+        self.action_names = (*trans_names, *rot_names, *action_names)
         root_sides = tuple(s for s in self.hand_sides for _ in "xyz")
         self.action_sides = (
             *root_sides,
             *root_sides,
-            *(h.side for h in self.layout.hands for _ in h.command_actuator_names),
+            *(h.side for h in self.layout.hands for _ in range(h.command_count)),
         )
         self._translation_slice = slice(0, 3 * roots)
         self._rotation_slice = slice(3 * roots, 6 * roots)
@@ -143,7 +163,7 @@ class NativeResidualAction(ActionTerm):
                 for group, size in (
                     ("wrist_trans", 3 * roots),
                     ("wrist_rot", 3 * roots),
-                    ("finger", len(finger_ids)),
+                    ("finger", len(self.finger_command_names)),
                 )
             ]
         ).to(self.device)
@@ -162,6 +182,8 @@ class NativeResidualAction(ActionTerm):
         self._finger_source_support = torch.zeros_like(
             self._finger_target, dtype=torch.bool
         )
+        self._finger_requested = torch.zeros(self.num_envs, len(self.finger_command_names), device=self.device)
+        self._finger_requested_support = torch.zeros_like(self._finger_requested, dtype=torch.bool)
         self._root_target = torch.zeros(self.num_envs, roots, 13, device=self.device)
         self._root_support = torch.zeros(
             self.num_envs, roots, dtype=torch.bool, device=self.device
@@ -200,7 +222,7 @@ class NativeResidualAction(ActionTerm):
             "wrist_target_twist": cfg.wrist_target_twist,
             "root_rate_support": "independent_source_component_support",
             "correction_rate": None if cfg.wrist_target_twist == "source_only"
-            else "adjacent_filtered_world_increment_first_packet_zero",
+            else "adjacent_effective_world_increment_after_guide_and_limits_first_packet_zero",
             "finger_residual_rad": cfg.finger_residual_rad,
             "finger_effective_limits_rad": limits.cpu().tolist(),
             "cutoff_hz": dict(cfg.cutoff_hz),
@@ -211,7 +233,7 @@ class NativeResidualAction(ActionTerm):
         }
         if cfg.source_contact_approach is not None:
             self._action_recipe["source_contact_approach"] = dict(cfg.source_contact_approach)
-        self.ref_joint_pos_used = None
+        self.ref_command_pos_used = None
 
     @property
     def action_dim(self) -> int:
@@ -248,6 +270,10 @@ class NativeResidualAction(ActionTerm):
             "hand_body_names": self.hand_body_names,
             "finger_actuator_names": self.finger_actuator_names,
             "finger_joint_names": tuple(self.finger_joint_names),
+            "finger_command_names": self.finger_command_names,
+            "actuator_command_indices": self._actuator_command_mapping,
+            "finger_requested": self._finger_requested,
+            "finger_requested_support": self._finger_requested_support,
             "finger_target_rad": self._finger_target,
             "finger_source_support": self._finger_source_support,
             "root_state_w": self._root_target,
@@ -264,22 +290,30 @@ class NativeResidualAction(ActionTerm):
         }
 
     def capture_control_context(self) -> NativeActionControlContext:
-        reference = getattr(self, "ref_joint_pos_used", None)
+        reference = getattr(self, "ref_command_pos_used", None)
         return NativeActionControlContext(
             **{name: getattr(self, "_" + name).clone()
                for name in NativeActionControlContext.__dataclass_fields__
-               if name != "reference_joint_position"},
-            reference_joint_position=None if reference is None else reference.clone(),
+               if name != "reference_command_position"},
+            reference_command_position=None if reference is None else reference.clone(),
         )
 
     def restore_control_context(self, context: NativeActionControlContext) -> None:
         for name, value in vars(context).items():
-            if name != "reference_joint_position":
+            if name != "reference_command_position":
                 getattr(self, "_" + name).copy_(value)
-        if context.reference_joint_position is None:
-            self.__dict__.pop("ref_joint_pos_used", None)
+        if context.reference_command_position is None:
+            self.__dict__.pop("ref_command_pos_used", None)
         else:
-            self.ref_joint_pos_used = context.reference_joint_position.clone()
+            self.ref_command_pos_used = context.reference_command_position.clone()
+
+    def _wrist_translation(self) -> torch.Tensor:
+        correction = self._processed_actions[:, self._translation_slice].reshape(self.num_envs, -1, 3)
+        cap = self.cfg.translation_residual_m
+        translation = correction * cap
+        if self._source_contact_guard is not None:
+            translation = (translation + self._source_contact_translation).clamp(-cap, cap)
+        return translation
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
@@ -288,18 +322,23 @@ class NativeResidualAction(ActionTerm):
             processed = processed.clamp(self._clip[:, 0], self._clip[:, 1])
         pending = self._filter_pending.clone()
         if self.cfg.wrist_target_twist == "filtered_correction_feedforward":
-            previous_translation = self._filter_state[:, self._translation_slice].clone()
+            previous_translation = self._wrist_translation()
             previous_rotation = self._filter_state[:, self._rotation_slice].clone()
             self._correction_interval_valid[:] = ~pending
         self._filter_state[pending] = processed[pending]
         self._filter_state.lerp_(processed, self._alpha)
         self._filter_pending[:] = False
         self._processed_actions[:] = self._filter_state
+        if self._source_contact_guard is not None:
+            command = self._env.command_manager.get_term(self.cfg.command_name)
+            direction, part = command.source_contact_approach_direction(
+                command._motion_flat_ids, **self._source_contact_guard)
+            self._source_contact_translation.masked_fill_((part != self._source_contact_part)[..., None], 0.0)
+            self._source_contact_translation.lerp_(direction * self._source_contact_scale, 0.35)
+            self._source_contact_part.copy_(part)
         if self.cfg.wrist_target_twist == "filtered_correction_feedforward":
-            translation = self._filter_state[:, self._translation_slice]
             self._correction_twist[..., :3] = (
-                (translation - previous_translation).reshape(self.num_envs, -1, 3)
-                * self.cfg.translation_residual_m / self._control_dt
+                (self._wrist_translation() - previous_translation) / self._control_dt
             )
             previous_rotation = previous_rotation.reshape(self.num_envs, -1, 3)
             rotation = self._filter_state[:, self._rotation_slice].reshape(
@@ -322,13 +361,6 @@ class NativeResidualAction(ActionTerm):
             self._correction_twist.masked_fill_(
                 ~self._correction_interval_valid[:, None, None], 0.0
             )
-        if self._source_contact_guard is not None:
-            command = self._env.command_manager.get_term(self.cfg.command_name)
-            direction, part = command.source_contact_approach_direction(
-                command._motion_flat_ids, **self._source_contact_guard)
-            self._source_contact_translation.masked_fill_((part != self._source_contact_part)[..., None], 0.0)
-            self._source_contact_translation.lerp_(direction * self._source_contact_scale, 0.35)
-            self._source_contact_part.copy_(part)
 
     def apply_actions(self) -> None:
         command = self._env.command_manager.get_term(self.cfg.command_name)
@@ -336,28 +368,23 @@ class NativeResidualAction(ActionTerm):
         ml = command.motion_lib
         self._reference_motion_ids[:] = command.motion_ids
         self._reference_motion_steps[:] = command.motion_steps
-        self.ref_joint_pos_used = command.ref_joint_pos
-        support = ml.native_joint_position_support[ids][:, self._finger_ids]
+        self.ref_command_pos_used, support = command.requested_command_reference(ids)
         action = self._processed_actions[:, self._finger_slice]
         if self.cfg.finger_residual_rad is None:
             requested = unscale_transform(action, self._lower, self._upper)
         else:
-            requested = (
-                self.ref_joint_pos_used[:, self._finger_ids]
-                + action * self.cfg.finger_residual_rad
-            )
+            requested = self.ref_command_pos_used + action * self.cfg.finger_residual_rad
+        self._finger_requested[:] = torch.where(support, requested, 0.0)
+        self._finger_requested_support[:] = support
+        mapping = self.actuator_command_indices
+        actuator_support = support[:, mapping]
         carried = self._entity.data.joint_pos_target[:, self._finger_ids]
-        self._finger_target[:] = torch.where(support, requested, carried).clamp(
-            self._lower, self._upper
+        self._finger_target[:] = torch.where(actuator_support, requested[:, mapping], carried).clamp(
+            self.finger_actuator_limits[:, 0], self.finger_actuator_limits[:, 1]
         )
-        self._finger_source_support[:] = support
+        self._finger_source_support[:] = actuator_support
         self._entity.set_joint_position_target(self._finger_target, self._finger_ids)
-        translation = self._processed_actions[:, self._translation_slice].reshape(
-            self.num_envs, -1, 3
-        ) * self.cfg.translation_residual_m
-        if self._source_contact_guard is not None:
-            cap = self.cfg.translation_residual_m
-            translation = (translation + self._source_contact_translation).clamp(-cap, cap)
+        translation = self._wrist_translation()
         rotation = self._processed_actions[:, self._rotation_slice].reshape(
             self.num_envs, -1, 3
         )
@@ -409,3 +436,6 @@ class NativeResidualAction(ActionTerm):
         self._correction_twist[rows] = 0.0
         self._correction_interval_valid[rows] = False
         self._installed_valid[rows] = False
+        self._finger_requested[rows] = 0.0
+        self._finger_requested_support[rows] = False
+        self._finger_source_support[rows] = False

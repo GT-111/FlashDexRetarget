@@ -135,8 +135,14 @@ rigid objects and articulated objects together, with genuinely absent joints
 omitted. Each hand can declare `tip_source_point_names` from the prepared
 MANO reference alongside the corresponding physical `tip_site_names`. The
 prepared profile binds both hands by those roles and uses the command
-actuators declared by the scene. Older references with only site names can
-still use their original robot profile.
+actuators declared by the scene. Named logical targets in the prepared
+reference can fan out to several physical drives. Each drive uses its
+compiled limits. Rollouts retain the logical request, installed drive
+targets and measured scalar joint state as separate arrays, with solved
+generalized actuator effort when the backend supplies it. Older one-to-one
+references use the exact driven coordinate of each named actuator.
+New native checkpoints bind observation order and the actual named action
+and state columns at both resume and frozen replay.
 
 Select `--config_name native_hoi_surface envs/robot@robot=prepared_native`
 for the HOI producer with declared fingertip roles.
@@ -482,13 +488,13 @@ It renders object tracking error, per-hand contact forces and supported interval
 Pass a directory containing one prepared dataset per hand to compare hands on the same clips and object layout.
 For a hand with multiple prepared selections, point `--dataset` at the selection containing the desired `motion.pt`.
 
-### Six-hand grasp-hardened native HOI recipe (`native_hoi_surface`)
+### Prepared native HOI recipe (`native_hoi_surface`)
 
 `config/native_hoi_surface.yaml` combines worst-named-part surface tracking, `native_source_tip_reference_error`,
 `native_source_hand_part_intent`, same-part thumb and fingertip approach and contact credit,
 contact-gated rotational `xfrc` scaling (`contact_scale: 0.5`), post-decay wrench
-perturbations (`require_assist_decayed: true`), and fast adaptive `xfrc -> 0` decay across all six registered FREE-wrist
-robot configs (`config/envs/robot/{inspire_rh56f1,inspire_rh56dftp,wuji_hand,sharpa_wave_native,unitree_dex3_1,wonik_allegro_v5}_bimanual.yaml`).
+perturbations (`require_assist_decayed: true`), and adaptive `xfrc -> 0` decay
+with the hand actuators and contact sites declared in the prepared scene.
 Pairing `envs/simulator@simulator=newton` with CoACD convex hulls capped at `<= 16` hulls and `<= 32` vertices/hull runs
 native `SolverMuJoCo` contacts. `NativeRolloutRecord` measures the post-solve force and torque peaks
 over each supported interval from `mjw_data.xfrc_applied`.
@@ -504,7 +510,8 @@ wrist translation budget. The approach uses the achieved fingertip surface
 normal while that part remains within 20 mm and 20° of its reference pose.
 It clears as soon as the source engagement, pose tolerance, or nearby
 surface support fails at a control decision. The same action runs in training
-and evaluation.
+and evaluation. Wrist feedforward differentiates the effective translation
+after this guide and the wrist cap, on the actual control interval.
 The HOI recipe treats a take that exceeds 5 cm of part translation or 20° of
 part rotation as a training failure. The part-position reward uses the same
 5 cm scale. Frozen evaluation still records the entire source take so the
@@ -512,7 +519,9 @@ failure window can be inspected.
 Set `eval.interval=0` for an HOI training run whose exact-zero FULL checkpoint
 will be evaluated separately in nominal and perturbed modes. Runs that begin
 with zero assistance must still execute the full 15-epoch zero hold before an
-eligible checkpoint is written.
+eligible checkpoint is written. The saved actor optimizer must have applied
+an update during that zero hold. A run that exhausts its budget during replay
+warm-up saves a resumable FULL without a qualification receipt.
 
 ## Project Structure
 

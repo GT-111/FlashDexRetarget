@@ -202,7 +202,7 @@ class ObsCompactor:
                 scale = by_name[source].scale
                 if scale is not None and bool((scale == 0).any()):
                     raise ValueError(f"native replay cannot recover zero-scaled {source} values")
-            commands = tuple(command.robot.joint_names[int(i)] for i in command.native_command_joint_ids)
+            commands = {name for group in command.native_command_state_joint_names for name in group}
             for source in ("robot_joint_pos", "robot_joint_vel"):
                 span = by_name[source]
                 if span.entity_name is None or command._env.scene[span.entity_name] is not command.robot:
@@ -210,9 +210,7 @@ class ObsCompactor:
                 names = span.joint_names
                 if names is None or any(name not in names for name in commands):
                     raise ValueError(f"native replay {source} is missing required named command columns")
-                self._native_joint_columns[source] = torch.tensor(
-                    [names.index(name) for name in commands], dtype=torch.long, device=self._device,
-                )
+                self._native_joint_columns[source] = command.command_state_columns(names).to(self._device)
         self._builders: dict[str, Callable[..., torch.Tensor]] = {
             "obj_point_cloud_wrist": self._build_obj_point_cloud_wrist,
             "ref_future_obj_point_cloud_delta_wrist": self._build_future_obj_point_cloud_delta_wrist,
@@ -360,18 +358,19 @@ class ObsCompactor:
         object_position = object_state[:, :joints]
         object_velocity = object_state[:, joints:]
         return build_native_future_reference(
-            self._cmd.motion_lib,
+            self._cmd,
             mid,
             step,
             sides=self._sides,
             wrist_pose=self._get(compact, "robot_wrist_pose_w").reshape(-1, sides, 7),
             wrist_linear_velocity=self._get(compact, "robot_wrist_lin_vel_w").reshape(-1, sides, 3),
             wrist_angular_velocity=self._get(compact, "robot_wrist_ang_vel_w").reshape(-1, sides, 3),
-            command_position=self._get(compact, "robot_joint_pos")[:, self._native_joint_columns["robot_joint_pos"]],
-            command_velocity=self._get(compact, "robot_joint_vel")[:, self._native_joint_columns["robot_joint_vel"]],
+            command_position=self._cmd.project_command_state(
+                self._get(compact, "robot_joint_pos"), self._native_joint_columns["robot_joint_pos"]),
+            command_velocity=self._cmd.project_command_state(
+                self._get(compact, "robot_joint_vel"), self._native_joint_columns["robot_joint_vel"]),
             object_joint_position=object_position,
             object_joint_velocity=object_velocity,
-            command_joint_ids=self._cmd.native_command_joint_ids,
             object_joint_columns=self._cmd._object_joint_columns,
             n_future=n_future,
             stride=stride,

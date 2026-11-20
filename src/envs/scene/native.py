@@ -6,6 +6,7 @@ engine-specific converted assets remain in the simulator configuration.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Mapping
@@ -38,6 +39,30 @@ class NativeHandCfg(NativeArticulationCfg):
     command_actuator_names: tuple[str, ...]
     root_control: NativeRootControlCfg
     tip_site_names: tuple[str, ...] = ()
+    command_names: tuple[str, ...] = ()
+    actuator_command_indices: tuple[int, ...] = ()
+    command_limits: tuple[tuple[float, float], ...] = ()
+    command_state_joint_names: tuple[tuple[str, ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.command_actuator_names or len(set(self.command_actuator_names)) != len(self.command_actuator_names):
+            raise ValueError(f"native hand {self.side!r} requires distinct physical actuators")
+        if not any((self.command_names, self.actuator_command_indices, self.command_limits, self.command_state_joint_names)):
+            return
+        n = len(self.command_names)
+        if (not n or len(set(self.command_names)) != n
+                or len(self.actuator_command_indices) != len(self.command_actuator_names)
+                or any(type(index) is not int for index in self.actuator_command_indices)
+                or set(self.actuator_command_indices) != set(range(n))
+                or len(self.command_limits) != n or len(self.command_state_joint_names) != n
+                or any(len(bounds) != 2 or not all(math.isfinite(v) for v in bounds)
+                       or bounds[0] >= bounds[1] for bounds in self.command_limits)
+                or any(not names or len(set(names)) != len(names) for names in self.command_state_joint_names)):
+            raise ValueError(f"native hand {self.side!r} has an invalid named logical command binding")
+
+    @property
+    def command_count(self) -> int:
+        return len(self.command_names or self.command_actuator_names)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -79,6 +104,10 @@ class NativeSceneCfg:
                 command_actuator_names=tuple(h["command_actuator_names"]),
                 root_control=NativeRootControlCfg(**dict(h["root_control"])),
                 tip_site_names=tuple(h.get("tip_site_names", ())),
+                command_names=tuple(h.get("command_names", ())),
+                actuator_command_indices=tuple(h.get("actuator_command_indices", ())),
+                command_limits=tuple(tuple(bounds) for bounds in h.get("command_limits", ())),
+                command_state_joint_names=tuple(tuple(names) for names in h.get("command_state_joint_names", ())),
             )
             for h in config["hands"]
         )
@@ -103,6 +132,23 @@ class NativeSceneCfg:
             if len(set(values)) != len(values):
                 raise ValueError(f"native articulations require distinct {field}")
         return layout
+
+    def command_coordinates(self, actuator_joint_names):
+        """Ordered logical names, associated measured Q groups and physical A-to-C indices."""
+        names, groups, indices = [], [], []
+        start = 0
+        for hand in self.hands:
+            end = start + len(hand.command_actuator_names)
+            actual = tuple(actuator_joint_names[start:end])
+            indices.extend(len(names) + i for i in (
+                hand.actuator_command_indices or range(len(actual))))
+            names.extend(hand.command_names or actual)
+            groups.extend(hand.command_state_joint_names or ((name,) for name in actual))
+            start = end
+        if (len(actuator_joint_names) != start or len(set(names)) != len(names)
+                or len(set(actuator_joint_names)) != len(actuator_joint_names)):
+            raise ValueError("native hand control requires distinct named logical commands and driven joints")
+        return tuple(names), tuple(groups), tuple(indices)
 
     @property
     def articulations(self) -> tuple[NativeArticulationCfg, ...]:

@@ -355,8 +355,10 @@ def test_native_bc_uses_installed_independent_reference_and_support(tmp_path):
     )
     term = SimpleNamespace(
         installed_control=installed,
-        ref_joint_pos_used=torch.tensor([[0.2, -100.0, 0.3]]),
-        finger_command_limits=torch.tensor([[0.0, 1.0], [0.0, 2.0]]),
+        ref_command_pos_used=torch.tensor([[0.2, 0.3]]),
+        finger_actuator_limits=torch.tensor([[0.0, 1.0], [0.0, 2.0]]),
+        actuator_command_indices=torch.tensor([0, 1]),
+        actuator_command_weights=torch.ones(2),
     )
     env.action_manager = SimpleNamespace(_terms={"native": term})
     command.robot.data.joint_pos[:] = (
@@ -872,8 +874,8 @@ def test_native_reward_routing_preserves_scalar_under_support_and_single_hand_ch
     scalar_manager = RewardManager(build_rewards(scalar_cfg, command_name="native_credit", entity_name="robot"), env)
     assert set(scalar_manager.active_terms) == set(env.reward_recipe.reward_weights)
     installed = action.installed_control
-    action.ref_joint_pos_used = command.ref_joint_pos.clone()
-    installed["finger_target_rad"][:] = action.ref_joint_pos_used[:, command.native_command_joint_ids]
+    action.ref_command_pos_used = command.command_reference()["position"].clone()
+    installed["finger_target_rad"][:] = action.ref_command_pos_used[:, action.actuator_command_indices]
     installed["finger_source_support"][:] = True
     installed["installed_valid"][:] = True
     for side in command._side_list:
@@ -1201,6 +1203,7 @@ def _source_geometry_command(widths=(("right", 3), ("left", 5))):
     command._side_list = [side for side, _ in widths]
     command.native_layout = replace(command.native_layout, hands=tuple(
         hand for side, _ in widths for hand in command.native_layout.hands if hand.side == side))
+    command._finger_joint_ids = torch.tensor([0 if side == "left" else 2 for side, _ in widths])
     command._root_body_ids = [0 if side == "left" else 1 for side, _ in widths]
     env.scene.env_origins = torch.tensor([[2., -1., .5]])
     command.robot.data.body_link_pos_w += env.scene.env_origins[:, None]

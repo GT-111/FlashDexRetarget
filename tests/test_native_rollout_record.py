@@ -872,6 +872,7 @@ def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assista
         _declare_joint_coordinates(next(iter(command.native_objects.values())), ("slide", "hinge"))
         _declare_joint_coordinates(command.robot, ("slide", "hinge", "hinge"))
         command._bind_native_reference()
+        command.robot.data.qfrc_actuator = torch.tensor([[.5, 0., -.7]])
         _add_loose_object(command, env, [])
         # A type does not rename, convert, or reorder observed coordinates.
         next(iter(command.native_objects.values())).data.joint_pos[:] = torch.tensor([[.023, -.4]])
@@ -902,6 +903,12 @@ def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assista
     assert commands["velocity_units"] == ["m/s", "rad/s"]
     np.testing.assert_array_equal(recorded.arrays["installed_finger_target_rad"],
                                   np.array([[0., 0.], [1., 1.], [1., 1.]], np.float32))
+    assert recorded.installed_control_metadata["finger_command_names"] == ["left_driver", "right_driver"]
+    np.testing.assert_array_equal(recorded.arrays["requested_finger_command"], [[0., 0.], [1., 1.], [1., 1.]])
+    np.testing.assert_array_equal(recorded.arrays["requested_finger_command_support"], [[False, False], [True, True], [True, True]])
+    np.testing.assert_array_equal(recorded.arrays["joint_effort"], np.array([[0., 0., 0.], [.5, 0., -.7], [.5, 0., -.7]], np.float32))
+    np.testing.assert_array_equal(recorded.arrays["joint_effort_support"], [[False] * 3, [True] * 3, [True] * 3])
+    assert json.loads(str(recorded.arrays["joint_effort_metadata_json"]))["units"] == ["N", "N m", "N m"]
     assert recorded.installed_control_metadata["action_recipe"]["finger_effective_limits_rad"] == [[-1., 1.], [-1., 1.]]
     expected = torch.tensor([[.023, -.4]]).repeat(3, 1).numpy()
     np.testing.assert_array_equal(recorded.arrays["object_joint_pos"], expected)

@@ -133,11 +133,38 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             self._object_joint_slices[entity] = slice(start, start + len(obj.joint_names))
             start += len(obj.joint_names)
         self.robot_joint_coordinate_metadata = self.robot.joint_coordinate_metadata()
-        command_columns = self.native_command_joint_ids.tolist()
+        actuator_joint_names = tuple(self.robot.joint_names[i] for i in self._finger_joint_ids.tolist())
+        command_names, groups, mapping = self.native_layout.command_coordinates(actuator_joint_names)
+        self.native_command_state_joint_names = groups
+        self._command_state_columns = self.command_state_columns(self.robot.joint_names)
+        self._command_state_weights = None
+        if self._command_state_columns.ndim == 2:
+            width = self._command_state_columns.shape[-1]
+            self._command_state_weights = torch.tensor(
+                [[1.0 / len(names)] * len(names) + [0.0] * (width - len(names)) for names in groups],
+                device=self.device,
+            )
+        reference_names = getattr(ml, "native_command_names", None)
+        self._reference_command_columns = None
+        if reference_names is not None:
+            if set(reference_names) != set(command_names):
+                raise ValueError("native reference logical commands differ from the scene binding")
+            self._reference_command_columns = torch.tensor(
+                [reference_names.index(name) for name in command_names], device=self.device, dtype=torch.long,
+            )
+        elif (len(groups) != len(actuator_joint_names)
+              or any(groups[c] != (joint,) for joint, c in zip(actuator_joint_names, mapping, strict=True))):
+            raise ValueError("native reference requires explicit commands for a nonidentity actuator binding")
+
+        command_columns = [self.robot.joint_names.index(names[0]) for names in groups]
         self.command_joint_coordinate_metadata = {
             key: tuple(values[i] for i in command_columns)
             for key, values in self.robot_joint_coordinate_metadata.items()
         }
+        self.command_joint_coordinate_metadata["joint_names"] = command_names
+        types = dict(zip(self.robot.joint_names, self.robot_joint_coordinate_metadata["joint_types"], strict=True))
+        if any(len({types[name] for name in names}) != 1 for names in groups):
+            raise ValueError("native command state cannot project across different physical coordinate types")
 
         def unit_columns(metadata):
             return {
@@ -220,18 +247,45 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
 
     @property
     def native_command_joint_ids(self):
+        """Physical actuator joint ids, including any jointly commanded drives."""
         return self._finger_joint_ids
 
+    def command_state_columns(self, joint_names):
+        width = max(map(len, self.native_command_state_joint_names))
+        groups = [[joint_names.index(name) for name in names] for names in self.native_command_state_joint_names]
+        rows = [ids[0] for ids in groups] if width == 1 else [ids + [ids[0]] * (width - len(ids)) for ids in groups]
+        return torch.tensor(rows, dtype=torch.long, device=self.device)
+
+    def project_command_state(self, joint_state, columns=None):
+        """Project measured physical state into the declared logical coordinate groups."""
+        columns = self._command_state_columns if columns is None else columns
+        values = joint_state[..., columns]
+        weights = self._command_state_weights
+        if weights is None:
+            return values
+        if values.dtype == torch.bool:
+            return (values | (weights == 0)).all(-1)
+        return (values * weights).sum(-1)
+
+    def requested_command_reference(self, ids):
+        """Admitted logical position targets and their independent support."""
+        ml, columns = self.motion_lib, self._reference_command_columns
+        if columns is None:
+            return (self.project_command_state(ml.robot_joint_pos[ids]),
+                    self.project_command_state(ml.native_joint_position_support[ids]))
+        return ml.native_command_pos[ids][..., columns], ml.native_command_position_support[ids][..., columns]
+
     def command_reference(self, ids=None):
-        """Independent native commands only; passive mimic joints are not BC actions."""
+        """Requested logical positions and projected physical reference rates."""
         ids = self._motion_flat_ids if ids is None else ids
-        ml, columns = self.motion_lib, self.native_command_joint_ids
+        ml = self.motion_lib
+        position, position_support = self.requested_command_reference(ids)
         return {
             **self.command_joint_coordinate_metadata,
-            "position": ml.robot_joint_pos[ids][..., columns],
-            "velocity": ml.robot_joint_vel[ids][..., columns],
-            "position_support": ml.native_joint_position_support[ids][..., columns],
-            "velocity_support": ml.native_joint_velocity_support[ids][..., columns],
+            "position": position,
+            "velocity": self.project_command_state(ml.robot_joint_vel[ids]),
+            "position_support": position_support,
+            "velocity_support": self.project_command_state(ml.native_joint_velocity_support[ids]),
         }
 
     def object_joint_reference(self, ids=None):
@@ -621,7 +675,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         linear = self.object_joint_columns_by_unit["m"]
         joint_error = (object_ref["position"] - self.native_object_joint_pos).abs()
         command_error = (
-            command_ref["position"] - self.robot.data.joint_pos[:, self.native_command_joint_ids]
+            command_ref["position"] - self.project_command_state(self.robot.data.joint_pos)
         ).abs()
         command_angular = self.command_joint_columns_by_unit["rad"]
         command_linear = self.command_joint_columns_by_unit["m"]

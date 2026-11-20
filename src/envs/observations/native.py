@@ -84,7 +84,7 @@ def build_native_next_part_point_cloud_delta(
 
 
 def build_native_future_reference(
-    motion_lib,
+    command,
     motion_ids,
     motion_steps,
     *,
@@ -96,7 +96,6 @@ def build_native_future_reference(
     command_velocity,
     object_joint_position,
     object_joint_velocity,
-    command_joint_ids,
     object_joint_columns,
     n_future,
     stride,
@@ -108,7 +107,7 @@ def build_native_future_reference(
     from live worlds. ``motion_steps`` is the observation's own command phase.
     Native support, column permutations and int64 query clocks stay independent.
     """
-    ml = motion_lib
+    ml = command.motion_lib
     offsets = torch.arange(1, n_future + 1, device=motion_steps.device) * stride
     future_steps = motion_steps[:, None] + offsets
     last = ml._motion_num_frames[motion_ids, None] - 1
@@ -118,6 +117,7 @@ def build_native_future_reference(
     rows = []
     for k in range(n_future):
         index = ids[:, k]
+        reference = command.command_reference(index)
         fields = []
         for side_index, side in enumerate(sides):
             target = ml.native_root_state_w[side][index]
@@ -139,10 +139,10 @@ def build_native_future_reference(
             fields.extend(mask[:, None].float() for mask in (pose, linear, angular))
         for position, velocity, position_support, velocity_support, actual_q, actual_v in (
             (
-                ml.robot_joint_pos[index][:, command_joint_ids],
-                ml.robot_joint_vel[index][:, command_joint_ids],
-                ml.native_joint_position_support[index][:, command_joint_ids],
-                ml.native_joint_velocity_support[index][:, command_joint_ids],
+                reference["position"],
+                reference["velocity"],
+                reference["position_support"],
+                reference["velocity_support"],
                 command_position,
                 command_velocity,
             ),
@@ -251,17 +251,16 @@ class NativeMotionTrackingObs(MotionTrackingObs):
     def native_command_reference_error(env, command_name):
         command = env.command_manager.get_term(command_name)
         ref = command.command_reference()
-        columns = command.native_command_joint_ids
         return torch.cat(
             [
                 torch.where(
                     ref["position_support"],
-                    ref["position"] - command.robot.data.joint_pos[:, columns],
+                    ref["position"] - command.project_command_state(command.robot.data.joint_pos),
                     0.0,
                 ),
                 torch.where(
                     ref["velocity_support"],
-                    ref["velocity"] - command.robot.data.joint_vel[:, columns],
+                    ref["velocity"] - command.project_command_state(command.robot.data.joint_vel),
                     0.0,
                 ),
             ],
@@ -418,7 +417,7 @@ class NativeMotionTrackingObs(MotionTrackingObs):
         """
         command = env.command_manager.get_term(command_name)
         return build_native_future_reference(
-            command.motion_lib,
+            command,
             command.motion_ids,
             command.motion_steps,
             sides=command._side_list,
@@ -431,11 +430,10 @@ class NativeMotionTrackingObs(MotionTrackingObs):
             ),
             wrist_linear_velocity=command.robot_wrist_lin_vel_w,
             wrist_angular_velocity=command.robot_wrist_ang_vel_w,
-            command_position=command.robot.data.joint_pos[:, command.native_command_joint_ids],
-            command_velocity=command.robot.data.joint_vel[:, command.native_command_joint_ids],
+            command_position=command.project_command_state(command.robot.data.joint_pos),
+            command_velocity=command.project_command_state(command.robot.data.joint_vel),
             object_joint_position=command.native_object_joint_pos,
             object_joint_velocity=command.native_object_joint_vel,
-            command_joint_ids=command.native_command_joint_ids,
             object_joint_columns=command._object_joint_columns,
             n_future=n_future,
             stride=stride,

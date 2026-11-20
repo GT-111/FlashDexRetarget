@@ -650,11 +650,15 @@ def test_native_isaac_contacts_resolve_named_rigid_descendants_before_reset(monk
 
 def _native_action_case(
     tmp_path, *, wrist_target_twist="source_only", dt=.02, cutoff_hz=None,
-    hand_sides=("left", "right"),
+    hand_sides=("left", "right"), fanout=False, source_contact_approach=None,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     layout, mapping = _scene(tmp_path)
     mapping["hands"] = [hand for hand in mapping["hands"] if hand["side"] in hand_sides]
+    if fanout:
+        right = next(hand for hand in mapping["hands"] if hand["side"] == "right")
+        right.update(command_names=["right_grip"], actuator_command_indices=[0, 0], command_limits=[[0., 1.]],
+                     command_state_joint_names=[["right_joint", "right_other"]])
     meta = load_robot_mjcf_meta(layout.scene_xml_path)
     names = ["left_joint", "left_mimic", "right_joint", "right_other"]
     accepted = []
@@ -708,6 +712,7 @@ def _native_action_case(
         motion_ids=torch.tensor([2, 3]),
         motion_steps=torch.tensor([4, 5]),
         ref_joint_pos=torch.zeros(2, 4),
+        source_contact_approach_direction=lambda *args, **kwargs: command.approach_dir_and_part,
     )
     env = SimpleNamespace(
         num_envs=2,
@@ -727,9 +732,20 @@ def _native_action_case(
             clip={".*": (-1.0, 1.0)},
             wrist_target_twist=wrist_target_twist,
             cutoff_hz={} if cutoff_hz is None else cutoff_hz,
+            source_contact_approach=source_contact_approach,
         ),
         env,
     )
+    if fanout:
+        command.requested_command_reference = lambda ids: (
+            torch.tensor([[.3, .8], [.3, .8]])[ids],
+            torch.tensor([[True, True], [True, False]])[ids],
+        )
+    else:
+        command.requested_command_reference = lambda ids: (
+            command.ref_joint_pos[ids][:, action._finger_ids],
+            ml.native_joint_position_support[ids][:, action._finger_ids],
+        )
     return env, action, command, accepted
 
 
@@ -797,6 +813,47 @@ def test_actual_native_action_derives_dimensions_and_records_accepted_supported_
     json.dumps(recipe)  # A recorder can retain the actual accepted action recipe.
     action.reset(torch.tensor([0]))
     np.testing.assert_array_equal(record["installed_valid"], [False, True])
+
+
+def test_native_logical_residual_expands_to_independently_limited_drives(tmp_path):
+    _env, action, _command, _accepted = _native_action_case(tmp_path, fanout=True)
+    action.cfg.finger_residual_rad = 1.0
+    assert action.action_names[-2:] == ("command_A", "right_grip")
+    raw = torch.zeros_like(action.raw_action)
+    raw[:, action._finger_slice] = torch.tensor([.2, .7])
+    action.process_actions(raw)
+    action.apply_actions()
+    record = action.installed_control
+    assert record["finger_command_names"] == ("left_joint", "right_grip")
+    assert record["actuator_command_indices"] == (0, 1, 1)
+    torch.testing.assert_close(record["finger_requested"], torch.tensor([[.5, 1.5], [.5, 0.]]))
+    torch.testing.assert_close(record["finger_target_rad"], torch.tensor([[.4, 1., 1.5], [.4, .4, .5]]))
+    assert record["finger_source_support"].tolist() == [[True, True, True], [True, False, False]]
+    assert record["finger_requested_support"].tolist() == [[True, True], [True, False]]
+    torch.testing.assert_close(action._entity.data.joint_pos_target[:, 1], torch.full((2,), .3))
+
+
+def test_native_wrist_twist_follows_the_installed_guide_and_translation_cap(tmp_path):
+    _env, action, command, _accepted = _native_action_case(
+        tmp_path, wrist_target_twist="filtered_correction_feedforward",
+        source_contact_approach={"translation_m": .08, "guard": 1.},
+    )
+    direction = torch.zeros(2, 2, 3)
+    direction[..., 0] = 1.
+    command.approach_dir_and_part = direction, torch.zeros(2, 2, dtype=torch.long)
+    raw = torch.zeros_like(action.raw_action)
+    raw[:, (0, 3)] = .9
+    action.process_actions(raw)
+    action.apply_actions()
+    first = action.installed_control["root_state_w"][..., :3].clone()
+    assert not action._correction_twist.any()
+
+    command.approach_dir_and_part = -direction, torch.ones(2, 2, dtype=torch.long)
+    action.process_actions(raw)
+    action.apply_actions()
+    installed = action.installed_control["root_state_w"]
+    torch.testing.assert_close(installed[..., 7:10], (installed[..., :3] - first) / .02, atol=2e-5, rtol=1e-5)
+    torch.testing.assert_close(action._correction_twist[..., 0], torch.full((2, 2), -1.9))
 
 
 def test_native_wrist_source_only_keeps_source_rates_through_filter_updates(tmp_path):

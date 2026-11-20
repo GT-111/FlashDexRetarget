@@ -986,7 +986,7 @@ def test_native_initial_control_context_repeats_real_manager_lpf_phase_and_rng(t
     assert command.reference_phase["motion_steps"].tolist() == [0, 0]
     assert command.motion_steps.tolist() == [1, 1]
     assert bool(action._filter_pending.all()) and not bool(action._installed_valid.any())
-    assert not hasattr(action, "ref_joint_pos_used")
+    assert not hasattr(action, "ref_command_pos_used")
     assert not hasattr(env, "reward_buf")
     _assert_control_values_equal(env.capture_initial_control_context(), initial)
     repeated = run_two_steps()

@@ -21,6 +21,8 @@ def _case(widths):
     action.finger_joint_names = tuple(f"{side}_q{i}" for side, width in widths for i in range(width))
     roots = 6 * len(widths)
     action.action_names = tuple(f"root{i}" for i in range(roots)) + action.finger_actuator_names
+    action.finger_command_names = action.finger_joint_names
+    action._finger_slice = slice(roots, len(action.action_names))
     action._env = SimpleNamespace(num_envs=2, device="cpu")
     width = len(action.finger_joint_names)
     action._lower = torch.arange(width).float() * -.1 - .4

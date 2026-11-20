@@ -115,6 +115,12 @@ class MotionLibrary:
             setattr(self, attribute, _concat(
                 [reference[field][:, ids] for reference, ids in zip(references, columns, strict=True)],
                 self.device, dtype=dtype))
+        self.native_command_names = first.get("command_names")
+        if any(reference.get("command_names") != self.native_command_names for reference in references[1:]):
+            raise ValueError("native references select different logical command columns")
+        if self.native_command_names is not None:
+            for field, dtype in (("command_pos", torch.float32), ("command_position_support", torch.bool)):
+                setattr(self, "native_" + field, _concat([r[field] for r in references], self.device, dtype=dtype))
         self.native_time_ns = _concat([reference["time_ns"] for reference in references],
                                      self.device, dtype=torch.int64)
         self.native_clock_authority = [reference["clock_authority"] for reference in references]

@@ -587,12 +587,49 @@ def test_warmup_stop_request_commits_without_update(monkeypatch, tmp_path):
 
 def test_native_hoi_with_disabled_training_eval_finishes_without_a_second_evaluator(monkeypatch, tmp_path):
     runner, events = _stop_loop(tmp_path, monkeypatch)
-    runner._hoi_curriculum = SimpleNamespace(hoi_zero_receipt=lambda: None)
+    runner._hoi_curriculum = SimpleNamespace(has_zero_gains=lambda: False, hoi_zero_receipt=lambda: None)
     runner._started_at_hoi_zero = False
     runner._eval_stride = 0
     runner._finish = lambda: events.append(("finish", runner._final_step))
     runner.learn(1)
     assert events == ["collect", ("finish", 2)]
+
+
+@pytest.mark.parametrize("learning", ["warmup", "no_actor_step", "actor_step"])
+def test_hoi_zero_ready_requires_actor_optimization(monkeypatch, tmp_path, learning):
+    runner, _ = _stop_loop(tmp_path, monkeypatch, ready=learning != "warmup")
+    curriculum, env = _curriculum(kp=0, kv=0, force=0)
+    for step in range(1, 15 * 4):
+        _curriculum_step(curriculum, env, step)
+    runner._hoi_curriculum = curriculum
+    runner._started_at_hoi_zero = False
+    runner._eval_stride = 0
+    runner._agent.actor_optimizer_steps = 9
+    runner._collect = lambda *_args: _curriculum_step(curriculum, env, 15 * 4)
+    runner._finish = OffPolicyRunner._finish.__get__(runner)
+    checkpoints = []
+
+    def save_checkpoint(env_step, name, *, full):
+        checkpoints.append((env_step, name, full))
+        return tmp_path / name
+
+    def update():
+        if learning == "actor_step":
+            runner._agent.actor_optimizer_steps += 1
+        return {"critic/loss": 1.0}
+
+    runner._agent.update = update
+    runner._write_checkpoint = save_checkpoint
+    runner.learn(1)
+    ready = tmp_path / "hoi-zero-ready.json"
+    if learning == "actor_step":
+        assert checkpoints == [(2, "hoi-zero-2", True)]
+        assert json.loads(ready.read_text())["zero_optimization"] == {
+            "actor_steps_at_zero_start": 9, "actor_steps_at_checkpoint": 10,
+        }
+    else:
+        assert checkpoints == [(2, "final", True)]
+        assert not ready.exists()
 
 
 def test_stop_save_failure_preserves_request_and_no_committed_checkpoint(
@@ -752,6 +789,30 @@ def _curriculum_step(curriculum, env, step):
     curriculum.on_step(env)
 
 
+def test_curriculum_dials_back_only_after_a_decay_and_poor_completion():
+    curriculum, env = _curriculum()
+    curriculum.dialback_min_epochs = 1
+    env.termination_manager.terminated[:] = True
+    for step in range(1, 9):
+        _curriculum_step(curriculum, env, step)
+    assert curriculum.curr_gains == curriculum.init_gains
+    assert not curriculum.gain_history
+
+    env.termination_manager.time_outs[:] = True
+    for step in range(9, 17):
+        _curriculum_step(curriculum, env, step)
+    assert curriculum.curr_gains == {"kp": 72.0, "kv": 4.5, "fr": 50.0}
+    assert len(curriculum.gain_history) == 1
+
+    env.termination_manager.time_outs[:] = False
+    for step in range(17, 25):
+        _curriculum_step(curriculum, env, step)
+    assert curriculum.curr_gains == {"kp": 78.4, "kv": 4.9, "fr": 50.0}
+    assert not curriculum.completion_rates
+    assert curriculum.num_epoch_since_last_decay == 0
+    assert not curriculum.gain_history
+
+
 def test_curriculum_restores_histories_and_partial_epoch_on_fresh_control_clock():
     original, env = _curriculum()
     for step in range(1, 7):
@@ -771,6 +832,7 @@ def test_curriculum_restores_histories_and_partial_epoch_on_fresh_control_clock(
 
 def test_hoi_zero_hold_requires_fifteen_actual_epochs_after_adaptive_decay():
     curriculum, env = _curriculum()
+    curriculum.dialback_min_epochs = 1
     curriculum.upper_ratios = dict.fromkeys(curriculum.decay_terms, 0.01)
     curriculum.kp_zero_thres = 1.0
     for step in range(1, 17):
@@ -780,9 +842,11 @@ def test_hoi_zero_hold_requires_fifteen_actual_epochs_after_adaptive_decay():
     assert curriculum.has_zero_gains()
     assert curriculum.hoi_zero_receipt() is None
     first_zero_step = step
+    env.termination_manager.terminated[:] = True
     for step in range(first_zero_step + 1, first_zero_step + 14 * 4 + 1):
         _curriculum_step(curriculum, env, step)
     assert curriculum.num_epoch_since_last_decay == 14
+    assert curriculum.has_zero_gains()
     assert curriculum.hoi_zero_receipt() is None
 
     restored, fresh = _curriculum()
@@ -816,18 +880,21 @@ def test_hoi_frozen_evaluation_checks_actual_restored_full_curriculum(tmp_path):
     for step in range(1, 15 * 4 + 1):
         _curriculum_step(trained, env, step)
     state = {"env_step": 512, "curriculum": trained.state_dict(),
-             "native_hoi_zero": trained.hoi_zero_receipt(), "native_hoi_source_revision": "test-source"}
+             "native_hoi_zero": trained.hoi_zero_receipt(), "native_hoi_source_revision": "test-source",
+             "native_hoi_zero_optimization": {"actor_steps_at_zero_start": 5, "actor_steps_at_checkpoint": 12}}
     (tmp_path / "replay_buffer.pt").touch()
     torch.save(state, tmp_path / LEARNING_STATE_FILE)
     restored, _ = _curriculum()
     command = SimpleNamespace(_xfrc_curr_ctrl=restored)
-    receipt = _restore_hoi_zero_curriculum(command, tmp_path, 512, "test-source", 0)
-    assert receipt == {**state["native_hoi_zero"], "restored": True}
+    receipt = _restore_hoi_zero_curriculum(command, tmp_path, 512, "test-source", 0, 12)
+    assert receipt == {**state["native_hoi_zero"], "restored": True, "zero_assist_actor_optimizer_steps": 7}
+    with pytest.raises(ValueError, match="actor optimizer update during the zero hold"):
+        _restore_hoi_zero_curriculum(command, tmp_path, 512, "test-source", 0, 5)
 
     state["curriculum"]["curr_gains_lower"]["fr"] = 1e-15
     torch.save(state, tmp_path / LEARNING_STATE_FILE)
     with pytest.raises(ValueError, match="restored FULL curriculum disagrees"):
-        _restore_hoi_zero_curriculum(command, tmp_path, 512, "test-source", 0)
+        _restore_hoi_zero_curriculum(command, tmp_path, 512, "test-source", 0, 12)
 
 
 def test_shared_env_runner_reset_does_not_count_old_physical_episode_as_completed():
@@ -1106,6 +1173,7 @@ def test_real_sac_learning_and_full_owner_restore_keep_schedules_rng_and_fresh_e
         info = original.update()
         assert info and all(np.isfinite(value) for value in info.values())
     assert original._alg.update_step == 2
+    assert original.actor_optimizer_steps == 1
     curriculum, env = _curriculum()
     for step in range(1, 7):
         _curriculum_step(curriculum, env, step)
@@ -1123,6 +1191,7 @@ def test_real_sac_learning_and_full_owner_restore_keep_schedules_rng_and_fresh_e
 
     restored = _agent()
     restored.load(str(checkpoint))
+    assert restored.actor_optimizer_steps == original.actor_optimizer_steps
     restored.load_buffer(str(checkpoint))
     fresh_curriculum, _ = _curriculum()
     fresh_space = gym.spaces.Box(-1, 1, shape=(2, 4), dtype=np.float32)
@@ -1150,6 +1219,7 @@ def test_real_sac_learning_and_full_owner_restore_keep_schedules_rng_and_fresh_e
         _tree_equal(restored._alg.save()[key], saved_algorithm[key])
     restored.update()
     assert restored._alg.update_step == 3
+    assert restored.actor_optimizer_steps == 2
     assert restored._alg.critic_scheduler.last_epoch == original._alg.critic_scheduler.last_epoch + 1
 
 
@@ -1492,6 +1562,20 @@ def test_policy_only_load_rejects_equal_width_layout_change_before_model_read(tm
                                          ["future_traj", "window", 12]]}
     with pytest.raises(ValueError, match="obs layout differs"):
         load_policy(cfg, env, incompatible, "motion", str(tmp_path))
+
+
+def test_native_checkpoint_requires_ordered_observations_and_actuators(tmp_path):
+    from agents.flashsac import _check_observation_layout
+
+    terms = [["actor", "actual", 3], ["actor", "reference", 3]]
+    columns = {"actions": ["first", "second"], "actuator_command_indices": [0, 1]}
+    (tmp_path / "obs_layout.json").write_text(json.dumps(
+        {"encoded_obs_dims": [], "obs_terms": terms, "native_policy_columns": columns}))
+    _check_observation_layout(str(tmp_path), [], terms, columns)
+    with pytest.raises(ValueError, match="native observation order"):
+        _check_observation_layout(str(tmp_path), [], terms[::-1], columns)
+    with pytest.raises(ValueError, match="native action or state columns"):
+        _check_observation_layout(str(tmp_path), [], terms, {**columns, "actuator_command_indices": [1, 0]})
 
 
 def test_policy_only_load_rejects_incomplete_saved_actor(tmp_path):

@@ -28,8 +28,7 @@ class NativeReferenceFollower:
             raise ValueError("reference follower requires the configured absolute finger action")
         if self.action.cfg.cutoff_hz.get("finger") is not None:
             raise ValueError("reference follower requires unfiltered reference finger requests")
-        self.finger_columns = tuple(self.action.action_names.index(name)
-                                    for name in self.action.finger_actuator_names)
+        self.finger_columns = self.action._finger_slice
         limits = self.action.finger_command_limits
         self.lower, self.upper = limits.unbind(-1)
         if not torch.isfinite(limits).all() or not (self.upper > self.lower).all():
@@ -44,13 +43,14 @@ class NativeReferenceFollower:
             "command_name": str(command_name), "action_name": str(action_name),
             "action_names": list(self.action.action_names),
             "finger_joint_names": list(self.action.finger_joint_names),
+            "finger_command_names": list(self.action.finger_command_names),
             "deterministic": True,
         }
 
     def act(self, obs, deterministic: bool = False) -> np.ndarray:
         reference = self.command.command_reference()
         names = tuple(reference["joint_names"])
-        columns = [names.index(name) for name in self.action.finger_joint_names]
+        columns = [names.index(name) for name in self.action.finger_command_names]
         position = reference["position"][..., columns]
         support = reference["position_support"][..., columns]
         normalized = 2 * (position - self.lower) / (self.upper - self.lower) - 1
