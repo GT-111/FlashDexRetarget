@@ -458,7 +458,7 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
 
     @cached_property
     def source_stationary_parts(self):
-        """Require a complete, stationary source trajectory of the whole owning assembly."""
+        """Require a stationary, source-supported part and owning root throughout the motion."""
         from mjlab.utils.lab_api.math import quat_error_magnitude
 
         ml = self.motion_lib
@@ -469,8 +469,8 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             displacement = (pose[..., :3] - pose[0, :, :3]).norm(dim=-1)
             rotation = quat_error_magnitude(pose[..., 3:7], pose[0:1, :, 3:7].expand_as(pose[..., 3:7]))
             stable = (ml.native_object_part_pose_support[rows] & (displacement <= .005) & (rotation <= .05)).all(0)
-            for columns in self._object_part_columns.values():
-                stable[columns] = stable[columns].all()
+            for columns, root in zip(self._object_part_columns.values(), self._object_root_columns, strict=True):
+                stable[columns] = stable[columns] & stable[root]
             stationary.append(stable)
         return torch.stack(stationary)
 

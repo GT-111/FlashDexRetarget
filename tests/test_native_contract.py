@@ -1025,17 +1025,22 @@ def test_stationary_hold_pressure_requires_solved_support_and_retains_wrist_feed
     torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.0007))
 
 
-def test_source_stationary_parts_require_every_pose_of_the_complete_assembly():
+def test_source_stationary_parts_follow_each_part_and_its_owning_root():
     command = object.__new__(NativeMotionTrackingCommand)
-    pose = torch.zeros(6, 2, 13)
+    pose = torch.zeros(10, 2, 13)
     pose[..., 3] = 1.
-    pose[3, 1, 0] = .015
-    support = torch.ones(6, 2, dtype=torch.bool)
-    support[5, 1] = False
+    pose[3, 1, 3:7] = torch.tensor([0., 1., 0., 0.])
+    pose[5, 0, 0] = .015
+    support = torch.ones(10, 2, dtype=torch.bool)
+    support[7, 1] = False
+    support[9, 0] = False
     command.motion_lib = SimpleNamespace(native_object_part_state_w=pose, native_object_part_pose_support=support,
-        length_starts=torch.tensor([0, 2, 4]), _motion_num_frames=torch.tensor([2, 2, 2]))
+        length_starts=torch.tensor([0, 2, 4, 6, 8]), _motion_num_frames=torch.full((5,), 2))
     command._object_part_columns = {"assembly": [0, 1]}
-    assert command.source_stationary_parts.tolist() == [[True, True], [False, False], [False, False]]
+    command._object_root_columns = torch.tensor([0])
+    assert command.source_stationary_parts.tolist() == [
+        [True, True], [True, False], [False, False], [True, False], [False, False],
+    ]
 
 
 def test_native_wrist_source_only_keeps_source_rates_through_filter_updates(tmp_path):
