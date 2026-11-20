@@ -1091,7 +1091,8 @@ def test_native_context_rng_keeps_real_gym_sampler_separate(tmp_path):
     _assert_control_values_equal(capture_rng_state(None), initial.rng)
 
 
-def test_native_factory_keeps_multiple_objects_and_duplicate_local_part_labels(tmp_path, monkeypatch):
+@pytest.mark.parametrize("support_mode", ("default", "plane", "mixed"))
+def test_native_factory_keeps_multiple_objects_and_duplicate_local_part_labels(tmp_path, monkeypatch, support_mode):
     """Actual factory/scene with a CPU state protocol, no integration or SDK."""
     from omegaconf import OmegaConf
 
@@ -1099,6 +1100,13 @@ def test_native_factory_keeps_multiple_objects_and_duplicate_local_part_labels(t
 
     layout, mapping = _two_object_scene(tmp_path)
     document = ET.parse(layout.scene_xml_path)
+    if support_mode != "default":
+        world = document.getroot().find("worldbody")
+        for geom in world.findall("geom"):
+            world.remove(geom)
+        ET.SubElement(world, "geom", name="table", type="plane", size="1 1 .1")
+        if support_mode == "mixed":
+            ET.SubElement(world, "geom", name="fixture", type="box", size=".1 .1 .1")
     for hand in layout.hands:
         for axis, gear in enumerate(np.eye(6, dtype=int)):
             ET.SubElement(document.getroot().find("actuator"), "motor",
@@ -1127,10 +1135,15 @@ def test_native_factory_keeps_multiple_objects_and_duplicate_local_part_labels(t
         commands=dict(object=dict(pin_objects=False, support_disks=dict(enable=False))), curriculum={},
         sim=dict(dt=.005, plant={"_target_": "explicit_cpu_protocol"}), scene=dict(num_envs=2),
         decimation=4, episode_length_s=1., seed=1, eval={}))
+    if support_mode != "default":
+        cfg.actions = {"source_contact_approach": {"stationary_hold_force_n": 1.}}
     env, _ = native_create.create_native_envs(cfg, "cpu")
     scene, plant = env.scene, env.sim.plant
     key = "objects/object/loose_prop"
-    assert len(plant.contact_facts) == 7
+    support_pairs = {key: ([0], [plant.model.body(part.body_name).id])
+                     for key, (_, part) in layout.support_pair_bindings.items()} if support_mode == "plane" else {}
+    assert len(plant.contact_facts) == 7 + len(support_pairs)
+    assert {key: pair for key, pair in plant.contact_pairs.items() if key.startswith("support/")} == support_pairs
     assert plant.contact_pairs[key] == ([plant.model.body("base").id, plant.model.body("lid").id],
                                        [plant.model.body("prop_root").id])
     assert key not in scene.hand_part_contact_facts()["pairs"]

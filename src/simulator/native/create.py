@@ -36,7 +36,7 @@ def create_native_envs(cfg, device="cuda"):
     }
     pairs.update({key: (bodies[first.root_body_name], bodies[second.root_body_name])
                   for key, (first, second) in layout.object_pair_bindings.items()})
-    approach = cfg.actions.get("source_contact_approach") or {}
+    approach = cfg.get("actions", {}).get("source_contact_approach") or {}
     if approach.get("stationary_hold_force_n", 0.):
         world_collision = (model.geom_bodyid == 0) & ((model.geom_contype | model.geom_conaffinity) != 0)
         if world_collision.any() and (model.geom_type[world_collision] == mujoco.mjtGeom.mjGEOM_PLANE).all():
