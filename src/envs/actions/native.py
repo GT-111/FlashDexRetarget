@@ -40,8 +40,8 @@ def _contact_compression(
                 & roles[world, assigned_hand.clamp_min(0), assigned_part.clamp_min(0)] & (force >= .08))
     parts = roles.shape[-1]
     pair_slot = (world * roles.shape[1] + assigned_hand.clamp_min(0)) * parts + assigned_part.clamp_min(0)
-    bearing = torch.zeros_like(roles).flatten()
-    bearing.scatter_reduce_(0, pair_slot, eligible, reduce="amax")
+    bearing = force.new_zeros(roles.numel())
+    bearing.scatter_reduce_(0, pair_slot, torch.where(eligible, force, 0.), reduce="amax")
     slot = world * len(body_hands) + hand_body
     strongest = force.new_zeros(roles.shape[0] * len(body_hands))
     strongest.scatter_reduce_(0, slot, torch.where(eligible, force, 0.), reduce="amax")
@@ -68,7 +68,7 @@ def _contact_compression(
     normal = transpose @ projected
     normal.diagonal(dim1=-2, dim2=-1).add_(.014 ** 2)
     correction = torch.linalg.solve_ex(normal, (transpose @ travel[..., None]).squeeze(-1)).result
-    return correction, bearing.reshape_as(roles)
+    return correction, bearing.reshape_as(roles) > 0.
 
 
 @dataclass(kw_only=True)
