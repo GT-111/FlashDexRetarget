@@ -2,7 +2,7 @@
 
 import json
 import xml.etree.ElementTree as ET
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,13 +41,14 @@ def test_pad_normal_travel_respects_endpoint_owner_roles_and_shared_commands():
         body_root=torch.arange(4), subtree_com_w=torch.zeros(3, 4, 3),
     )
     assigned = torch.tensor([[[True, False]], [[False, True]], [[True, False]]])
-    result = _contact_compression(
+    result, bearing = _contact_compression(
         solve, assigned, torch.tensor([True, True, False]),
         torch.tensor([-1, 0, -1, -1]), torch.tensor([-1, -1, 0, 1]),
         torch.tensor([0, 0, 1]), 2, .004,
     )
     expected = .004 * .1 / (.1 ** 2 + .014 ** 2)
     torch.testing.assert_close(result, torch.tensor([[expected, 0.], [0., 0.], [0., 0.]]))
+    assert bearing.tolist() == [[[True, False]], [[False, False]], [[False, False]]]
 
 
 def _scene(tmp_path):
@@ -788,6 +789,67 @@ def _native_action_case(
             ml.native_joint_position_support[ids][:, action._finger_ids],
         )
     return env, action, command, accepted
+
+
+def test_loaded_contact_outlives_approach_guard_until_contact_or_role_ends(tmp_path):
+    import mujoco
+
+    env, ordinary, command, _ = _native_action_case(tmp_path, wrist_target_twist="filtered_correction_feedforward")
+    model = mujoco.MjModel.from_xml_path(ordinary.layout.scene_xml_path)
+    pad, part = model.body("left_driver").id, model.body("base").id
+    bodies = torch.tensor([[pad, part], [pad, part]])
+    ancestor = torch.zeros(model.nbody, 3, dtype=torch.bool)
+    ancestor[pad, 0] = True
+    subspace = torch.zeros(2, 3, 6)
+    subspace[:, 0, 2] = 1.
+    solve = dict(
+        world=torch.arange(2), valid=torch.ones(2, dtype=torch.bool), native_bodies=bodies, solver_bodies=bodies,
+        normal_w=torch.tensor([[0., 1., 0.], [0., 1., 0.]]), point_w=torch.tensor([[.05, 0., 0.], [.05, 0., 0.]]),
+        normal_force_n=torch.ones(2), motion_subspace=subspace, body_is_dof_ancestor=ancestor,
+        body_root=torch.arange(model.nbody), subtree_com_w=torch.zeros(2, model.nbody, 3),
+    )
+    env.sim = SimpleNamespace(plant=SimpleNamespace(
+        model=model, contact_support=torch.ones(2, dtype=torch.bool),
+        configure_contact_differential=lambda _: None, solved_contact_differential=lambda: solve,
+    ))
+    source_active = torch.zeros(2, 2, 2, dtype=torch.bool)
+    source_active[:, 0, 0] = True
+    command.source_hand_part_intent = lambda _: dict(active=source_active, known=torch.ones_like(source_active),
+        metadata=dict(hand_sides=("left", "right"), part_body_names=("base", "lid")))
+    requested = torch.zeros(2, 2, 13)
+    requested[..., :3] = env.scene.env_origins[:, None]
+    requested[..., 0] += .05
+    requested[..., 3] = 1.
+    command.object_part_reference = lambda _: requested
+    command.sim_object_part_state_w = requested.clone()
+    command.approach_dir_and_part = (torch.zeros(2, 2, 3), torch.tensor([[0, -1], [0, -1]]))
+    action = NativeResidualAction(replace(
+        ordinary.cfg, finger_residual_rad=.5,
+        source_contact_approach=dict(translation_m=.012, max_part_position_error_m=.02,
+                                     max_part_rotation_error_rad=.35, max_tip_distance_m=.042,
+                                     pad_compression_m=.004),
+    ), env)
+    raw = torch.zeros_like(action.raw_action)
+    action.process_actions(raw)
+    action.apply_actions()
+    before = action.installed_control["root_state_w"][:, 0, :3].clone()
+    initial_finger = action.installed_control["finger_target_rad"][:, 0].clone()
+    assert (initial_finger > 0.).all()
+
+    command.sim_object_part_state_w[:, 0, 0] += .03
+    command.approach_dir_and_part = (torch.zeros(2, 2, 3), torch.full((2, 2), -1))
+    action.process_actions(raw)
+    action.apply_actions()
+    assert (action.installed_control["finger_target_rad"][:, 0] > initial_finger).all()
+    torch.testing.assert_close(action.installed_control["root_state_w"][:, 0, :3], before)
+    torch.testing.assert_close(action.installed_control["root_state_w"][:, 0, 7:10], torch.zeros(2, 3))
+
+    source_active[0] = False
+    solve["normal_force_n"][1] = 0.
+    action.process_actions(raw)
+    action.apply_actions()
+    torch.testing.assert_close(action.installed_control["finger_target_rad"][:, 0], torch.zeros(2))
+    assert (action.installed_control["root_state_w"][:, 0, 0] < before[:, 0]).all()
 
 
 def test_actual_native_action_derives_dimensions_and_records_accepted_supported_targets(

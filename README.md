@@ -520,6 +520,11 @@ normal travel at each loaded pad through the solved point Jacobian into the
 named finger command coordinates. Use the same setting for training and both
 frozen evaluations. Grip adjustment acts through hand position targets and
 retains the original source roles, installed actuator bounds, and perturbation.
+With pad preload enabled, the pose and tip guard admits new approach guidance.
+An existing guide can retain its bounded wrist offset and pad correction while
+the same source-assigned part is still force-bearing in the actual solve.
+Losing that measured contact clears its finger correction and releases the
+wrist offset through the same filter.
 Set `++actions.source_contact_approach.stationary_hold_force_n=<newtons>`
 to regulate the assigned hand's normal force during a complete stationary
 source task on a passive plane. The guide requires measured object-plane

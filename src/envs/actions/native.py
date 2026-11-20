@@ -38,6 +38,10 @@ def _contact_compression(
     force = solve["normal_force_n"]
     eligible = (solve["valid"] & solved[world] & (assigned_hand >= 0) & (assigned_part >= 0)
                 & roles[world, assigned_hand.clamp_min(0), assigned_part.clamp_min(0)] & (force >= .08))
+    parts = roles.shape[-1]
+    pair_slot = (world * roles.shape[1] + assigned_hand.clamp_min(0)) * parts + assigned_part.clamp_min(0)
+    bearing = torch.zeros_like(roles).flatten()
+    bearing.scatter_reduce_(0, pair_slot, eligible, reduce="amax")
     slot = world * len(body_hands) + hand_body
     strongest = force.new_zeros(roles.shape[0] * len(body_hands))
     strongest.scatter_reduce_(0, slot, torch.where(eligible, force, 0.), reduce="amax")
@@ -63,7 +67,8 @@ def _contact_compression(
     transpose = projected.transpose(1, 2)
     normal = transpose @ projected
     normal.diagonal(dim1=-2, dim2=-1).add_(.014 ** 2)
-    return torch.linalg.solve_ex(normal, (transpose @ travel[..., None]).squeeze(-1)).result
+    correction = torch.linalg.solve_ex(normal, (transpose @ travel[..., None]).squeeze(-1)).result
+    return correction, bearing.reshape_as(roles)
 
 
 @dataclass(kw_only=True)
@@ -417,9 +422,9 @@ class NativeResidualAction(ActionTerm):
                           <= self._source_contact_guard["max_part_position_error_m"])
         close_rotation = (quat_error_magnitude(live[..., 3:7], requested[..., 3:7])
                           <= self._source_contact_guard["max_part_rotation_error_rad"])
-        roles &= (close_position & close_rotation)[:, None]
-        part = roles.long().argmax(-1)
-        unique = roles.sum(-1) == 1
+        approaching = roles & (close_position & close_rotation)[:, None]
+        part = approaching.long().argmax(-1)
+        unique = approaching.sum(-1) == 1
         aim = live[..., :3].gather(1, part[..., None].expand(-1, -1, 3)) - roots
         if len(self.hand_sides) == 2:
             paired = unique.all(1) & (part[:, 0] == part[:, 1])
@@ -431,14 +436,19 @@ class NativeResidualAction(ActionTerm):
         part_columns = nearest.new_tensor(parts)
         use_grasp_axis = unique & (part_columns[part] == nearest)
         direction = torch.where(use_grasp_axis[..., None], torch.nn.functional.normalize(aim, dim=-1), fallback)
-        correction = _contact_compression(
+        correction, bearing = _contact_compression(
             self._plant.solved_contact_differential(), roles, self._plant.contact_support,
             self._pad_body_hand, self._pad_body_part, self.actuator_command_indices,
             len(self.finger_command_names), self._pad_travel_m,
         )
         self._source_contact_compression.lerp_(correction, .3)
-        self._source_contact_compression.masked_fill_(~roles.any(-1)[:, self._pad_command_hand], 0.)
-        return direction, nearest
+        self._source_contact_compression.masked_fill_(~bearing.any(-1)[:, self._pad_command_hand], 0.)
+        # Pose and tip proximity admit new guidance. They cannot revoke a loaded role.
+        retained = (bearing & (self._source_contact_part[..., None] == part_columns)).any(-1)
+        retain_guide = retained & (nearest != self._source_contact_part)
+        direction = torch.where(retain_guide[..., None], self._source_contact_translation / self._source_contact_scale,
+                                direction)
+        return direction, torch.where(retain_guide, self._source_contact_part, nearest)
 
     def _supported_hold_translation(self, command, part, fallback):
         """Bound wrist motion using observed hand load on a stationary supported part."""
@@ -492,7 +502,8 @@ class NativeResidualAction(ActionTerm):
                 direction, part = command.source_contact_approach_direction(
                     command._motion_flat_ids, **self._source_contact_guard)
             changed_part = part != self._source_contact_part
-            self._source_contact_translation.masked_fill_(changed_part[..., None], 0.0)
+            restart = changed_part & (part >= 0) if self._pad_travel_m else changed_part
+            self._source_contact_translation.masked_fill_(restart[..., None], 0.0)
             self._source_contact_translation.lerp_(direction * self._source_contact_scale, 0.35)
             if self._source_hold_pairs:
                 self._source_hold_offset_m.masked_fill_(changed_part, 0.)
