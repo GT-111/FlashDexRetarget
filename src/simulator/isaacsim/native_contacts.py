@@ -87,12 +87,13 @@ class IsaacHandPartContact:
         # Normal and friction calls reuse the SDK start/count allocation.
         rows, columns, active, normal_complete = _patch_owners(counts, starts, self._slots)
         magnitude, separation = magnitude.flatten(), separation.flatten()
-        bearing = active & (magnitude > 0)
         finite = (torch.isfinite(magnitude) & torch.isfinite(separation)
                   & torch.isfinite(point).all(-1) & torch.isfinite(normal).all(-1))
+        bearing = active & finite & (magnitude != 0)
         bad = torch.zeros_like(supported, dtype=torch.long).scatter_add_(0, rows, (active & ~finite).long())
-        normal_force = torch.where(bearing, magnitude, 0.0)
-        force = normal_force[:, None] * normal
+        # PhysX can report a negative coefficient for the named sensor/filter order.
+        coefficient = torch.where(bearing, magnitude, 0.0)
+        force = coefficient[:, None] * normal
         props = self._body_properties
         data = self.obj.data
         com = data.body_link_pos_w + quat_apply(data.body_link_quat_w, props.com_position_body_m)
@@ -113,7 +114,7 @@ class IsaacHandPartContact:
                 0, rows, torch.where(bearing, value, 0.0), reduce="amax",
             )
 
-        load = center.new_zeros(len(center)).scatter_add_(0, rows, normal_force)
+        load = center.new_zeros(len(center)).scatter_add_(0, rows, coefficient.abs())
         force_on_part = sum_vector(force, rows, bearing)
         moment_on_part = sum_vector(moment, rows, bearing)
         max_separation, max_slip = max_scalar(separation.abs()), max_scalar(slip)

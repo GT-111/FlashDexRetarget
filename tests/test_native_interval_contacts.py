@@ -407,7 +407,8 @@ def test_isaac_net_link_and_sdf_views_do_not_create_interval_pair_force_support(
     assert (result["columns"]["unsupported_or_unrecorded_sample_count"] == 3).all()
 
 
-def test_isaac_named_pair_solve_uses_the_sdk_clock_and_discards_only_reset_world(monkeypatch):
+@pytest.mark.parametrize("normal_sign", [1., -1.])
+def test_isaac_named_pair_solve_uses_the_sdk_clock_and_discards_only_reset_world(monkeypatch, normal_sign):
     from simulator.isaacsim.native_contacts import (
         IsaacHandPartContact,
         IsaacNativeContactReadback,
@@ -419,7 +420,7 @@ def test_isaac_named_pair_solve_uses_the_sdk_clock_and_discards_only_reset_world
 
         def get_contact_data(self, dt):
             assert dt == pytest.approx(.005, abs=1e-12)
-            return (torch.tensor([[2.0], [3.0], [torch.nan], [torch.nan]]),
+            return (torch.tensor([[2.0 * normal_sign], [3.0 * normal_sign], [torch.nan], [torch.nan]]),
                     torch.tensor([[0., 1., 0.], [0., 2., 0.], [torch.nan] * 3, [torch.nan] * 3]),
                     torch.tensor([[0., 0., 1.]] * 4), torch.tensor([[-.001], [-.002], [0.], [0.]]),
                     torch.tensor([[1, 1], [0, 0]]), torch.tensor([[1, 0], [0, 0]]))
@@ -470,9 +471,9 @@ def test_isaac_named_pair_solve_uses_the_sdk_clock_and_discards_only_reset_world
     assert scene.physics_execution_clock()["steps"].tolist() == [9, 9]
     pair = facts["pairs"]["left/assembly/part"]
     assert pair["normal_force_n"].tolist() == [[5., 5.], [0., 0.]]
-    torch.testing.assert_close(pair["force_on_second_w_n"][0, 0], torch.tensor([1., 0., 5.]))
-    torch.testing.assert_close(pair["moment_on_second_about_root_w_nm"][0, 0], torch.tensor([8., 0., -1.]))
-    torch.testing.assert_close(pair["joint_effort_on_second"][0, 0], torch.tensor([5., 5.]))
+    torch.testing.assert_close(pair["force_on_second_w_n"][0, 0], torch.tensor([1., 0., 5. * normal_sign]))
+    torch.testing.assert_close(pair["moment_on_second_about_root_w_nm"][0, 0], torch.tensor([8. * normal_sign, 0., -1.]))
+    torch.testing.assert_close(pair["joint_effort_on_second"][0, 0], torch.full((2,), 5. * normal_sign))
     assert torch.isnan(pair["joint_effort_on_second"][1]).all()
     assert pair["force_bearing_tangent_speed_max_m_s"][0, 0].item() == pytest.approx(2**.5)
     assert pair["force_bearing_distance_max_m"][0, 0].item() == pytest.approx(.002)

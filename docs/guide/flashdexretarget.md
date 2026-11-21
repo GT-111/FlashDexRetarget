@@ -189,9 +189,12 @@ Native Isaac also binds detailed PhysX contact reporters from each named
 object part to every installed link of each selected hand. The view checks
 the resolved per-world sensor and filter paths before reading them. Each
 accepted SDK physics callback advances the common control-interval tape.
-Positive normal patch forces and the separately reported tangential forces
-sum in the object's direction. Moments use the installed articulation COM
-at the achieved endpoint. Tangential relative speed uses achieved link
+PhysX can return signed normal coefficients for a named pair. The signed
+coefficient times the reported normal contributes to the object's force
+and moment. Its absolute value contributes to the compressive load. The
+separately reported tangential forces contribute to the same wrench.
+Moments use the installed articulation COM at the achieved endpoint.
+Tangential relative speed uses achieved link
 velocities at the reported normal patch points. Missing or saturated reports
 carry false measurement support. A partial reset discards the selected
 world's samples and preserves the scene-global SDK clock.
