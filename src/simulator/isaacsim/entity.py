@@ -151,16 +151,18 @@ class ArticulationAdapter(NamedArticulationView):
         quat = _xyzw_to_wxyz(tf[:, self._isaac_body_ids, 3:7])
         return pos, quat
 
-    def _body_vel(self):
+    def _body_com_velocity(self) -> torch.Tensor:
         def fetch_vel():
             v = self._art.root_physx_view.get_link_velocities()
-            return v.reshape(self._art.num_instances, -1, 6).to(self.device)
+            return v.reshape(self._art.num_instances, -1, 6).to(self.device)[:, self._isaac_body_ids]
 
-        v = self._cache.get("link_vel", fetch_vel)
+        return self._cache.get("link_vel", fetch_vel)
+
+    def _body_vel(self):
+        v = self._body_com_velocity()
         # physx: linear velocity reported at link COM; shift to link origin.
         _, quat = self._body_pose()
         r_com = quat_apply(quat, self._body_properties.com_position_body_m)
-        v = v[:, self._isaac_body_ids]
         lin_com = v[..., 0:3]
         ang = v[..., 3:6]
         lin_link = lin_com + torch.cross(ang, -r_com, dim=-1)
@@ -264,6 +266,30 @@ class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
     def write_root_state_to_sim(self, root_state, env_ids=None) -> None:
         self._art.write_root_link_state_to_sim(root_state, env_ids=env_ids)
         self._clock.bump()
+
+    def body_com_scalar_jacobians(self) -> torch.Tensor:
+        """PhysX WORLD COM Jacobians in named body and scalar-joint order."""
+        def fetch():
+            view = self._art.root_physx_view
+            width = len(self._isaac_joint_ids)
+            shape = (self._art.num_instances, len(self._isaac_body_ids), 6, width)
+            observed = self._body_com_velocity()
+            try:
+                jacobians = view.get_jacobians().to(observed)
+            except Exception:  # SDK raises Exception when the tensor is unavailable.
+                return observed.new_full(shape, torch.nan)
+            if jacobians.shape != (*shape[:-1], width + 6):
+                return observed.new_full(shape, torch.nan)
+            named_bodies = jacobians.index_select(1, self._isaac_body_ids)
+            scalar = named_bodies.index_select(-1, self._isaac_joint_ids + 6)
+            root_term = named_bodies[..., :6] @ observed[:, :1, :, None]
+            scalar_term = scalar @ self._joint_vel()[:, None, :, None]
+            predicted = (root_term + scalar_term).squeeze(-1)
+            # Keep the chart unavailable if it cannot recover the same endpoint's body rates.
+            valid = torch.isclose(predicted, observed, atol=1e-5, rtol=1e-4).all(dim=(1, 2))
+            return torch.where(valid[:, None, None, None], scalar, torch.nan)
+
+        return self._cache.get("body_com_scalar_jacobians", fetch)
 
     def _submit_external_wrenches(self):
         # Lab derives has_external_wrench from the submitted slice. Submit the

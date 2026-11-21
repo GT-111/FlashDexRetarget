@@ -196,11 +196,20 @@ velocities at the reported normal patch points. Missing or saturated reports
 carry false measurement support. A partial reset discards the selected
 world's samples and preserves the scene-global SDK clock.
 
-Production qualification also requires an exact applied object-wrench reader.
-Signed scalar joint effort, fixed and independent-object support pairs, and
-digit opposition still need their own installed PhysX bindings. The native
-Isaac reporter currently serves engineering runs and records those evidence
-limits explicitly.
+Signed scalar joint effort uses the installed floating articulation Jacobian
+in named body and joint order. The contact moment is shifted from the total
+object COM to the contacted link COM before projecting the wrench. Projection
+is supported where the achieved Jacobian and generalized velocities recover
+the SDK's measured link COM velocities. The result covers the normal and
+friction forces reported at patch points.
+[PhysX articulation Jacobian](https://nvidia-omniverse.github.io/PhysX/physx/5.6.1/docs/Articulations.html#jacobian)
+
+The public SDK accepts external wrench submissions. An isolated free-body
+pulse can be checked against measured changes in momentum. Production
+qualification requires an exact applied object-wrench reader in the presence
+of contact and passive constraints. Fixed and independent-object support
+pairs and digit opposition still need their own installed PhysX bindings.
+The native Isaac reporter currently serves engineering runs.
 
 Stock USD collision overrides are installed after the scene owner makes nested
 references editable, before material binding and the first physics reset.

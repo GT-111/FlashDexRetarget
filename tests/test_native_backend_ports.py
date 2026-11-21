@@ -134,6 +134,44 @@ def test_direct_plant_records_scalar_contact_effort_and_slip_on_the_solved_clock
     assert torch.isnan(effort[0, 0]).all() and not interval.interval_complete[0]
 
 
+def test_physx_com_jacobian_keeps_native_coordinates_and_rejects_unmatched_world():
+    from simulator.isaacsim.entity import FreeArticulationAdapter
+    from simulator.native.entity import _Cached, _FreshnessClock
+
+    jacobians = torch.zeros(2, 3, 6, 8)
+    jacobians[..., :6] = torch.eye(6)
+    jacobians[:, 1, 3, 7] = 1.0
+    jacobians[:, 1:, 2, 6] = 1.0
+    root_velocity = torch.tensor([[.1, -.3, .2, .3, .1, -.2]]).repeat(2, 1)
+    dof_velocity = torch.tensor([[.3, -.2], [.1, .2]])
+    generalized = torch.cat((root_velocity, dof_velocity), -1)
+    link_velocity = (jacobians @ generalized[:, None, :, None]).squeeze(-1)
+    link_velocity[1, 1, 3] += .02
+    view = SimpleNamespace(
+        get_jacobians=lambda: jacobians,
+        get_link_velocities=lambda: link_velocity,
+        get_dof_velocities=lambda: dof_velocity,
+    )
+    entity = FreeArticulationAdapter.__new__(FreeArticulationAdapter)
+    entity._art = SimpleNamespace(root_physx_view=view, num_instances=2)
+    entity._isaac_body_ids = torch.tensor([0, 2, 1])
+    entity._isaac_joint_ids = torch.tensor([1, 0])
+    clock = _FreshnessClock()
+    entity.device, entity._cache = "cpu", _Cached(clock)
+    measured = entity.body_com_scalar_jacobians()
+    torch.testing.assert_close(measured[0], jacobians[0, [0, 2, 1]][..., [7, 6]])
+    assert torch.isnan(measured[1]).all()
+
+    def unavailable():
+        raise RuntimeError("PhysX returned no dense Jacobian")
+
+    clock.bump()
+    view.get_jacobians = unavailable
+    unknown = entity.body_com_scalar_jacobians()
+    assert unknown.shape == measured.shape and unknown.dtype == link_velocity.dtype
+    assert torch.isnan(unknown).all()
+
+
 def test_native_config_dispatch_and_runtime_do_not_boot_kit_or_require_usd(tmp_path):
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf

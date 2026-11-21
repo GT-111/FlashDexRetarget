@@ -431,12 +431,17 @@ def test_isaac_named_pair_solve_uses_the_sdk_clock_and_discards_only_reset_world
             return (torch.tensor([[1., 0., 0.]] * 4), torch.tensor([[0., 1., 0.]] * 4),
                     torch.tensor([[1, 0], [0, 0]]), torch.zeros(2, 2, dtype=torch.long))
 
-    parts = SimpleNamespace(body_names=["part"], joint_names=(), data=SimpleNamespace(
-        body_link_pos_w=torch.zeros(2, 1, 3),
-        body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]]] * 2),
-        body_link_lin_vel_w=torch.zeros(2, 1, 3), body_link_ang_vel_w=torch.zeros(2, 1, 3)),
+    com_jacobians = torch.zeros(2, 2, 6, 2)
+    com_jacobians[0, 0, 4, 0] = 1.0  # hinge about world Y
+    com_jacobians[0, 0, 2, 1] = 1.0  # slider along world Z
+    com_jacobians[1] = torch.nan
+    parts = SimpleNamespace(body_names=["part", "base"], joint_names=("hinge", "rail"), data=SimpleNamespace(
+        body_link_pos_w=torch.tensor([[[1., 0., 0.], [-1., 0., 0.]]] * 2),
+        body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2] * 2),
+        body_link_lin_vel_w=torch.zeros(2, 2, 3), body_link_ang_vel_w=torch.zeros(2, 2, 3)),
+        body_com_scalar_jacobians=lambda: com_jacobians,
         body_inertial_properties=lambda: SimpleNamespace(
-            mass_kg=torch.ones(2, 1), com_position_body_m=torch.zeros(2, 1, 3)))
+            mass_kg=torch.ones(2, 2), com_position_body_m=torch.zeros(2, 2, 3)))
     hand = SimpleNamespace(body_names=["pad_a", "pad_b"], data=SimpleNamespace(
         body_link_pos_w=torch.zeros(2, 2, 3), body_link_lin_vel_w=torch.ones(2, 2, 3),
         body_link_ang_vel_w=torch.zeros(2, 2, 3)))
@@ -467,6 +472,8 @@ def test_isaac_named_pair_solve_uses_the_sdk_clock_and_discards_only_reset_world
     assert pair["normal_force_n"].tolist() == [[5., 5.], [0., 0.]]
     torch.testing.assert_close(pair["force_on_second_w_n"][0, 0], torch.tensor([1., 0., 5.]))
     torch.testing.assert_close(pair["moment_on_second_about_root_w_nm"][0, 0], torch.tensor([8., 0., -1.]))
+    torch.testing.assert_close(pair["joint_effort_on_second"][0, 0], torch.tensor([5., 5.]))
+    assert torch.isnan(pair["joint_effort_on_second"][1]).all()
     assert pair["force_bearing_tangent_speed_max_m_s"][0, 0].item() == pytest.approx(2**.5)
     assert pair["force_bearing_distance_max_m"][0, 0].item() == pytest.approx(.002)
     assert torch.isnan(pair["force_bearing_distance_max_m"][1]).all()

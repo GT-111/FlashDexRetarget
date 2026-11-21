@@ -66,7 +66,6 @@ class IsaacHandPartContact:
             "moment_on_second_about_root_w_nm": vector.clone(),
         }
         if len(obj.joint_names):
-            # The imported name alone does not establish the realized signed axis.
             self.facts["joint_effort_on_second"] = sample.new_full((len(sample), len(obj.joint_names)), torch.nan)
         if view is not None:
             self._slots = torch.arange(view.max_contact_data_count, device=device)
@@ -140,6 +139,12 @@ class IsaacHandPartContact:
         for name, (value, valid) in actual.items():
             self.facts[name].copy_(torch.where(valid, value, torch.nan))
         self.facts["force_bearing_contact_present"].copy_(present)
+        if (effort := self.facts.get("joint_effort_on_second")) is not None:
+            jacobian = self.obj.body_com_scalar_jacobians()[:, self.body_id]
+            moment_at_part = moment_on_part + torch.linalg.cross(center - com[:, self.body_id], force_on_part)
+            wrench_at_part = torch.cat((force_on_part, moment_at_part), -1)
+            projected = (jacobian.transpose(1, 2) @ wrench_at_part[..., None]).squeeze(-1)
+            effort.copy_(torch.where(supported[:, None], projected, torch.nan))
         return supported
 
 
