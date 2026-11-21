@@ -653,8 +653,17 @@ their achieved upward or downward load on the same clock.
 The optional guide follows the known source hand role. Existing solved load
 can preserve guidance through the approach pose guard. When a role changes
 or contact is lost, guidance moves at up to `max_speed_m_s` while the installed
-wrist feedforward follows the actual bounded change. Source-phase rewards use
-the action's consumed original source frame. Upward load credit is reduced
+wrist feedforward follows the actual bounded change. With
+`stationary_hold_force_n` enabled, solved load from a fixed support admits
+vertical pressure guidance for a stationary source part. For rigid objects,
+stationarity is checked over the upcoming prepared samples within the same
+clip. The horizon is the control interval nearest the time it takes the
+guide to cover its configured distance at its speed limit. A later move can
+go back to surface acquisition. Articulated objects use whole-clip
+stationarity for this pressure guide.
+
+Source-phase rewards use the action's consumed original source frame.
+Upward load credit is reduced
 when the object tilts away from the source pose. Articulation credit requires
 both useful signed effort and achieved joint motion in the requested direction.
 Declared phase direction takes precedence over local reference velocity.

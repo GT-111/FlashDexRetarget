@@ -241,6 +241,7 @@ class NativeResidualAction(ActionTerm):
         self._source_hold_offset_m = torch.zeros(self.num_envs, roots, device=self.device)
         self._source_hold_force_n = torch.zeros_like(self._source_hold_offset_m)
         self._source_hold_pairs = ()
+        self._source_hold_reference_rows = None
         if self._stationary_hold_force_n:
             self._source_hold_pairs = tuple(key for key in self.layout.support_pair_bindings
                                           if key in env.sim.plant.contact_facts)
@@ -488,7 +489,10 @@ class NativeResidualAction(ActionTerm):
         scene = self._env.scene
         plant = self._env.sim.plant
         index = part.clamp_min(0)
-        stationary = (part >= 0) & command.source_stationary_parts[command.motion_ids].gather(1, index)
+        if self._source_hold_reference_rows is None:
+            reach_steps = max(1, round(self._source_contact_scale / (self._source_contact_speed_m_s * self._control_dt)))
+            self._source_hold_reference_rows = command.source_stationary_part_rows(reach_steps)
+        stationary = (part >= 0) & self._source_hold_reference_rows[command._motion_flat_ids].gather(1, index)
         support_up = torch.stack([plant.contact_facts[key]["force_on_second_w_n"] @ scene.gravity_up_w
                                   for key in self._source_hold_pairs], 1).gather(1, index)
         hand_contacts = [[plant.contact_facts[f"{hand.side}/{obj.entity_name}/{p.name}"]
@@ -503,8 +507,9 @@ class NativeResidualAction(ActionTerm):
         measured = plant.contact_support[:, None] & torch.isfinite(force)
         self._source_hold_force_n.lerp_(torch.where(measured, force, 0.), .4)
         supported = measured & (support_up >= .25 * self._source_hold_weights_n[index])
+        stationary &= supported
         delta = .001 * (self._stationary_hold_force_n - self._source_hold_force_n)
-        delta = torch.where(stationary & supported & (distance <= .0025), delta, -self._source_hold_offset_m)
+        delta = torch.where(stationary & (distance <= .0025), delta, -self._source_hold_offset_m)
         max_step_m = .035 * self._control_dt
         self._source_hold_offset_m.add_(delta.clamp(-max_step_m, max_step_m)).clamp_(
             0., min(.02, self._source_contact_scale))

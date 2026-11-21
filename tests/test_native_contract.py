@@ -1126,8 +1126,12 @@ def test_stationary_hold_pressure_requires_solved_support_and_retains_wrist_feed
         support_contacts=True,
     )
     part_count = len(action.layout.part_bindings)
-    command.motion_ids = torch.tensor([0, 1])
-    command.source_stationary_parts = torch.tensor([True, False])[:, None].expand(2, part_count)
+
+    def stationary_part_rows(lookahead_steps):
+        assert lookahead_steps == 10
+        return torch.tensor([True, False])[:, None].expand(2, part_count)
+
+    command.source_stationary_part_rows = stationary_part_rows
     direction = torch.tensor([1., 0., 0.]).expand(2, 2, 3)
     command.approach_dir_and_part = direction, torch.tensor([[0, -1], [0, -1]])
     raw = torch.zeros_like(action.raw_action)
@@ -1150,6 +1154,7 @@ def test_stationary_hold_pressure_requires_solved_support_and_retains_wrist_feed
     env.sim.plant.contact_support[0] = False
     action.process_actions(raw)
     assert action._source_hold_offset_m[0, 0] == 0.
+    assert action._source_contact_translation[0, 0, 0] > 0.
     action.reset()
     action.restore_control_context(carry)
     torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.0007))
@@ -1168,8 +1173,29 @@ def test_source_stationary_parts_follow_each_part_and_its_owning_root():
         length_starts=torch.tensor([0, 2, 4, 6, 8]), _motion_num_frames=torch.full((5,), 2))
     command._object_part_columns = {"assembly": [0, 1]}
     command._object_root_columns = torch.tensor([0])
-    assert command.source_stationary_parts.tolist() == [
-        [True, True], [True, False], [False, False], [True, False], [False, False],
+    command._object_joint_slices = {"assembly": slice(0, 1)}
+    expected = [[True, True], [True, False], [False, False], [True, False], [False, False]]
+    assert command.source_stationary_part_rows(1).tolist() == [row for row in expected for _ in range(2)]
+
+
+def test_rigid_stationary_hold_uses_the_prepared_interval_within_each_clip():
+    command = object.__new__(NativeMotionTrackingCommand)
+    pose = torch.zeros(8, 2, 13)
+    pose[..., 3] = 1.
+    pose[3:5, 0, 0] = .010
+    pose[5:, 0, 0] = .3
+    support = torch.ones(8, 2, dtype=torch.bool)
+    support[2, 1] = False
+    command.motion_lib = SimpleNamespace(
+        native_object_part_state_w=pose, native_object_part_pose_support=support,
+        length_starts=torch.tensor([0, 5]), _motion_num_frames=torch.tensor([5, 3]),
+    )
+    command._object_part_columns = {"first": [0], "second": [1]}
+    command._object_root_columns = torch.tensor([0, 1])
+    command._object_joint_slices = {"first": slice(0, 0), "second": slice(0, 0)}
+    assert command.source_stationary_part_rows(2).tolist() == [
+        [True, False], [False, False], [False, False], [True, True], [True, True],
+        [True, True], [True, True], [True, True],
     ]
 
 

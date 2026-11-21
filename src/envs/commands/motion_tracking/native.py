@@ -456,23 +456,33 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             "reference_time_ns": ml.native_time_ns[ids],
         }
 
-    @cached_property
-    def source_stationary_parts(self):
-        """Require a stationary, source-supported part and owning root throughout the motion."""
+    @torch.no_grad()
+    def source_stationary_part_rows(self, lookahead_steps):
+        """Bound rigid source movement over the guide's reach time inside each clip."""
         from mjlab.utils.lab_api.math import quat_error_magnitude
+
+        def still(a, b):
+            return (((a[..., :3] - b[..., :3]).norm(dim=-1) <= .005)
+                    & (quat_error_magnitude(a[..., 3:7], b[..., 3:7]) <= .05))
 
         ml = self.motion_lib
         stationary = []
         for start, count in zip(ml.length_starts.tolist(), ml._motion_num_frames.tolist(), strict=True):
             rows = slice(start, start + count)
             pose = ml.native_object_part_state_w[rows, :, :7]
-            displacement = (pose[..., :3] - pose[0, :, :3]).norm(dim=-1)
-            rotation = quat_error_magnitude(pose[..., 3:7], pose[0:1, :, 3:7].expand_as(pose[..., 3:7]))
-            stable = (ml.native_object_part_pose_support[rows] & (displacement <= .005) & (rotation <= .05)).all(0)
-            for columns, root in zip(self._object_part_columns.values(), self._object_root_columns, strict=True):
-                stable[columns] = stable[columns] & stable[root]
+            observed = ml.native_object_part_pose_support[rows]
+            stable = observed.clone()
+            for ahead in range(1, min(count, lookahead_steps + 1)):
+                stable[:-ahead] &= observed[ahead:] & still(pose[:-ahead], pose[ahead:])
+            whole_clip = (observed & still(pose, pose[:1].expand_as(pose))).all(0)
+            for (owner, columns), root in zip(self._object_part_columns.items(), self._object_root_columns, strict=True):
+                joints = self._object_joint_slices[owner]
+                if joints.start != joints.stop:
+                    stable[:, columns] = whole_clip[columns] & whole_clip[root]
+                else:
+                    stable[:, columns] &= stable[:, root, None]
             stationary.append(stable)
-        return torch.stack(stationary)
+        return torch.cat(stationary)
 
     @torch.no_grad()
     def source_contact_approach_direction(
