@@ -1949,6 +1949,15 @@ def test_source_lift_load_uses_signed_force_across_assigned_parts_at_the_install
     root[:] = torch.tensor([0., 1., 0., 0.])
     assert value(env, "motion", **params).item() < 0.
     root.copy_(original)
+    angular = env.scene["renamed_item"].data.body_link_ang_vel_w[:, 0]
+    angular[:, 0] = 25.
+    assert value(env, "motion", **params).item() == pytest.approx(.625)
+    command.motion_lib.native_object_part_angular_velocity_support[1, 0] = True
+    assert value(env, "motion", **params).item() < .10
+    parts[1, 0, 10] = 25.
+    assert value(env, "motion", **params).item() == pytest.approx(.625)
+    angular.zero_()
+    parts[1, 0, 10] = 0.
     interval["pairs"]["arbitrary-0-0"]["force_on_second_w_n"].fill_(float("nan"))
     assert value(env, "motion", **params).item() == 0.
     interval["pairs"]["arbitrary-0-0"]["force_on_second_w_n"].fill_(1.)

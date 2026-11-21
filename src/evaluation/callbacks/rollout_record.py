@@ -237,6 +237,7 @@ class NativeRolloutRecord(RolloutRecord):
             raise ValueError("FlashDex native export requires one combined installed-control owner")
         self.installed_term = installed[0][1] if installed else None
         self.installed_metadata = None
+        self._installed_arrays = _INSTALLED_ARRAYS
         if self.installed_term is not None:
             control = self.installed_term.installed_control
             for side, body in zip(control["hand_sides"], control["hand_body_names"], strict=True):
@@ -248,6 +249,9 @@ class NativeRolloutRecord(RolloutRecord):
             self.installed_metadata.update(term_name=installed[0][0],
                 coordinate_frame="env-local p/WXYZ; WORLD link twist and hand-root force/torque",
                 effort_sampling="actual last physics substep; not interval-mean effort")
+            if "source_contact_part_index" in control:
+                self._installed_arrays = (*self._installed_arrays, "source_contact_part_index")
+                self.installed_metadata["source_contact_part_body_names"] = control["source_contact_part_body_names"]
         self.object_joint_metadata = self.joint_effort_metadata = None
         if hasattr(self.cmd, "native_objects"):
             self.object_joint_metadata = dict(object_root_body_names=self.cmd.native_layout.object_root_body_names,
@@ -337,6 +341,8 @@ class NativeRolloutRecord(RolloutRecord):
         self._contact_interval_reader = getattr(env.scene, "hand_part_contact_interval_facts", None)
         interval = None if self._contact_interval_reader is None else self._contact_interval_reader()
         self.contact_interval_metadata = None
+        self._contact_interval_extra_fields = ()
+        self._contact_joint_columns = ()
         if interval is not None:
             self.contact_interval_metadata = dict(
                 schema="solver_hand_part_control_interval_v1",
@@ -358,6 +364,36 @@ class NativeRolloutRecord(RolloutRecord):
                     "solved WORLD force on object part from its named hand, including tangential force; "
                     "recorded endpoint, configured substep, named pair, xyz N"
                 )
+            optional_fields = (
+                ("force_bearing_tangent_speed_max_m_s", "substep maximum tangential relative speed over force-bearing contacts, m/s"),
+                ("moment_on_second_about_root_w_nm", "solved WORLD hand contact moment about the object's articulation COM, xyz Nm"),
+            )
+            self._contact_interval_extra_fields = tuple(
+                key for key, authority in optional_fields
+                if any(key in interval["pairs"][name] for name in self._contact_names))
+            self.contact_interval_metadata.update({
+                key + "_authority": authority for key, authority in optional_fields
+                if key in self._contact_interval_extra_fields
+            })
+            if any("joint_effort_on_second" in interval["pairs"][name] for name in self._contact_names):
+                joints = self.object_joint_metadata
+                self._contact_joint_columns = tuple(
+                    tuple(i for i, entity in enumerate(joints["entity_names"]) if entity == pair["part_entity_name"])
+                    for pair in self.contact_interval_metadata["pairs"])
+                self.contact_interval_metadata["joint_effort_on_second"] = {
+                    "joint_names": joints["joint_names"], "position_units": joints["position_units"],
+                    "axes": "recorded endpoint, configured substep, named pair, named object joint",
+                    "authority": "solved hand contact generalized effort on signed native joint axis, Nm for rad and N for m; NaN is unknown or inapplicable",
+                }
+        if interval is not None and "digit_groups" in interval:
+            self.contact_interval_metadata.update(
+                digit_group_authority="actual_solver_digit_group_positive_normal_force",
+                digit_group_normal_force_axes="recorded endpoint, configured substep, named pair, thumb then fingers",
+                digit_group_body_names=[
+                    {group: interval["digit_groups"][key][group]["body_names"] for group in ("thumb", "fingers")}
+                    for key in self._contact_names
+                ],
+            )
         self._object_pair_interval_reader = getattr(env.scene, "object_pair_contact_interval_facts", None)
         self.object_pair_interval_metadata = None
         object_pair_interval = (
@@ -447,7 +483,7 @@ class NativeRolloutRecord(RolloutRecord):
         if self.installed_term is not None:
             control = self.installed_term.installed_control
             frame["installed"] = {field: control[field].detach().to("cpu").clone()
-                                  for field in _INSTALLED_ARRAYS}
+                                  for field in self._installed_arrays}
             frame["installed"]["root_state_w"][..., :3] -= self._env_origins.cpu()[:, None]
             if self.joint_effort_metadata is not None:
                 effort = robot.data.qfrc_actuator
@@ -480,6 +516,22 @@ class NativeRolloutRecord(RolloutRecord):
                 frame["contact_interval"]["force_on_part_w_n"] = torch.stack(
                     [interval["pairs"][name]["force_on_second_w_n"] for name in self._contact_names], dim=-2
                 ).detach().cpu().clone()
+            for key in self._contact_interval_extra_fields:
+                template = next(interval["pairs"][name][key] for name in self._contact_names
+                                if key in interval["pairs"][name])
+                frame["contact_interval"][key] = torch.stack([
+                    interval["pairs"][name][key] if key in interval["pairs"][name]
+                    else torch.full_like(template, torch.nan) for name in self._contact_names
+                ], dim=2).detach().cpu().clone()
+            if self._contact_joint_columns:
+                width = len(self.object_joint_metadata["joint_names"])
+                normal = frame["contact_interval"]["normal_force_n"]
+                effort = normal.new_full((*normal.shape, width), torch.nan)
+                for index, (name, columns) in enumerate(zip(self._contact_names, self._contact_joint_columns, strict=True)):
+                    value = interval["pairs"][name].get("joint_effort_on_second")
+                    if value is not None:
+                        effort[:, :, index, list(columns)] = value.detach().cpu()
+                frame["contact_interval"]["joint_effort_on_second"] = effort
             for key in ("measurement_support", "sample_recorded", "clock_support",
                         "sample_begin_time_s", "sample_end_time_s", "interval_complete"):
                 frame["contact_interval"][key] = interval[key].detach().cpu().clone()
@@ -487,6 +539,12 @@ class NativeRolloutRecord(RolloutRecord):
                 for key in ("execution_sample_begin_step", "execution_sample_end_step",
                             "execution_clock_support", "execution_interval_complete"):
                     frame["contact_interval"][key] = interval[key].detach().cpu().clone()
+        if self.contact_interval_metadata is not None and "digit_group_authority" in self.contact_interval_metadata:
+            frame["contact_interval"]["digit_group_normal_force_n"] = torch.stack([
+                torch.stack([interval["digit_groups"][key][group]["normal_force_n"]
+                             for group in ("thumb", "fingers")], dim=-1)
+                for key in self._contact_names
+            ], dim=-2).detach().cpu().clone()
         if self.object_pair_interval_metadata is not None:
             pairs = self._object_pair_interval_reader()
             frame["object_pair_interval"] = {field: pairs[field].detach().cpu().clone()
@@ -635,7 +693,7 @@ class NativeRolloutRecord(RolloutRecord):
                     names = {"installed_valid": "installed_control_valid",
                              "finger_requested": "requested_finger_command",
                              "finger_requested_support": "requested_finger_command_support"}
-                    for field in _INSTALLED_ARRAYS:
+                    for field in self._installed_arrays:
                         key = names.get(field, "installed_" + field)
                         result[key] = np.stack([
                             frame["installed"][field][row].numpy() for frame in frames])
@@ -682,11 +740,22 @@ class NativeRolloutRecord(RolloutRecord):
                         result["hand_part_interval_force_on_part_w_n"] = np.stack([
                             frame["contact_interval"]["force_on_part_w_n"][row].numpy() for frame in frames
                         ])
+                    additional = self._contact_interval_extra_fields
+                    if self._contact_joint_columns:
+                        additional = (*additional, "joint_effort_on_second")
+                    for field in additional:
+                        result["hand_part_interval_" + field] = np.stack([
+                            frame["contact_interval"][field][row].numpy() for frame in frames
+                        ])
                     if "execution_clock" in self.contact_interval_metadata:
                         for field in ("execution_sample_begin_step", "execution_sample_end_step",
                                       "execution_clock_support", "execution_interval_complete"):
                             result["hand_part_interval_" + field] = np.stack([
                                 frame["contact_interval"][field][row].numpy() for frame in frames])
+                    if "digit_group_authority" in self.contact_interval_metadata:
+                        key = "digit_group_normal_force_n"
+                        result["hand_part_interval_" + key] = np.stack([
+                            frame["contact_interval"][key][row].numpy() for frame in frames])
                 if self.object_pair_interval_metadata is not None:
                     prefix = "object_pair_interval_"
                     result[prefix + "metadata_json"] = np.asarray(json.dumps(self.object_pair_interval_metadata))

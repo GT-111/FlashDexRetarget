@@ -16,6 +16,33 @@ from simulator.mjcf_meta import load_robot_mjcf_meta
 from .scene import NativeScene, NativeSim
 
 
+def _digit_body_groups(model, hand_root, tip_sites, finger_roles):
+    """Assign only bodies below anatomically unique, physically installed tip paths."""
+    if len(tip_sites) != len(finger_roles) or "thumb" not in finger_roles or len(tip_sites) < 2:
+        return {}
+    root = model.body(hand_root).id
+    paths = {"thumb": set(), "fingers": set()}
+    for tip, role in zip(tip_sites, finger_roles, strict=True):
+        current = int(model.site_bodyid[model.site(tip).id])
+        path = paths["thumb" if role == "thumb" else "fingers"]
+        while current != root:
+            if current == 0:
+                raise ValueError("native digit tip is outside its declared physical hand")
+            path.add(current)
+            current = int(model.body_parentid[current])
+    shared = paths["thumb"] & paths["fingers"]
+    groups = {name: branch - shared for name, branch in paths.items()}
+    if not all(groups.values()):
+        return {}
+    # Include pad/collider descendants that live on a child body of a digit link.
+    for body in range(1, model.nbody):
+        parent = int(model.body_parentid[body])
+        for group in groups.values():
+            if parent in group:
+                group.add(body)
+    return {group: sorted(members) for group, members in groups.items()}
+
+
 def create_native_envs(cfg, device="cuda"):
     meta = load_robot_mjcf_meta(cfg.robot.native_scene.scene_xml_path)
     layout = bind_native_scene_config(cfg, constructor_gravity_world_m_per_s2=meta.gravity)
@@ -35,6 +62,20 @@ def create_native_envs(cfg, device="cuda"):
         )
         for hand in layout.hands for obj, part in layout.part_bindings
     }
+    tip_sites = cfg.robot.get("site_names", {}).get("tip", {})
+    finger_roles = cfg.robot.get("body_names", {}).get("fingers", ())
+    digit_groups = {hand.side: _digit_body_groups(model, hand.root_body_name, tip_sites.get(hand.side, ()), finger_roles)
+                    for hand in layout.hands}
+    digit_contacts = {}
+    if all(digit_groups.values()):
+        for hand in layout.hands:
+            for obj, part in layout.part_bindings:
+                key = f"{hand.side}/{obj.entity_name}/{part.name}"
+                digit_contacts[key] = {}
+                for name, bodies_in_group in digit_groups[hand.side].items():
+                    child_key = f"{key}/{name}"
+                    pairs[child_key] = (bodies_in_group, [model.body(part.body_name).id])
+                    digit_contacts[key][name] = (child_key, [model.body(i).name for i in bodies_in_group])
     pairs.update({key: (bodies[first.root_body_name], bodies[second.root_body_name])
                   for key, (first, second) in layout.object_pair_bindings.items()})
     fixed_geom = (model.body_weldid[model.geom_bodyid] == 0) & ((model.geom_contype | model.geom_conaffinity) != 0)
@@ -53,7 +94,7 @@ def create_native_envs(cfg, device="cuda"):
     })
     plant.configure_control_interval(int(cfg.decimation))
     sim = NativeSim(plant)
-    scene = NativeScene(layout, meta, sim, cfg.robot.entity_name)
+    scene = NativeScene(layout, meta, sim, cfg.robot.entity_name, digit_contacts=digit_contacts)
     env = ManagerBasedRlEnv(
         ManagerEnvCfg(
             decimation=int(cfg.decimation), physics_dt=float(cfg.sim.dt),

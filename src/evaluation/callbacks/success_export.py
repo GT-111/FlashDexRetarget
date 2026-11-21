@@ -52,7 +52,7 @@ def _write_rollout(path: Path, arrays: dict[str, Any]) -> dict[str, Any]:
 
 def _measure_hoi_perturbation(arrays, plan, mode):
     if plan["status"] != "planned":
-        return dict(status=plan["status"])
+        return dict(status=plan["status"], **({"missing_phases": plan["missing_phases"]} if "missing_phases" in plan else {}))
     prefix = "applied_object_wrench_interval_"
     support = arrays.get(prefix + "measurement_support")
     if support is None or not support[1:].size or not support[1:].all():

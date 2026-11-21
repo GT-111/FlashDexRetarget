@@ -115,6 +115,7 @@ class NativePlant(ABC):
         for name, dofs in self.hand_part_feedback_dofs.items():
             facts = self.contact_facts[name]
             facts["force_bearing_tangent_speed_max_m_s"] = torch.full_like(facts["normal_force_n"], torch.nan)
+            facts["moment_on_second_about_root_w_nm"] = torch.full_like(facts["force_on_second_w_n"], torch.nan)
             if dofs:
                 facts["joint_effort_on_second"] = facts["normal_force_n"].new_full(
                     (self.num_envs, len(dofs)), torch.nan)

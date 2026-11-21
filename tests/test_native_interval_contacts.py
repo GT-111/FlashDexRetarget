@@ -104,6 +104,7 @@ class _Plant(NativePlant):
 
 
 class _Scene:
+    _digit_contacts = {}
     hand_part_contact_facts = NativeScene.hand_part_contact_facts
     hand_part_contact_interval_facts = NativeScene.hand_part_contact_interval_facts
 

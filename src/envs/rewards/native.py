@@ -205,7 +205,7 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
     @staticmethod
     def native_source_lift_load(env, command_name, lookahead_s, minimum_speed_m_s, separation_bound_m,
                                 rotation_scale_rad=.35):
-        """Credit simultaneous upward load that preserves the source orientation during lift."""
+        """Credit upward load while tracking attitude and angular motion during lift."""
         command = env.command_manager.get_term(command_name)
         intent = command.source_hand_part_intent_facts()
         interval = env.scene.hand_part_contact_interval_facts()
@@ -254,9 +254,15 @@ class NativeMotionTrackingRewards(MotionTrackingRewards):
         ], -1)
         load = torch.stack(list(object_load.values()), -1)
         credit = (load / weight.clamp_min(1e-12)).clamp(-1.0, 1.0)
-        rotation = quat_error_magnitude(now["state"][:, root_columns, 3:7],
-                                       command.sim_object_part_state_w[:, root_columns, 3:7])
-        orientation = torch.exp(-(rotation / rotation_scale_rad).square())
+        target = now["state"][:, root_columns]
+        actual = command.sim_object_part_state_w[:, root_columns]
+        rotation = quat_error_magnitude(target[..., 3:7], actual[..., 3:7])
+        angular_delta = target[..., 10:13] - actual[..., 10:13]
+        angular_known = (command.motion_lib.native_object_part_angular_velocity_support[ids][:, root_columns]
+                         & torch.isfinite(angular_delta).all(-1))
+        # Use the same task horizon to discount a developing spin before the pose diverges.
+        angular_motion_error = torch.where(angular_known, angular_delta.norm(dim=-1) * elapsed[:, None], 0.)
+        orientation = torch.exp(-(rotation.square() + angular_motion_error.square()) / rotation_scale_rad**2)
         credit = torch.where(credit > 0., credit * orientation[:, None], credit)
         eligible = torch.stack(list(object_known.values()), -1).all(1)
         complete &= (~required | eligible).all(-1)

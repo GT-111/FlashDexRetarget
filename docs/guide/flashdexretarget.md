@@ -97,6 +97,25 @@ plant, and contact/export metadata retains each `(entity_name, body_name)` owner
 A changed object/part layout is a new configured model interface; common code
 does not establish that a trained policy generalizes across layouts or tasks.
 
+### Matched stock author benchmark
+
+Use the pinned author checkout `6f95e133` and `scripts/retarget/50_motion_benchmark.sh`
+to prepare the 50 reference motions. Use the same packed motion, object assets,
+converted robot USD and Isaac runtime for both arms. The comparison helper checks
+the motion roster, composes both stock configurations and prints the command
+arguments and environment to use on the allocated device. It starts no training.
+
+```sh
+python scripts/author_benchmark_pair.py --author "$AUTHOR_CHECKOUT" \
+  --hand sharpa --motion "$BENCHMARK_ROOT/sharpa/motion.pt" \
+  --robot-usd "$SHARPA_USD" --output "$PAIR_OUTPUT"
+```
+
+Run the printed argv from each arm's `cwd` with its printed environment. The
+helper defaults to seed 42 and the author's 400M Sharpa or 300M XHand step
+budget. Use `--compose-only` for a rehearsal before assets are present. A
+rehearsal verifies the configuration and does not qualify a simulator run.
+
 ### Native Isaac articulated assets
 
 The native Isaac profile uses MJCF subtrees converted by
@@ -430,6 +449,23 @@ change the control law or establish physical tracking improvement. Keep the mode
 in the resolved condition; changing it is not an unchanged FULL continuation.
 Typed action contexts include the held correction twist and reset validity.
 Ordinary learner FULL restore retains its existing fresh-physical-episode reset.
+
+### Directed native part acquisition
+
+With source contact approach enabled, declared signed hinge and slider phases
+use named descendant parts of the installed joint. The controller projects
+supported source fingertips onto the reference surface, transports their
+anchors and normals into the live part frame, and selects a reachable face
+whose inward normal produces the requested joint direction. Separate
+supporting hands can retain loaded support through the transition. An
+unavailable signed face releases stale moving-part guidance through the
+existing wrist slew and translation limits. The normal test screens acquisition
+geometry; achieved force and motion remain solver measurements.
+
+Pure geometric approach also works when a backend lacks solved pair facts.
+The optional pad compression and stationary load feedback require a solved
+contact plant. Installed control records the selected part column and its
+named body axis, with `-1` for no selected part.
 
 ### Initial native control contexts
 

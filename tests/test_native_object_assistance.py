@@ -309,7 +309,8 @@ def test_native_perturbation_preserves_linear_force_and_bounds_root_angular_acce
     torch.testing.assert_close(submitted["object"][0, 0, 3:], full_torque)
 
 
-def test_native_pair_plans_are_stable_for_source_roles_across_batches(tmp_path):
+@pytest.mark.parametrize("compiled", (False, True))
+def test_native_pair_plans_are_stable_for_source_roles_across_batches(tmp_path, compiled):
     command, env, plant, model = _native_assist(tmp_path)
     command._object_root_columns = torch.tensor([0])
     command._eval_mode = True
@@ -340,15 +341,32 @@ def test_native_pair_plans_are_stable_for_source_roles_across_batches(tmp_path):
              selected_source_frame_index=source_frames.tolist(), processing=dict(source_task_phases=[
                  dict(kind=phase, source_frame_range_half_open=[103, 106], authority="annotated", hand_side="left")
              ])) for index, phase in enumerate(("interaction", "retreat"))]
+    if compiled:
+        for source in ml.source_lineage:
+            source["processing"]["task_phases"] = [
+                dict(kind="interaction", source_frame_range_half_open=[101, 104],
+                     hand_side="left", authority="compiled"),
+                *[dict(kind="articulation", source_frame_range_half_open=bounds,
+                       authority="compiled", entity_name=command.native_layout.objects[0].entity_name,
+                       part_body_name="lid", joint_name="hinge", coordinate_kind="hinge",
+                       native_direction=direction) for bounds, direction in (([103, 105], 1), ([105, 108], -1))],
+            ]
+        engaged[rows:, :, 1] = False
+        engaged[rows:, 0, 0] = True  # Support contact cannot back a moving-part phase.
+        ml.native_source_hand_part_intent["known"] = engaged.clone()
     command._init_native_object_assist()
     command.enable_hoi_evaluation_perturbation("perturbed")
     command.motion_ids[:] = torch.tensor([0, 1])
     command.motion_steps[:] = 1
     first, unusable = command.plan_hoi_evaluation_attempts(torch.tensor([0, 1]), [0, 0])
     assert unusable["status"] == "no_usable_source_phase" and not unusable["bursts"]
-    burst, = first["bursts"]
+    burst = first["bursts"][0]
     assert burst["root_body_name"] == "base"
-    assert burst["phase"] == ml.source_lineage[0]["processing"]["source_task_phases"][0]
+    if compiled:
+        assert [b["phase"]["native_direction"] for b in first["bursts"]] == [1, -1]
+        assert unusable["missing_phases"]
+    else:
+        assert burst["phase"] == ml.source_lineage[0]["processing"]["source_task_phases"][0]
     assert first["first_reference_motion_step"] == 1
     assert 8 <= burst["start_substep"] < burst["stop_substep_exclusive"] <= 20
 
@@ -363,8 +381,10 @@ def test_native_pair_plans_are_stable_for_source_roles_across_batches(tmp_path):
     acquired = torch.stack(applied)
     assert not acquired[:, 1].any()
     corrected = torch.nonzero(acquired[:, 0].any(-1), as_tuple=False).flatten().tolist()
-    assert corrected == list(range(burst["start_substep"], burst["stop_substep_exclusive"]))
-    torch.testing.assert_close(acquired[corrected, 0, :3], torch.tensor(burst["force_world_n"]).expand(len(corrected), 3))
+    intervals = [list(range(b["start_substep"], b["stop_substep_exclusive"])) for b in first["bursts"]]
+    assert corrected == sorted(step for interval in intervals for step in interval)
+    for b, interval in zip(first["bursts"], intervals, strict=True):
+        torch.testing.assert_close(acquired[interval, 0, :3], torch.tensor(b["force_world_n"]).expand(len(interval), 3))
 
     command.clear_object_wrenches()
     command.motion_ids[:] = torch.tensor([1, 0])

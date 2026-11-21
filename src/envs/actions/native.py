@@ -169,6 +169,9 @@ class NativeResidualAction(ActionTerm):
         self.actuator_command_indices = torch.tensor(mapping, dtype=torch.long, device=self.device)
         counts = torch.bincount(self.actuator_command_indices, minlength=len(self.finger_command_names))
         self.actuator_command_weights = counts[self.actuator_command_indices].float().reciprocal()
+        if ((self._pad_travel_m or self._stationary_hold_force_n)
+                and getattr(getattr(env, "sim", None), "plant", None) is None):
+            raise ValueError("native pad compression and stationary hold require solved contact feedback")
         if self._pad_travel_m:
             self._plant = env.sim.plant
             model = self._plant.model
@@ -378,6 +381,8 @@ class NativeResidualAction(ActionTerm):
             "installed_valid": self._installed_valid,
             "reference_motion_ids": self._reference_motion_ids,
             "reference_motion_steps": self._reference_motion_steps,
+            "source_contact_part_index": self._source_contact_part,
+            "source_contact_part_body_names": tuple(part.body_name for _, part in self.layout.part_bindings),
             "root_force_n": self._root_force,
             "root_torque_nm": self._root_torque,
             "root_control": self._root_control_metadata,
@@ -414,7 +419,8 @@ class NativeResidualAction(ActionTerm):
         """Approach from the declared carriers, then preserve achieved pad engagement."""
         ids = command._motion_flat_ids
         intent = command.source_hand_part_intent(ids)
-        fallback, nearest = command.source_contact_approach_direction(ids, **self._source_contact_guard)
+        fallback, nearest, drives_joint, moving = command.source_contact_approach_direction(
+            ids, **self._source_contact_guard)
         if intent is None:
             self._source_contact_compression.zero_()
             return fallback, nearest
@@ -423,9 +429,12 @@ class NativeResidualAction(ActionTerm):
         roles = (intent["active"] & intent["known"])[:, hands][:, :, parts]
         if self._pad_travel_m:
             direction, bearing = self._compress_loaded_pads(command, ids, roles, parts, fallback, nearest)
+            direction = torch.where(drives_joint[..., None], fallback, direction)
         else:
             direction = fallback
             solved = self._env.scene.hand_part_contact_facts()
+            if solved is None:
+                return direction, nearest
             normal = torch.stack([
                 torch.stack([
                     solved["pairs"][f"{side}/{obj.entity_name}/{part.name}"]["normal_force_n"]
@@ -433,10 +442,11 @@ class NativeResidualAction(ActionTerm):
                 ], dim=-1) for side in self.hand_sides
             ], dim=1)
             bearing = roles & solved["measurement_support"][:, None, None] & (normal >= .08)
-        # Pose and tip proximity admit new guidance. They cannot revoke a loaded role.
+        # Keep loaded support while another hand acquires the active drive side.
         part_columns = nearest.new_tensor(parts)
         retained = (bearing & (self._source_contact_part[..., None] == part_columns)).any(-1)
-        retain_guide = retained & (nearest != self._source_contact_part)
+        was_moving = moving.gather(1, self._source_contact_part.clamp_min(0))
+        retain_guide = retained & (nearest != self._source_contact_part) & ~(drives_joint | was_moving)
         direction = torch.where(retain_guide[..., None],
                                 self._source_contact_translation / self._source_contact_scale, direction)
         return direction, torch.where(retain_guide, self._source_contact_part, nearest)

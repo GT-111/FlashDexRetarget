@@ -266,7 +266,8 @@ class NativeSim:
 
 
 class NativeScene:
-    def __init__(self, layout, scene_meta, sim, robot_name):
+    def __init__(self, layout, scene_meta, sim, robot_name, *, digit_contacts=None):
+        self._digit_contacts = digit_contacts or {}
         self.sim, self._clock, self.native_layout = sim, sim._clock, layout
         self.num_envs = sim.plant.num_envs
         self.env_origins = torch.zeros(self.num_envs, 3, device=sim.device)
@@ -380,12 +381,19 @@ class NativeScene:
             return None
         last = self.hand_part_contact_facts()
         interval = self.sim.plant.contact_interval.facts()
-        return {
+        result = {
             **interval, "pairs": {key: interval["pairs"][key] for key in last["pairs"]},
             "addresses": last["addresses"],
             "normal_force_authority": last["normal_force_authority"],
             "distance_authority": last["distance_authority"],
         }
+        if self._digit_contacts:
+            result["digit_groups"] = {
+                key: {group: dict(body_names=names, normal_force_n=interval["pairs"][subpair]["normal_force_n"])
+                      for group, (subpair, names) in groups.items()}
+                for key, groups in self._digit_contacts.items()
+            }
+        return result
 
     def object_pair_contact_interval_facts(self):
         """Named pairs of distinct complete object trees on the shared solver clock."""

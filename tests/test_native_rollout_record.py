@@ -280,8 +280,15 @@ def test_frozen_attempt_npz_keeps_actual_native_schema_clocks_interval_and_first
             return {**facts, "num_substeps": 3, "sampling": "synthetic discrete protocol",
                 "pairs": {name: {"normal_force_n": torch.tensor([[.75, 0., .4] if row else [float("nan")]*3]),
                     "force_bearing_contact_present": torch.tensor([[True, False, True] if row else [False]*3]),
-                    "force_bearing_distance_max_m": torch.tensor([[.01, float("nan"), .03] if row else [float("nan")]*3])}
+                    "force_bearing_distance_max_m": torch.tensor([[.01, float("nan"), .03] if row else [float("nan")]*3]),
+                    "force_bearing_tangent_speed_max_m_s": torch.tensor([[.2, float("nan"), .3] if row else [float("nan")]*3]),
+                    "moment_on_second_about_root_w_nm": torch.full((1, 3, 3), -.025 if row else float("nan"))}
                     for name in facts["addresses"]},
+                "digit_groups": {name: {
+                    group: dict(body_names=[name.split("/")[0] + "_" + group],
+                                normal_force_n=torch.tensor([forces if row else [float("nan")] * 3]))
+                    for group, forces in (("thumb", [.25, 0., 0.]), ("fingers", [.5, 0., .4]))
+                } for name in facts["addresses"]},
                 "measurement_support": torch.full((1, 3), row > 0), "sample_recorded": torch.full((1, 3), row > 0),
                 "clock_support": torch.full((1, 3), row > 0), "interval_complete": torch.tensor([row > 0]),
                 "sample_begin_time_s": begin, "sample_end_time_s": begin+.02/3}
@@ -317,10 +324,19 @@ def test_frozen_attempt_npz_keeps_actual_native_schema_clocks_interval_and_first
         assert saved["command_motion_steps"][-1] == 2  # Keep actual clamped cursor distinct.
         np.testing.assert_array_equal(saved["native_hand_sides"], ("left", "right"))
         assert saved["native_physics_time_s"].dtype == np.float64
+        groups = saved["hand_part_interval_digit_group_normal_force_n"]
+        assert groups.shape == (3, 3, 4, 2) and np.isnan(groups[0]).all()
+        np.testing.assert_array_equal(groups[1, 0, 0], [.25, .5])
         assert saved["hand_part_interval_sample_begin_time_s"].dtype == np.float64
         assert saved["hand_part_interval_sample_recorded"].dtype == bool
         assert not saved["hand_part_interval_sample_recorded"][0].any()
         assert np.isnan(saved["hand_part_interval_normal_force_n"][0]).all()
+        assert np.isnan(saved["hand_part_interval_force_bearing_tangent_speed_max_m_s"][0]).all()
+        np.testing.assert_allclose(saved["hand_part_interval_force_bearing_tangent_speed_max_m_s"][1, :, 0],
+                                   [.2, np.nan, .3], equal_nan=True)
+        moment = saved["hand_part_interval_moment_on_second_about_root_w_nm"]
+        assert np.isnan(moment[0]).all()
+        np.testing.assert_allclose(moment[1, :, 0], -.025)
     assert motions[0]["attempts"][1]["recording"]["reason"] == "recorder_returned_no_factual_tape"
     assert all(row["recording"]["reason"] == "attempt_not_evaluated" for row in motions[1]["attempts"])
     assert export_success(success_manifest.parent, recorder, [], torch.tensor([True]), torch.tensor([0]),
@@ -876,6 +892,33 @@ def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assista
         _add_loose_object(command, env, [])
         # A type does not rename, convert, or reorder observed coordinates.
         next(iter(command.native_objects.values())).data.joint_pos[:] = torch.tensor([[.023, -.4]])
+        def contacts():
+            addresses = {f"{side}/{name}": dict(
+                hand_side=side, hand_body_name=side + "_root",
+                part_entity_name=part["entity_name"], part_body_name=part["body_name"])
+                for side in ("left", "right") for name, part in binding["object_parts"].items()}
+            return dict(addresses=addresses,
+                        pairs={name: dict(normal_force_n=torch.zeros(1), force_bearing_contact_present=torch.zeros(1, dtype=bool),
+                                         force_bearing_distance_max_m=torch.full((1,), torch.nan)) for name in addresses},
+                        measurement_support=torch.ones(1, dtype=bool), sample_time_s=torch.zeros(1),
+                        clock="fixture", normal_force_authority="fixture", distance_authority="fixture")
+
+        def contact_interval():
+            facts = contacts()
+            step = int(command.reference_phase["motion_steps"][0])
+            supported = torch.full((1, 4), step > 0)
+            for name, pair in facts["pairs"].items():
+                pair.update({key: value[:, None].expand(-1, 4) for key, value in pair.items()})
+                if facts["addresses"][name]["part_entity_name"] == "object":
+                    effort = torch.tensor([-.2, .03]) if step else torch.full((2,), torch.nan)
+                    pair["joint_effort_on_second"] = effort.expand(1, 4, 2)
+            return dict(facts, num_substeps=4, sampling="fixture", measurement_support=supported,
+                        sample_recorded=supported, clock_support=supported, interval_complete=supported.all(-1),
+                        sample_begin_time_s=torch.zeros(1, 4), sample_end_time_s=torch.zeros(1, 4))
+
+        env.scene.hand_part_contact_facts = contacts
+        env.scene.hand_part_contact_interval_facts = contact_interval
+
         def applied_interval():
             step = int(command.reference_phase["motion_steps"][0])
             wrench = torch.zeros(1, 4, 3, 6)
@@ -920,6 +963,13 @@ def test_native_multiple_objects_roundtrip_named_parts_passive_units_and_assista
                                   np.array([[0., 0.], [1.5, 1.5], [2.5, 2.5]], np.float32))
     assert recorded.arrays["object_joint_pos"].dtype == np.float32
     assert recorded.arrays["object_joint_position_support"].dtype == bool
+    contact = json.loads(str(recorded.arrays["hand_part_interval_metadata_json"]))
+    assert contact["joint_effort_on_second"]["joint_names"] == metadata["joint_names"]
+    assert contact["joint_effort_on_second"]["position_units"] == ["m", "rad"]
+    effort = recorded.arrays["hand_part_interval_joint_effort_on_second"]
+    assert effort.shape == (3, 4, 6, 2)
+    assert np.isnan(effort[0]).all() and np.isnan(effort[1:, :, [2, 5]]).all()
+    np.testing.assert_allclose(effort[1, 0, 0], [-.2, .03])
     np.testing.assert_array_equal(recorded.arrays["recorded_motion_steps"], [0, 1, 2])
     assert recorded.arrays["native_object_part_pose"].shape == (3, 3, 7)
     assistance = json.loads(str(recorded.arrays["object_assist_metadata_json"]))

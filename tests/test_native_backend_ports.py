@@ -31,6 +31,27 @@ from simulator.native.scene import NativeScene, NativeSim
 from simulator.runtime import launch_runtime
 
 
+def test_native_digit_contact_groups_follow_installed_tip_branches():
+    from simulator.native.create import _digit_body_groups
+
+    model = mujoco.MjModel.from_xml_string("""
+        <mujoco><worldbody><body name="root"><body name="palm">
+          <geom size=".01"/>
+          <body name="branch_a">
+            <site name="near_tip"/>
+            <body name="a_pad"><geom size=".01"/></body>
+          </body>
+          <body name="branch_b">
+            <body name="b_link"><site name="far_tip"/></body>
+          </body>
+        </body></body></worldbody></mujoco>
+    """)
+    groups = _digit_body_groups(model, "root", ("far_tip", "near_tip"), ("index", "thumb"))
+    assert {group: [model.body(i).name for i in ids] for group, ids in groups.items()} == {
+        "thumb": ["branch_a", "a_pad"], "fingers": ["branch_b", "b_link"],
+    }
+
+
 def _mechanics(tmp_path):
     layout, mapping = _scene(tmp_path)
     document = ET.parse(layout.scene_xml_path)
@@ -101,6 +122,10 @@ def test_direct_plant_records_scalar_contact_effort_and_slip_on_the_solved_clock
     facts = interval.pairs[name]
     effort = facts["joint_effort_on_second"]
     torch.testing.assert_close(effort[0, 0], effort.new_tensor(expected), atol=2e-4, rtol=1e-4)
+    expected_moment = np.cross(contact.pos - data.subtree_com[model.body_rootid[lever]], force_w) + couple_w
+    moment = facts["moment_on_second_about_root_w_nm"]
+    torch.testing.assert_close(moment[0, 0], moment.new_tensor(expected_moment), atol=2e-4, rtol=1e-4)
+    assert not moment[1, 0].any()
     assert not effort[1, 0].any()
     measured_slip = facts["force_bearing_tangent_speed_max_m_s"]
     assert measured_slip[0, 0].item() == pytest.approx(slip, abs=1e-6)

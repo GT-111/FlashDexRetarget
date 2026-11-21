@@ -220,6 +220,11 @@ class MjWarpPlant(NativePlant):
                 speed = facts["force_bearing_tangent_speed_max_m_s"]
                 speed.zero_().scatter_reduce_(0, rows, torch.where(bearing, slip, 0.0), reduce="amax")
                 speed.masked_fill_(present == 0, torch.nan)
+                center = torch.where(forward[:, None], centers[:, 1], centers[:, 0])
+                couple = torch.where(forward[:, None], couple_w, -couple_w)
+                moment = torch.linalg.cross(point - center, force_on_second) + couple
+                facts["moment_on_second_about_root_w_nm"].zero_().scatter_add_(
+                    0, rows[:, None].expand_as(moment), torch.where(bearing[:, None], moment, 0.0))
                 dof_list = self.hand_part_feedback_dofs[name]
                 if dof_list:
                     self._read_joint_contact_effort(

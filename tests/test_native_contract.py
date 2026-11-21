@@ -141,6 +141,83 @@ def _two_object_scene(tmp_path):
     return NativeSceneCfg.from_mapping(mapping), mapping
 
 
+@pytest.mark.parametrize("slide", (False, True))
+def test_signed_approach_transports_the_moving_contact_and_switches_faces(tmp_path, slide):
+    layout, _ = _scene(tmp_path)
+    if slide:
+        tree = ET.parse(layout.scene_xml_path)
+        tree.find(".//joint[@name='hinge']").attrib.update(type="slide", axis="0 1 0")
+        tree.write(layout.scene_xml_path)
+    command = object.__new__(NativeMotionTrackingCommand)
+    command.native_layout = layout
+    command._side_list = ("left", "right")
+    command._tip_site_ids = {"left": (0, 1), "right": (2,)}
+    command._object_part_columns = {"object": [0, 1]}
+    command.object_joint_coordinate_metadata = {"joint_names": ("hinge",), "entity_names": ("object",)}
+    source_tips = torch.tensor([[[.05, .016, 0.], [.05, -.016, 0.], [.05, 0., .005]]])
+    target = torch.zeros(1, 2, 13)
+    target[..., 3] = 1.
+    live = target.clone()
+    # Rotate the moving part's source anchors into the live local surface chart.
+    live[:, 1, :3] = torch.tensor([.005, -.008, 0.])
+    live[:, 1, 3:7] = torch.tensor([.70710678, 0., 0., .70710678])
+    tips = torch.tensor([[[-.014, .042, 0.], [.024, .042, 0.], [.05, 0., .005]]])
+    object_data = SimpleNamespace(
+        body_link_pos_w=live[..., :3], body_link_quat_w=live[..., 3:7],
+        body_link_lin_vel_w=live[..., 7:10], body_link_ang_vel_w=live[..., 10:13],
+    )
+    obj = SimpleNamespace(body_names=("base", "lid"), data=object_data)
+    class Scene(dict):
+        env_origins = torch.zeros(1, 3)
+    command._env = SimpleNamespace(num_envs=1, scene=Scene(object=obj))
+    command.robot = SimpleNamespace(data=SimpleNamespace(site_pos_w=tips))
+    command._part_entities = (obj, obj)
+    command._part_body_ids = (0, 1)
+    command.motion_lib = SimpleNamespace(
+        native_object_part_pose_support=torch.ones(1, 2, dtype=torch.bool),
+        native_object_part_state_w=target, native_source_point_position_support=True,
+    )
+    command.source_hand_part_intent = lambda ids: {
+        "metadata": {"hand_sides": ("left", "right")},
+        "active": torch.tensor([[[True, True], [True, False]]]),
+        "known": torch.ones(1, 2, 2, dtype=torch.bool),
+    }
+    command.source_point_reference = lambda ids: {
+        "position_w": {"left": source_tips[:, :2], "right": source_tips[:, 2:]},
+        "position_support": {"left": torch.ones(1, 2, dtype=torch.bool), "right": torch.ones(1, 1, dtype=torch.bool)},
+    }
+    direction = torch.zeros(1, 1, dtype=torch.int8)
+    command.task_phase_reference = lambda ids: {"joint_direction": direction}
+
+    def surfaces(points, *, part_state_w, return_support):
+        # Base is closer than the moving part. Both opposite faces of the moving slab are observable.
+        live_pose = bool(part_state_w[0, 1, 5:].abs().any())
+        slab_coordinate = points[..., 0] - .005 if live_pose else points[..., 1]
+        distances = torch.stack((torch.full_like(slab_coordinate, .001), slab_coordinate.abs() - .01), -1)
+        normals = torch.zeros(*distances.shape, 3)
+        normals[..., 0, 2] = 1.
+        normals[..., 1, 0 if live_pose else 1] = slab_coordinate.sign()
+        return distances, normals, torch.ones_like(distances, dtype=torch.bool)
+
+    command.sdf_query_parts = surfaces
+    settings = dict(max_part_position_error_m=.020, max_part_rotation_error_rad=.349, max_tip_distance_m=.042)
+    _, part, driving, moving = command.source_contact_approach_direction(torch.tensor([0]), **settings)
+    assert part.tolist() == [[0, 0]] and not driving.any()
+    assert not moving.any()
+    for sign in (+1, -1):
+        direction.fill_(sign)
+        approach, part, driving, moving = command.source_contact_approach_direction(torch.tensor([0]), **settings)
+        assert part.tolist() == [[1, 0]] and driving.tolist() == [[True, False]]
+        assert moving.tolist() == [[False, True]]
+        assert approach[0, 0, 0] * sign < -.99
+        torch.testing.assert_close(approach[0, 1], torch.tensor([0., 0., -1.]))
+    # Without the new face, the previously useful face must not push in the old direction.
+    source_tips[0, 0, 1] = -.016
+    _, part, driving, moving = command.source_contact_approach_direction(torch.tensor([0]), **settings)
+    assert part.tolist() == [[0, 0]] and not driving.any()
+    assert moving.tolist() == [[False, True]]
+
+
 
 def write_native_scene_manifest(dataset: Path, scene: dict) -> Path:
     path = dataset / "native-reference.json"
@@ -743,7 +820,11 @@ def _native_action_case(
         motion_steps=torch.tensor([4, 5]),
         ref_joint_pos=torch.zeros(2, 4),
         source_hand_part_intent=lambda _: None,
-        source_contact_approach_direction=lambda *args, **kwargs: command.approach_dir_and_part,
+        source_contact_approach_direction=lambda *args, **kwargs: (
+            *command.approach_dir_and_part,
+            getattr(command, "approach_drives_joint", torch.zeros_like(command.approach_dir_and_part[1], dtype=torch.bool)),
+            getattr(command, "approach_moving_parts", torch.zeros(2, 2, dtype=torch.bool)),
+        ),
     )
     env = SimpleNamespace(
         num_envs=2,
@@ -863,6 +944,30 @@ def test_loaded_contact_outlives_approach_guard_until_contact_or_role_ends(tmp_p
     action.apply_actions()
     torch.testing.assert_close(action.installed_control["finger_target_rad"][:, 0], torch.zeros(2))
     assert (action.installed_control["root_state_w"][:, 0, 0] < before[:, 0]).all()
+
+
+def test_native_geometric_acquisition_keeps_pair_feedback_unavailable(tmp_path):
+    env, ordinary, command, _ = _native_action_case(tmp_path)
+    env.scene.hand_part_contact_facts = lambda: None
+    command.source_hand_part_intent = lambda ids: dict(
+        active=torch.tensor([[[True, False], [False, False]]]).expand(2, -1, -1),
+        known=torch.ones(2, 2, 2, dtype=torch.bool),
+        metadata=dict(hand_sides=("left", "right"), part_body_names=("base", "lid")),
+    )
+    command.approach_dir_and_part = (
+        torch.tensor([[[1., 0., 0.], [0., 0., 0.]]]).expand(2, -1, -1),
+        torch.tensor([[0, -1], [0, -1]]),
+    )
+    guidance = dict(translation_m=.012, max_part_position_error_m=.02,
+                    max_part_rotation_error_rad=.35, max_tip_distance_m=.042)
+    cfg = replace(ordinary.cfg, source_contact_approach=guidance)
+    action = NativeResidualAction(cfg, env)
+    action.process_actions(torch.zeros_like(action.raw_action))
+    action.apply_actions()
+    assert action.installed_control["source_contact_part_index"].tolist() == [[0, -1], [0, -1]]
+    assert env.scene.hand_part_contact_facts() is None
+    with pytest.raises(ValueError, match="require solved contact feedback"):
+        NativeResidualAction(replace(cfg, source_contact_approach=dict(guidance, stationary_hold_force_n=1.)), env)
 
 
 def test_actual_native_action_derives_dimensions_and_records_accepted_supported_targets(

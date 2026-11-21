@@ -51,10 +51,10 @@ def _recorded_wrench_summary(outcome_dir):
                   for attempt in motion["attempts"]]
     records = [recording.get("applied_wrench_interval") for recording in recordings]
     measured = [record for record in records if record is not None]
-    complete = bool(records and len(measured) == len(records) and all(record["complete"] for record in measured))
     measured_intervals = sum(record["measured_intervals"] for record in measured)
-    force = max((record["peak_force_n"] for record in measured), default=0.0)
-    torque = max((record["peak_torque_nm"] for record in measured), default=0.0)
+    complete = bool(measured_intervals and len(measured) == len(records) and all(record["complete"] for record in measured))
+    force = max((record["peak_force_n"] for record in measured if record["measured_intervals"]), default=None)
+    torque = max((record["peak_torque_nm"] for record in measured if record["measured_intervals"]), default=None)
     if not complete:
         status = "MEASURED_PARTIAL_POST_SOLVE" if measured_intervals else "MEASURED_NO_SUPPORTED_STEPS"
     else:
@@ -77,6 +77,21 @@ def _recorded_wrench_summary(outcome_dir):
         "max_force_n": force,
         "max_torque_nm": torque,
         **schedule,
+    }
+
+
+def _native_evaluation_backend(env):
+    """Identify the installed plant and its available qualification readers."""
+    scene = env.scene
+    readers = ("hand_part_contact_interval_facts", "applied_object_wrench_interval_facts",
+               "physics_execution_clock")
+    missing = [name for name in readers if (read := getattr(scene, name, None)) is None or read() is None]
+    return {
+        "identity": dict(scene.backend_identity),
+        "physics_dt_s": float(env.physics_dt),
+        "control_dt_s": float(env.step_dt),
+        "qualification_evidence_available": not missing,
+        "missing_qualification_readers": missing,
     }
 
 
@@ -176,6 +191,7 @@ def run(args: argparse.Namespace) -> None:
             if qualification_mode is not None:
                 if not hasattr(command, "native_layout"):
                     raise ValueError("HOI qualification requires a prepared native scene")
+                authority["runtime_backend"] = _native_evaluation_backend(raw_eval)
                 zero = _restore_hoi_zero_curriculum(command, checkpoint, env_step, source_revision,
                                                     raw_eval.common_step_counter,
                                                     authority["policy"]["actor_optimizer_steps"])

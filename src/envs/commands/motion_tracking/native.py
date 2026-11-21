@@ -478,15 +478,18 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
     def source_contact_approach_direction(
         self, ids, *, max_part_position_error_m, max_part_rotation_error_rad, max_tip_distance_m,
     ):
-        """Closest supported fingertip-to-part direction from this action's source row."""
+        """Select a supported contact direction and identify intentional drive-side acquisition."""
         from mjlab.utils.lab_api.math import quat_error_magnitude
 
         hands = self.native_layout.hands
         directions = self.robot.data.site_pos_w.new_zeros((self.num_envs, len(hands), 3))
         selected_part = torch.full_like(directions[..., 0], -1, dtype=torch.long)
+        drives_joint = torch.zeros_like(selected_part, dtype=torch.bool)
+        moving_parts = torch.zeros((self.num_envs, len(self.native_layout.part_bindings)),
+                                   dtype=torch.bool, device=selected_part.device)
         intent = self.source_hand_part_intent(ids)
         if intent is None:
-            return directions, selected_part
+            return directions, selected_part, drives_joint, moving_parts
         live, target = self.sim_object_part_state_w, self.object_part_reference(ids)
         pose = (self.motion_lib.native_object_part_pose_support[ids]
                 & ((live[..., :3] - target[..., :3]).norm(dim=-1) <= max_part_position_error_m)
@@ -495,6 +498,10 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         tips = self.robot.data.site_pos_w[:, [site for group in sites for site in group]]
         distance, gradient, query = self.sdf_query_parts(tips, part_state_w=live, return_support=True)
         active = intent["active"] & intent["known"] & pose[:, None]
+        drive = self._articulated_approach(ids, tips, live, target, distance, gradient, query,
+                                           max_tip_distance_m)
+        if drive is not None:
+            moving_parts, drive_supported, drive_delta = drive
         start = 0
         for h, (hand, group) in enumerate(zip(hands, sites, strict=True)):
             end = start + len(group)
@@ -502,6 +509,9 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             rays = gradient[:, start:end]
             supported = (query[:, start:end] & active[:, hand_index, None]
                          & torch.isfinite(rays).all(-1) & (rays.square().sum(-1) > 0.0))
+            if drive is not None:
+                # A signed phase cannot acquire its moving part from the opposing face.
+                supported &= ~moving_parts[:, None]
             signed = distance[:, start:end].flatten(1)
             nearest, index = torch.where(supported.flatten(1), signed.abs(), float("inf")).min(-1, keepdim=True)
             valid = nearest[:, 0] <= max_tip_distance_m
@@ -510,8 +520,86 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             # Scale the last millimetre toward zero, where the signed normal can flip.
             fraction = (signed.gather(1, index) / 0.001).clamp(-1., 1.)
             directions[:, h] = torch.where(valid[:, None], -ray * fraction, 0.)
+            if drive is not None:
+                delta = drive_delta[:, start:end].flatten(1, 2)
+                candidates = (drive_supported[:, start:end]
+                              & (intent["active"] & intent["known"])[:, hand_index, None]).flatten(1)
+                length = delta.norm(dim=-1)
+                ranked, index = torch.where(candidates, length, float("inf")).min(-1, keepdim=True)
+                accepted = torch.isfinite(ranked[:, 0])
+                chosen = delta.gather(1, index[..., None].expand(-1, -1, 3))[:, 0]
+                selected_part[:, h] = torch.where(accepted, index[:, 0] % distance.shape[-1], selected_part[:, h])
+                drives_joint[:, h] = accepted
+                directions[:, h] = torch.where(accepted[:, None],
+                                               chosen / chosen.norm(dim=-1, keepdim=True).clamp_min(.001),
+                                               directions[:, h])
             start = end
-        return directions, selected_part
+        return directions, selected_part, drives_joint, moving_parts
+
+    @cached_property
+    def _approach_joint_chains(self):
+        """Authored joint frames and descendant parts, shared across simulator ports."""
+        import mujoco
+
+        model = mujoco.MjModel.from_xml_path(self.native_layout.scene_xml_path)
+        chains = []
+        joints = self.object_joint_coordinate_metadata
+        for column, (name, owner) in enumerate(zip(joints["joint_names"], joints["entity_names"], strict=True)):
+            joint = model.joint(name).id
+            child = model.jnt_bodyid[joint]
+            entity = self.native_objects[owner]
+            parts = []
+            for part_column in self._object_part_columns[owner]:
+                body = model.body(self.native_layout.part_bindings[part_column][1].body_name).id
+                while body and body != child:
+                    body = model.body_parentid[body]
+                if body == child:
+                    parts.append(part_column)
+            if parts:
+                axis = self.robot.data.site_pos_w.new_tensor(model.jnt_axis[joint])
+                anchor = self.robot.data.site_pos_w.new_tensor(model.jnt_pos[joint])
+                chains.append((column, entity, entity.body_names.index(model.body(child).name),
+                               parts, axis, anchor, model.jnt_type[joint] == mujoco.mjtJoint.mjJNT_HINGE))
+        return chains
+
+    def _articulated_approach(self, ids, tips, live, target, distance, gradient, query, max_tip_distance_m):
+        from mjlab.utils.lab_api.math import quat_apply
+
+        phase = self.task_phase_reference(ids)
+        if (phase is None or not phase["joint_direction"].shape[-1]
+                or getattr(self.motion_lib, "native_source_point_position_support", None) is None):
+            return None
+        reference = self.source_point_reference(ids)
+        source_tips = torch.cat([reference["position_w"][hand.side] for hand in self.native_layout.hands], 1)
+        source_support = torch.cat([reference["position_support"][hand.side] for hand in self.native_layout.hands], 1)
+        gap, source_normal, valid = self.sdf_query_parts(source_tips, part_state_w=target, return_support=True)
+        ref_quat = target[:, None, :, 3:7].expand(*gap.shape, 4)
+        live_quat = live[:, None, :, 3:7].expand_as(ref_quat)
+        offset = source_tips[:, :, None] - gap[..., None] * source_normal - target[:, None, :, :3]
+        normal = quat_apply(live_quat, quat_apply_inverse(ref_quat, source_normal))
+        anchors = live[:, None, :, :3] + quat_apply(live_quat, quat_apply_inverse(ref_quat, offset))
+        delta = anchors - .001 * normal - tips[:, :, None]
+        moving = torch.zeros_like(live[..., 0], dtype=torch.bool)
+        direction_safe = torch.ones_like(query)
+        directions = phase["joint_direction"]
+        for column, entity, child, parts, axis, anchor, hinged in self._approach_joint_chains:
+            sign = directions[:, column]
+            moving[:, parts] |= sign[:, None] != 0
+            quat = entity.data.body_link_quat_w[:, child]
+            axis_w = quat_apply(quat, axis.expand_as(quat[:, :3]))[:, None, None]
+            velocity = axis_w
+            if hinged:
+                pivot = entity.data.body_link_pos_w[:, child] + quat_apply(quat, anchor.expand_as(quat[:, :3]))
+                lever = anchors[:, :, parts] - pivot[:, None, None]
+                velocity = torch.linalg.cross(axis_w.expand_as(lever), lever)
+            effort = -(normal[:, :, parts] * velocity).sum(-1) * sign[:, None, None]
+            direction_safe[:, :, parts] &= (sign[:, None, None] == 0) | (effort > 0.)
+        # Keep the actual tip on the selected side of the live surface.
+        supported = (query & valid & source_support[..., None] & moving[:, None] & direction_safe
+                     & self.motion_lib.native_object_part_pose_support[ids][:, None]
+                     & (gap.abs() <= max_tip_distance_m) & (distance >= -.001)
+                     & (delta.norm(dim=-1) <= max_tip_distance_m) & ((normal * gradient).sum(-1) > 0.))
+        return moving, supported, delta
 
     def _consumed_reference_phase(self):
         from envs._common import action_term
@@ -890,9 +978,10 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                 or not (perturb.force_scale or perturb.torque_scale)):
             raise ValueError("HOI qualification requires positive finite disturbance amplitude and a burst duration")
         self.hoi_evaluation_mode = mode
-        self._assist_eval_start = torch.zeros_like(self._assist_perturb_active, dtype=torch.int64)
+        self._assist_eval_start = self._assist_perturb_active.new_zeros((*self._assist_perturb_active.shape, 1), dtype=torch.int64)
         self._assist_eval_stop = torch.zeros_like(self._assist_eval_start)
-        self._assist_eval_wrench = torch.zeros_like(self._assist_perturb_wrench)
+        self._assist_eval_wrench = self._assist_perturb_wrench.unsqueeze(-2).new_zeros(
+            (*self._assist_perturb_wrench.shape[:-1], 1, 6))
         self._assist_eval_tick = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
 
     def plan_hoi_evaluation_attempts(self, env_ids, replica_indices):
@@ -903,9 +992,6 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         substeps, clock_remainder = divmod(control_ns, physics_ns)
         if clock_remainder or substeps < 1:
             raise ValueError("HOI perturbation requires an integer solver/control clock")
-        self._assist_eval_start.zero_()
-        self._assist_eval_stop.zero_()
-        self._assist_eval_wrench.zero_()
         self._assist_eval_tick.zero_()
         intent = ml.native_source_hand_part_intent
         role_active = (intent["active"] & intent["known"]).detach().cpu().numpy()
@@ -929,58 +1015,115 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             rows = slice(start + first_step, start + min(length, length - 1 + first_step))
             frames = source_frames[rows]
             eligible = root_gate[rows] & (np.arange(len(frames))[:, None] * control_ns >= self._perturb_lag_ns)
-            phases = source.get("processing", {}).get("source_task_phases", ())
+            processing = source.get("processing", {})
+            compiled = "task_phases" in processing
+            phases = processing.get("task_phases" if compiled else "source_task_phases", ())
             provenance = getattr(ml, "native_reference_provenance", None)
             objects = {} if provenance is None else provenance[motion].get("objects", {})
-            bursts = []
+            part_names = [part.body_name for _, part in self.native_layout.part_bindings]
+            part_support = ml.native_object_part_pose_support[rows].detach().cpu().numpy()
+            bursts, missing = [], []
             for column, binding in enumerate(self.native_layout.objects):
                 entity = binding.entity_name
                 raw_id = objects.get(entity, {}).get("object_id", entity)
-                windows = []
-                for phase in (phases or (None,)):
-                    mask = eligible[:, column].copy()
-                    if phase is not None:
-                        if (phase["kind"] not in _PERTURBATION_PHASES
-                                or phase.get("object_id", raw_id) != raw_id):
-                            continue
-                        first, stop = phase["source_frame_range_half_open"]
-                        mask &= (frames >= first) & (frames < stop)
-                        if (side := phase.get("hand_side")) is not None:
-                            part_columns = self._object_part_columns[entity]
-                            hand = ml.hand_sides.index(side)
-                            mask &= role_active[rows, hand][:, part_columns].any(axis=1)
-                    steps = np.flatnonzero(mask)
-                    for run in np.split(steps, np.flatnonzero(np.diff(steps) != 1) + 1):
-                        if len(run):
-                            windows.append((int(run[0]), int(run[-1]) + 1, phase))
-                if not windows:
-                    continue
-                windows.sort(key=lambda window: (window[0], window[1], json.dumps(window[2], sort_keys=True)))
-                rng = Random(json.dumps([identity, entity], sort_keys=True, separators=(",", ":")))
-                begin, end, phase = rng.choice(windows)
-                clock_capacity = (end - begin) * substeps
-                duration = clock_capacity if perturb.continue_prob == 1. else min(
-                    clock_capacity, round(1. / (1. - perturb.continue_prob)))
-                begin_tick = begin * substeps + rng.randrange(clock_capacity - duration + 1)
-                if phase is None:
-                    phase = dict(kind="source_contact_support", authority="prepared_source_hand_part_intent",
-                                 source_frame_range_half_open=[int(frames[begin]), int(frames[end - 1]) + 1])
-                vectors = []
-                for scale in (perturb.force_scale, perturb.torque_scale):
-                    direction = [rng.gauss(0., 1.) for _ in range(3)]
-                    vectors.append([value * scale / math.hypot(*direction) for value in direction])
-                force, torque = vectors
-                stop_tick = begin_tick + duration
-                self._assist_eval_start[env_id, column] = begin_tick
-                self._assist_eval_stop[env_id, column] = stop_tick
-                self._assist_eval_wrench[env_id, column] = torch.tensor(force + torque, device=self.device)
-                bursts.append(dict(entity_name=entity, root_body_name=binding.root_body_name, phase=phase,
-                                   start_substep=begin_tick, stop_substep_exclusive=stop_tick,
-                                   force_world_n=force, requested_torque_world_nm=torque))
-            receipts.append(dict(schema="native_hoi_evaluation_perturbation_v1", **identity,
-                                 control_period_ns=control_ns, physics_period_ns=physics_ns,
-                                 first_reference_motion_step=first_step,
-                                 status="planned" if bursts else "no_usable_source_phase", bursts=bursts))
+                columns = self._object_part_columns[entity]
+                if compiled:
+                    critical = [i for i, phase in enumerate(phases)
+                                if phase.get("entity_name") == entity
+                                and ("coordinate_kind" in phase or phase["kind"] in ("lift", "terminal_support"))]
+                    engaged = role_active[start:start + length, :, columns].any()
+                    groups = [[i] for i in critical]
+                    if not groups and engaged:
+                        groups = [[i for i, phase in enumerate(phases)
+                                   if phase["kind"] in _PERTURBATION_PHASES
+                                   and phase.get("entity_name", entity) == entity]]
+                else:
+                    groups = [[i for i, phase in enumerate(phases)
+                               if phase["kind"] in _PERTURBATION_PHASES
+                               and phase.get("object_id", raw_id) == raw_id]] if phases else [[None]]
+                occupied = np.zeros(len(frames) * substeps, dtype=bool)
+                for phase_indices in groups:
+                    windows = []
+                    for phase_index in phase_indices:
+                        phase = None if phase_index is None else phases[phase_index]
+                        mask = eligible[:, column].copy()
+                        part_body = None if phase is None else phase.get("part_body_name")
+                        target_parts = columns if part_body is None else [part_names.index(part_body)]
+                        if compiled and "coordinate_kind" in phase and part_body is None:
+                            continue  # A directed event needs its actual contact-bearing child binding.
+                        if phase is not None:
+                            first, stop = phase["source_frame_range_half_open"]
+                            if phase["kind"] == "terminal_support":
+                                # The payload can be released before the supported terminal interval ends.
+                                receiver = phase["support_entity_name"]
+                                mask = (part_support[:, self._object_part_columns[receiver]].any(axis=-1)
+                                        & part_support[:, int(self._object_root_columns[column])])
+                            else:
+                                roles = role_active[rows][:, :, target_parts]
+                                roles = roles & part_support[:, None, target_parts]
+                                if (side := phase.get("hand_side")) is not None:
+                                    roles = roles[:, [ml.hand_sides.index(side)]]
+                                mask &= roles.any(axis=(1, 2))
+                            mask &= (frames >= first) & (frames < stop)
+                        steps = np.flatnonzero(np.repeat(mask, substeps) & ~occupied)
+                        for run in np.split(steps, np.flatnonzero(np.diff(steps) != 1) + 1):
+                            if len(run):
+                                windows.append((int(run[0]), int(run[-1]) + 1, phase_index))
+                    if not windows:
+                        if compiled:
+                            missing.append(dict(entity_name=entity, phase_indices=phase_indices))
+                        continue
+                    rng = Random(json.dumps([identity, entity, phase_indices], sort_keys=True, separators=(",", ":")))
+                    begin, end, phase_index = rng.choice(windows)
+                    capacity = end - begin
+                    duration = capacity if perturb.continue_prob == 1. else min(
+                        capacity, round(1. / (1. - perturb.continue_prob)))
+                    begin_tick = begin + rng.randrange(capacity - duration + 1)
+                    stop_tick = begin_tick + duration
+                    occupied[begin_tick:stop_tick] = True
+                    phase = phases[phase_index] if phase_index is not None else dict(
+                        kind="source_contact_support", authority="prepared_source_hand_part_intent",
+                        source_frame_range_half_open=[int(frames[begin // substeps]),
+                                                      int(frames[(end - 1) // substeps]) + 1])
+                    vectors = []
+                    for scale in (perturb.force_scale, perturb.torque_scale):
+                        direction = [rng.gauss(0., 1.) for _ in range(3)]
+                        vectors.append([value * scale / math.hypot(*direction) for value in direction])
+                    force, torque = vectors
+                    burst = dict(entity_name=entity, root_body_name=binding.root_body_name, phase=phase,
+                                 start_substep=begin_tick, stop_substep_exclusive=stop_tick,
+                                 force_world_n=force, requested_torque_world_nm=torque)
+                    if compiled:
+                        burst["phase_index"] = phase_index
+                    bursts.append(burst)
+            status = ("no_usable_source_phase" if not bursts else
+                      "incomplete_compiled_phase_coverage" if missing else "planned")
+            receipt = dict(schema=f"native_hoi_evaluation_perturbation_v{2 if compiled else 1}", **identity,
+                           control_period_ns=control_ns, physics_period_ns=physics_ns,
+                           first_reference_motion_step=first_step, status=status, bursts=bursts)
+            if compiled:
+                receipt["missing_phases"] = missing
+            receipts.append(receipt)
+        counts = {}
+        for env_id, receipt in zip(env_ids.tolist(), receipts, strict=True):
+            for burst in receipt["bursts"]:
+                key = (env_id, burst["entity_name"])
+                counts[key] = counts.get(key, 0) + 1
+        shape = (*self._assist_perturb_active.shape, max(counts.values(), default=1))
+        self._assist_eval_start = self._assist_eval_start.new_zeros(shape)
+        self._assist_eval_stop = torch.zeros_like(self._assist_eval_start)
+        self._assist_eval_wrench = self._assist_eval_wrench.new_zeros((*shape, 6))
+        columns = {obj.entity_name: column for column, obj in enumerate(self.native_layout.objects)}
+        for env_id, receipt in zip(env_ids.tolist(), receipts, strict=True):
+            counts = {}
+            for burst in receipt["bursts"]:
+                column = columns[burst["entity_name"]]
+                slot = counts.get(column, 0)
+                counts[column] = slot + 1
+                self._assist_eval_start[env_id, column, slot] = burst["start_substep"]
+                self._assist_eval_stop[env_id, column, slot] = burst["stop_substep_exclusive"]
+                self._assist_eval_wrench[env_id, column, slot] = torch.tensor(
+                    burst["force_world_n"] + burst["requested_torque_world_nm"], device=self.device)
         return receipts
 
     def _object_tracking_wrench(self, state, support):
@@ -1067,9 +1210,10 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
         if advance_perturbation and perturb.enabled and (zero_gains or eval_perturbed):
             columns = self._object_root_columns
             if eval_perturbed:
-                tick = self._assist_eval_tick[:, None]
-                active = (tick >= self._assist_eval_start) & (tick < self._assist_eval_stop)
-                wrench = torch.where(active[..., None], self._assist_eval_wrench, 0.)
+                tick = self._assist_eval_tick[:, None, None]
+                scheduled = (tick >= self._assist_eval_start) & (tick < self._assist_eval_stop)
+                active = scheduled.any(dim=-1)
+                wrench = torch.where(scheduled[..., None], self._assist_eval_wrench, 0.).sum(dim=-2)
                 self._assist_eval_tick += 1
             else:
                 active = self._assist_perturb_active

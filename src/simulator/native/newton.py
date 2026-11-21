@@ -118,7 +118,8 @@ class NewtonPlant(NativePlant):
         for name, (first, second) in self.contact_pairs.items():
             feedback = {}
             if name in self.hand_part_feedback_dofs:
-                feedback = dict(include_tangential=True, second_body_scalar_dofs=self.hand_part_feedback_dofs[name])
+                feedback = dict(include_tangential=True, include_world_moment=True,
+                                second_body_scalar_dofs=self.hand_part_feedback_dofs[name])
             values = self.backend.get_body_pair_contact_facts(
                 np.asarray(first), np.asarray(second), include_world_force=True, **feedback)
             for key, target in self.contact_facts[name].items():

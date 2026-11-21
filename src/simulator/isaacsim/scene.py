@@ -4,6 +4,7 @@ build order). Import only AFTER the Isaac Sim app is running."""
 from __future__ import annotations
 
 import os
+from importlib import metadata as package_metadata
 from pathlib import Path
 
 import isaaclab.sim as sim_utils
@@ -924,6 +925,14 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     adapter = IsaacSceneAdapter(scene, device, sim_ctx)
     adapter._clock = clock
     adapter.native_layout = layout
+    adapter.backend_identity.update(
+        engine_versions={package: package_metadata.version(package) for package in ("isaacsim", "isaaclab")},
+        scene_xml_path=str(layout.scene_xml_path),
+        installed_usds={
+            "static": str(cfg.sim.native_assets.static),
+            "articulations": {name: str(path) for name, path in cfg.sim.native_assets.articulations.items()},
+        },
+    )
     hands = {}
     for binding in layout.articulations:
         meta = metadata[binding.entity_name]

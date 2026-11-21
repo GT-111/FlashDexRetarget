@@ -1732,7 +1732,29 @@ def test_frozen_evaluation_entry_routes_public_policy_and_ordinary_evaluator(tmp
     assert result["training_env_step"] == 39_290_880 and result["pin_during_eval"] is False
     if recording:
         assert result["wrench_measurement"] == "MEASURED_NO_SUPPORTED_STEPS"
-        assert result["applied_object_wrench_summary"]["manifest"] == str(recording_dir / "manifest.json")
+        wrench = result["applied_object_wrench_summary"]
+        assert wrench["manifest"] == str(recording_dir / "manifest.json")
+        assert wrench["max_force_n"] is None and wrench["max_torque_nm"] is None
     else:
         assert result["wrench_measurement"].startswith("UNKNOWN")
     assert result["factual_recording_dir"] == (None if recording_dir is None else str(recording_dir))
+
+
+def test_native_evaluation_receipt_requires_exact_solver_readers():
+    source = Path(__file__).resolve().parents[1] / "evaluate.py"
+    spec = importlib.util.spec_from_file_location("native_evaluation_entry", source)
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    scene = SimpleNamespace(
+        backend_identity={"backend": "isaacsim"},
+        tracking_contact_metadata=lambda: {"left": {"authority": "net-link force"}},
+        hand_part_contact_interval_facts=lambda: None,
+    )
+    env = SimpleNamespace(scene=scene, physics_dt=.005, step_dt=.02)
+    receipt = entry._native_evaluation_backend(env)
+    assert receipt["identity"]["backend"] == "isaacsim"
+    assert receipt["physics_dt_s"] == .005 and receipt["control_dt_s"] == .02
+    assert receipt["qualification_evidence_available"] is False
+    assert set(receipt["missing_qualification_readers"]) == {
+        "hand_part_contact_interval_facts", "applied_object_wrench_interval_facts", "physics_execution_clock",
+    }
