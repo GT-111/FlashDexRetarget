@@ -407,6 +407,99 @@ def test_isaac_net_link_and_sdf_views_do_not_create_interval_pair_force_support(
     assert (result["columns"]["unsupported_or_unrecorded_sample_count"] == 3).all()
 
 
+def test_isaac_named_pair_solve_uses_the_sdk_clock_and_discards_only_reset_world(monkeypatch):
+    from simulator.isaacsim.native_contacts import (
+        IsaacHandPartContact,
+        IsaacNativeContactReadback,
+    )
+
+    class _SdkContactView:
+        max_contact_data_count = 4
+        friction_available = True
+
+        def get_contact_data(self, dt):
+            assert dt == pytest.approx(.005, abs=1e-12)
+            return (torch.tensor([[2.0], [3.0], [torch.nan], [torch.nan]]),
+                    torch.tensor([[0., 1., 0.], [0., 2., 0.], [torch.nan] * 3, [torch.nan] * 3]),
+                    torch.tensor([[0., 0., 1.]] * 4), torch.tensor([[-.001], [-.002], [0.], [0.]]),
+                    torch.tensor([[1, 1], [0, 0]]), torch.tensor([[1, 0], [0, 0]]))
+
+        def get_friction_data(self, dt):
+            assert dt == pytest.approx(.005, abs=1e-12)
+            if not self.friction_available:
+                raise Exception("missing pinned SDK friction report")
+            return (torch.tensor([[1., 0., 0.]] * 4), torch.tensor([[0., 1., 0.]] * 4),
+                    torch.tensor([[1, 0], [0, 0]]), torch.zeros(2, 2, dtype=torch.long))
+
+    parts = SimpleNamespace(body_names=["part"], joint_names=(), data=SimpleNamespace(
+        body_link_pos_w=torch.zeros(2, 1, 3),
+        body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]]] * 2),
+        body_link_lin_vel_w=torch.zeros(2, 1, 3), body_link_ang_vel_w=torch.zeros(2, 1, 3)),
+        body_inertial_properties=lambda: SimpleNamespace(
+            mass_kg=torch.ones(2, 1), com_position_body_m=torch.zeros(2, 1, 3)))
+    hand = SimpleNamespace(body_names=["pad_a", "pad_b"], data=SimpleNamespace(
+        body_link_pos_w=torch.zeros(2, 2, 3), body_link_lin_vel_w=torch.ones(2, 2, 3),
+        body_link_ang_vel_w=torch.zeros(2, 2, 3)))
+    address = dict(hand_side="left", hand_body_name="wrist", part_entity_name="assembly", part_body_name="part")
+    view = _SdkContactView()
+    pair = IsaacHandPartContact(view, hand, [0, 1], parts, 0, address, "cpu")
+    ctx = SimpleNamespace(current_time_step_index=7, current_time=.035, get_physics_dt=lambda: .005)
+
+    def solve(*, render):
+        assert not render
+        ctx.current_time_step_index += 1
+        ctx.current_time += .005
+
+    ctx.step = solve
+    backend_scene = SimpleNamespace(cfg=SimpleNamespace(num_envs=2))
+    scene = _isaac_scene_type(monkeypatch)(backend_scene, "cpu", ctx)
+    sim = IsaacSimAdapter(ctx, "cpu")
+    sim._clock = SimpleNamespace(bump=lambda: None)
+    bank = IsaacNativeContactReadback(ctx, 2, "cpu", .005, 2, {"left/assembly/part": pair})
+    sim.native_contacts = scene.native_contacts = bank
+    assert not scene.hand_part_contact_interval_facts()["measurement_support"].any()
+    _advance_control(sim, 2)
+    facts = scene.hand_part_contact_interval_facts()
+    assert facts["execution_interval_complete"].tolist() == [True, True]
+    assert facts["execution_sample_begin_step"].tolist() == [[7, 8], [7, 8]]
+    assert scene.physics_execution_clock()["steps"].tolist() == [9, 9]
+    pair = facts["pairs"]["left/assembly/part"]
+    assert pair["normal_force_n"].tolist() == [[5., 5.], [0., 0.]]
+    torch.testing.assert_close(pair["force_on_second_w_n"][0, 0], torch.tensor([1., 0., 5.]))
+    torch.testing.assert_close(pair["moment_on_second_about_root_w_nm"][0, 0], torch.tensor([8., 0., -1.]))
+    assert pair["force_bearing_tangent_speed_max_m_s"][0, 0].item() == pytest.approx(2**.5)
+    assert pair["force_bearing_distance_max_m"][0, 0].item() == pytest.approx(.002)
+    assert torch.isnan(pair["force_bearing_distance_max_m"][1]).all()
+    sim.reset(torch.tensor([0]))
+    assert facts["interval_complete"].tolist() == [False, True]
+    assert torch.isnan(pair["normal_force_n"][0]).all()
+    assert scene.physics_execution_clock()["steps"].tolist() == [9, 9]
+    view.friction_available = False
+    _advance_control(sim, 2)
+    assert facts["execution_interval_complete"].all()
+    assert not facts["measurement_support"].any()
+    assert torch.isnan(pair["normal_force_n"]).all()
+
+
+def test_isaac_named_pair_filter_order_must_resolve_in_the_matching_clone():
+    from simulator.isaacsim.native_contacts import create_named_contact_view
+
+    sensors = ["/world/0/object", "/world/1/object"]
+    filters = [["/world/0/hand/pad", "/world/0/hand/palm"],
+               ["/world/1/hand/pad", "/world/1/hand/palm"]]
+    view = SimpleNamespace(sensor_paths=sensors, filter_paths=filters, sensor_count=2, filter_count=2,
+                           max_contact_data_count=128)
+
+    def bind(requested_sensors, requested_filters, capacity):
+        assert requested_sensors == sensors and requested_filters == filters and capacity > 0
+        return view
+
+    SDK = SimpleNamespace(create_rigid_contact_view=bind)
+    assert create_named_contact_view(SDK, sensors, filters) == (view, None)
+    view.filter_paths = [filters[1], filters[0]]
+    assert create_named_contact_view(SDK, sensors, filters)[0] is None
+
+
 def test_recorder_retains_substep_tape_reset_unknown_and_original_phase(tmp_path):
     from dexforge_adaptation.flashdex_retarget import (
         flashdex_source_mapping,

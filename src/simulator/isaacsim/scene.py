@@ -27,6 +27,11 @@ from .entity import (
     FreeArticulationAdapter,
     RigidObjectAdapter,
 )
+from .native_contacts import (
+    IsaacHandPartContact,
+    IsaacNativeContactReadback,
+    create_named_contact_view,
+)
 from .sensors import build_tracking_contact_views
 from .sim import IsaacSimAdapter
 
@@ -77,6 +82,7 @@ class IsaacSceneAdapter:
         self.sensor_context = None
         self._reset_entities = None
         self._tracking_banks = {}
+        self.native_contacts = None
 
     def bind_tracking_command(self, command) -> None:
         """Bind this scene's views after the command has admitted its references."""
@@ -87,18 +93,23 @@ class IsaacSceneAdapter:
         return {side: bank.measurement_metadata for side, bank in self._tracking_banks.items()}
 
     def hand_part_contact_facts(self):
-        """Net-link forces and SDF association do not provide exact pair forces."""
-        return None
+        return None if self.native_contacts is None else self.native_contacts.facts()
 
     def hand_part_contact_interval_facts(self):
-        """Exact pair-force intervals are unavailable from net-link/SDF views."""
-        return None
+        return None if self.native_contacts is None else self.native_contacts.interval_facts()
+
+    def support_contact_interval_pairs(self):
+        # TODO(Isaac HOI): bind exact fixed support and independent object reporters.
+        return {}
 
     def physics_time_s(self):
         """Raw scene-global SDK physics time, repeated over the clone-world axis."""
         return torch.full(
             (self.num_envs,), self._sim_ctx.current_time, dtype=torch.float64, device=self.device
         )
+
+    def physics_execution_clock(self):
+        return None if self.native_contacts is None else self.native_contacts.execution_clock()
 
     @property
     def num_envs(self) -> int:
@@ -806,7 +817,7 @@ def _native_rigid_object_cfg(binding, meta, usd_path) -> RigidObjectCfg:
         raise FileNotFoundError(usd_path)
     return RigidObjectCfg(
         prim_path=f"/World/envs/env_.*/{binding.entity_name}",
-        spawn=sim_utils.UsdFileCfg(usd_path=usd_path),
+        spawn=sim_utils.UsdFileCfg(usd_path=usd_path, activate_contact_sensors=True),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=tuple(meta.free_roots[0].default_pose[:3]),
             rot=tuple(meta.free_roots[0].default_pose[3:]),
@@ -844,6 +855,52 @@ def _install_native_joint_properties(asset, meta, joint_ids, device) -> None:
     )
 
 
+def _native_rigid_body_paths(scene, asset):
+    from pxr import UsdPhysics
+
+    entity_path = next(
+        path for path in sim_utils.find_matching_prim_paths(asset.cfg.prim_path, stage=scene.stage)
+        if path.startswith(f"{scene.env_prim_paths[0]}/")
+    )
+    return entity_path, {
+        prim.GetName(): str(prim.GetPath())
+        for prim in sim_utils.get_all_matching_child_prims(
+            entity_path, predicate=lambda prim: prim.HasAPI(UsdPhysics.RigidBodyAPI), stage=scene.stage,
+        )
+    }
+
+
+def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths):
+    env_zero = scene.env_prim_paths[0]
+    layout = adapter.native_layout
+    pairs, unavailable = {}, {}
+    for hand in layout.hands:
+        hand_entity = adapter.entities[hand.entity_name]
+        hand_paths = body_paths[hand.entity_name][1]
+        hand_bodies = [hand_paths[name].removeprefix(env_zero) for name in hand_entity.body_names]
+        filters = [[env + path for path in hand_bodies] for env in scene.env_prim_paths]
+        for obj, part in layout.part_bindings:
+            key = f"{hand.side}/{obj.entity_name}/{part.name}"
+            part_path = body_paths[obj.entity_name][1][part.body_name].removeprefix(env_zero)
+            sensors = [env + part_path for env in scene.env_prim_paths]
+            view, problem = create_named_contact_view(sim_ctx.physics_sim_view, sensors, filters)
+            if problem is not None:
+                unavailable[key] = problem
+            object_entity = adapter.entities[obj.entity_name]
+            pairs[key] = IsaacHandPartContact(
+                view, hand_entity, range(len(hand_bodies)), object_entity,
+                object_entity.body_names.index(part.body_name),
+                dict(hand_side=hand.side, hand_body_name=hand.root_body_name,
+                     part_entity_name=obj.entity_name, part_body_name=part.body_name), adapter.device,
+            )
+    readback = IsaacNativeContactReadback(
+        sim_ctx, adapter.num_envs, adapter.device, float(cfg.sim.dt), int(cfg.decimation), pairs,
+    )
+    adapter.native_contacts = sim.native_contacts = readback
+    adapter.backend_identity["execution_clock"] = readback.execution_clock()["metadata"]
+    adapter.backend_identity["unavailable_hand_part_reports"] = unavailable
+
+
 def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     """Install the named hand, object and static assets converted from the source scene."""
     layout = NativeSceneCfg.from_mapping(cfg.robot.native_scene)
@@ -876,8 +933,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
             assets[binding.entity_name] = Articulation(
                 _native_articulation_cfg(binding, meta, cfg)
             )
-    from pxr import UsdPhysics
-
+    body_paths = {name: _native_rigid_body_paths(scene, asset) for name, asset in assets.items()}
     contacts, contact_links = {}, {}
     for hand in layout.hands:
         hand_meta = metadata[hand.entity_name]
@@ -889,22 +945,10 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
             names = [name for name in hand_meta.body_names if name in hand_meta.body_bound or name in tip_bodies]
         contact_links[hand.side] = names
         asset_path = assets[hand.entity_name].cfg.prim_path
-        entity_path = next(
-            path
-            for path in sim_utils.find_matching_prim_paths(asset_path, stage=scene.stage)
-            if path.startswith(f"{scene.env_prim_paths[0]}/")
-        )
-        bodies = {
-            prim.GetName(): prim
-            for prim in sim_utils.get_all_matching_child_prims(
-                entity_path,
-                predicate=lambda prim: prim.HasAPI(UsdPhysics.RigidBodyAPI),
-                stage=scene.stage,
-            )
-        }
+        entity_path, bodies = body_paths[hand.entity_name]
         for body in names:
             hand_meta.body_names.index(body)
-            relative_path = str(bodies[body].GetPath()).removeprefix(entity_path)
+            relative_path = bodies[body].removeprefix(entity_path)
             contacts[body] = ContactSensor(
                 ContactSensorCfg(
                     prim_path=f"{asset_path}{relative_path}",
@@ -969,6 +1013,14 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
         f"{obj.entity_name}/{p.name}": {"entity_name": obj.entity_name, "body_name": p.body_name}
         for obj, p in layout.part_bindings
     }
+    gravity = torch.tensor(sim.gravity_world_m_per_s2(), device=device, dtype=torch.float32)
+    magnitude = gravity.norm()
+    adapter.gravity_up_w = -gravity / magnitude.clamp_min(1e-12)
+    adapter.native_object_weights_n = magnitude * torch.stack([
+        adapter.entities[obj.entity_name].body_inertial_properties().mass_kg[0].sum()
+        for obj in layout.objects
+    ])
+    _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths)
     for hand in layout.hands:
         names = contact_links[hand.side]
         margins = torch.tensor(

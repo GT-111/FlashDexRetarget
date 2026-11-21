@@ -678,6 +678,7 @@ def test_native_isaac_contacts_resolve_named_rigid_descendants_before_reset(monk
     }
     left = roots["hand_left"].replace("env_.*", "env_0")
     right = roots["hand_right"].replace("env_.*", "env_0")
+    obj = roots["object"].replace("env_.*", "env_0")
     stage = object()
     events = []
     checked_rigid_paths = []
@@ -704,6 +705,8 @@ def test_native_isaac_contacts_resolve_named_rigid_descendants_before_reset(monk
         Prim(right + "/Rig/right_root", False),
         Prim(right + "/Rig/Roots/right_root", True),
         Prim(right + "/Rig/right_second", True),
+        Prim(obj + "/Object/base", True),
+        Prim(obj + "/Object/lid", True),
         Prim("/World/unrelated/left_root", True),
     ]
 
@@ -713,7 +716,7 @@ def test_native_isaac_contacts_resolve_named_rigid_descendants_before_reset(monk
         return [regex.replace("env_.*", "env_1"), regex.replace("env_.*", "env_0")]
 
     def find_children(path, predicate, *, stage):
-        assert stage is native_scene.stage and path in (left, right)
+        assert stage is native_scene.stage and path in (left, right, obj)
         events.append(("bodies", path))
         return [prim for prim in prims
                 if prim.path.startswith(path + "/") and predicate(prim)]
@@ -771,6 +774,7 @@ def test_native_isaac_contacts_resolve_named_rigid_descendants_before_reset(monk
     assert events == [
         ("find", roots["hand_left"]), ("bodies", left),
         ("find", roots["hand_right"]), ("bodies", right),
+        ("find", roots["object"]), ("bodies", obj),
         ("clone", {"copy_from_source": False}),
         ("filter", {"global_prim_paths": []}), ("reset",),
     ]

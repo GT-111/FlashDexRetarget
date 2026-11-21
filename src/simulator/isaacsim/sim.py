@@ -62,6 +62,7 @@ class IsaacSimAdapter:
         self.device = device
         self.render = render
         self._gravity_compensators = []
+        self.native_contacts = None
 
     def gravity_world_m_per_s2(self):
         """Actual scene-global PhysX acceleration, not a configuration mirror."""
@@ -82,14 +83,21 @@ class IsaacSimAdapter:
         self._gravity_compensators.append(entity)
 
     def begin_control_step(self) -> None:
-        # This adapter has no exact hand-part interval force readout.
-        pass
+        if self.native_contacts is not None:
+            self.native_contacts.interval.begin()
 
     def end_control_step(self) -> None:
-        pass
+        if self.native_contacts is not None:
+            self.native_contacts.interval.finish()
 
     def step(self) -> None:
+        if self.native_contacts is not None:
+            self.native_contacts.before_substep()
         self._sim.step(render=self.render)
+        if self.native_contacts is not None:
+            # Pair moments and slip read the link state at this achieved endpoint.
+            self._clock.bump()
+            self.native_contacts.after_substep()
 
     def forward(self) -> None:
         """mjlab sim.forward() parity: PhysX applies no FK on dof writes, so run
@@ -106,7 +114,8 @@ class IsaacSimAdapter:
         pass
 
     def reset(self, env_ids=None) -> None:
-        pass
+        if self.native_contacts is not None:
+            self.native_contacts.reset(env_ids)
 
     def expand_model_fields(self, fields) -> None:
         if fields:

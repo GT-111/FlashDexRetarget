@@ -185,6 +185,23 @@ Body correspondences use the existing `[robot, MANO role]` pairs, with the robot
 All shipped XHand, Sharpa and F1 registrations retain their prior body names, MANO roles and ordering. Stock and native commands use the same nonempty declared level groups for geometry access. Stock metrics follow those groups; native metrics retain their separate registered-root and object-part meanings. This does not add native anatomical metric outputs. F1 retains its seven sparse all-body correspondences and no level groups. Reward selection, source/support authority, controllers, clocks and physics are unchanged.
 
 Native references may carry source geometry availability as the paired fields
+Native Isaac also binds detailed PhysX contact reporters from each named
+object part to every installed link of each selected hand. The view checks
+the resolved per-world sensor and filter paths before reading them. Each
+accepted SDK physics callback advances the common control-interval tape.
+Positive normal patch forces and the separately reported tangential forces
+sum in the object's direction. Moments use the installed articulation COM
+at the achieved endpoint. Tangential relative speed uses achieved link
+velocities at the reported normal patch points. Missing or saturated reports
+carry false measurement support. A partial reset discards the selected
+world's samples and preserves the scene-global SDK clock.
+
+Production qualification also requires an exact applied object-wrench reader.
+Signed scalar joint effort, fixed and independent-object support pairs, and
+digit opposition still need their own installed PhysX bindings. The native
+Isaac reporter currently serves engineering runs and records those evidence
+limits explicitly.
+
 `source_point_names` and `source_point_position_support`, each keyed by the
 actual hand sides. Names address the existing clip's MANO world positions;
 boolean support has shape `[frames, points]` in that named order, independently

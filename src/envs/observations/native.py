@@ -277,9 +277,13 @@ class NativeMotionTrackingObs(MotionTrackingObs):
                 upward = (force @ scene.gravity_up_w) / object_weights[obj.entity_name]
                 append(torch.tanh(upward[:, None]), complete & supported)
         for name, (first, second) in layout.object_pair_bindings.items():
-            force, supported = weighted_force(support_pairs[name])
-            scale = torch.minimum(object_weights[first.entity_name], object_weights[second.entity_name])
-            append(torch.tanh((force @ scene.gravity_up_w / scale)[:, None]), complete & supported)
+            pair = support_pairs.get(name)
+            if pair is None:
+                append(dt.new_zeros(env.num_envs, 1), torch.zeros_like(complete))
+            else:
+                force, supported = weighted_force(pair)
+                scale = torch.minimum(object_weights[first.entity_name], object_weights[second.entity_name])
+                append(torch.tanh((force @ scene.gravity_up_w / scale)[:, None]), complete & supported)
         return torch.cat(fields, -1)
 
     @staticmethod
