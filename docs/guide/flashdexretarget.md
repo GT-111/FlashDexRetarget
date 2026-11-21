@@ -100,7 +100,20 @@ does not establish that a trained policy generalizes across layouts or tasks.
 ### Matched stock author benchmark
 
 Use the pinned author checkout `6f95e133` and `scripts/retarget/50_motion_benchmark.sh`
-to prepare the 50 reference motions. Use the same packed motion, object assets,
+to prepare the 50 reference motions. Verify the original source names and imported
+frame counts against that launcher. TACO V1 needs both hand tracks, the independent
+tool and target tracks, and the corresponding centimetre meshes. The pose
+archives in the official mirror can be read by ZIP member for the benchmark
+subset. The V1 sequence roster and parent split cover the full pose release.
+[TACO official release](https://github.com/leolyliu/TACO-Instructions)
+
+OakInk2 uses the original capture annotations, program stages and repair
+meshes. HOT3D uses full recording identities with synchronized MANO, dynamic
+object and headset poses, plus the original object library. Obtain the full
+recording download manifests from the dataset owner.
+[HOT3D toolkit and downloads](https://github.com/facebookresearch/hot3d)
+
+Use the same packed motion, object assets,
 converted robot USD and Isaac runtime for both arms. The comparison helper checks
 the motion roster, composes both stock configurations and prints the command
 arguments and environment to use on the allocated device. It starts no training.
@@ -115,6 +128,13 @@ Run the printed argv from each arm's `cwd` with its printed environment. The
 helper defaults to seed 42 and the author's 400M Sharpa or 300M XHand step
 budget. Use `--compose-only` for a rehearsal before assets are present. A
 rehearsal verifies the configuration and does not qualify a simulator run.
+
+For a short stock physics comparison, run both revisions with one shared
+packed library, selected motion and reset. Record the motion actually sampled,
+installed collision properties and body inertials, issued targets and wrenches,
+and the SDK time and state at each solve. Compare the collision-property
+installation order at fixed assistance first. A separate zero-assistance pair
+on the matched plant isolates changes in the assistance controller.
 
 ### Native Isaac articulated assets
 
@@ -165,6 +185,23 @@ wrapper with the same name as a body is not the physical contact address.
 Contact reporter activation remains enabled; resolving an address does not
 qualify installed reporter behavior or hand–part force measurement.
 
+Native Isaac also binds detailed PhysX contact reporters from each named
+object part to every installed link of each selected hand. The view checks
+the resolved per-world sensor and filter paths before reading them. Each
+accepted SDK physics callback advances the common control-interval tape.
+Positive normal patch forces and the separately reported tangential forces
+sum in the object's direction. Moments use the installed articulation COM
+at the achieved endpoint. Tangential relative speed uses achieved link
+velocities at the reported normal patch points. Missing or saturated reports
+carry false measurement support. A partial reset discards the selected
+world's samples and preserves the scene-global SDK clock.
+
+Production qualification also requires an exact applied object-wrench reader.
+Signed scalar joint effort, fixed and independent-object support pairs, and
+digit opposition still need their own installed PhysX bindings. The native
+Isaac reporter currently serves engineering runs and records those evidence
+limits explicitly.
+
 Stock USD collision overrides are installed after the scene owner makes nested
 references editable, before material binding and the first physics reset.
 Robot and parked-object edits precede environment cloning; per-world objects,
@@ -185,23 +222,6 @@ Body correspondences use the existing `[robot, MANO role]` pairs, with the robot
 All shipped XHand, Sharpa and F1 registrations retain their prior body names, MANO roles and ordering. Stock and native commands use the same nonempty declared level groups for geometry access. Stock metrics follow those groups; native metrics retain their separate registered-root and object-part meanings. This does not add native anatomical metric outputs. F1 retains its seven sparse all-body correspondences and no level groups. Reward selection, source/support authority, controllers, clocks and physics are unchanged.
 
 Native references may carry source geometry availability as the paired fields
-Native Isaac also binds detailed PhysX contact reporters from each named
-object part to every installed link of each selected hand. The view checks
-the resolved per-world sensor and filter paths before reading them. Each
-accepted SDK physics callback advances the common control-interval tape.
-Positive normal patch forces and the separately reported tangential forces
-sum in the object's direction. Moments use the installed articulation COM
-at the achieved endpoint. Tangential relative speed uses achieved link
-velocities at the reported normal patch points. Missing or saturated reports
-carry false measurement support. A partial reset discards the selected
-world's samples and preserves the scene-global SDK clock.
-
-Production qualification also requires an exact applied object-wrench reader.
-Signed scalar joint effort, fixed and independent-object support pairs, and
-digit opposition still need their own installed PhysX bindings. The native
-Isaac reporter currently serves engineering runs and records those evidence
-limits explicitly.
-
 `source_point_names` and `source_point_position_support`, each keyed by the
 actual hand sides. Names address the existing clip's MANO world positions;
 boolean support has shape `[frames, points]` in that named order, independently
