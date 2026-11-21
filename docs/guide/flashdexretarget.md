@@ -456,8 +456,11 @@ With source contact approach enabled, declared signed hinge and slider phases
 use named descendant parts of the installed joint. The controller projects
 supported source fingertips onto the reference surface, transports their
 anchors and normals into the live part frame, and selects a reachable face
-whose inward normal produces the requested joint direction. Separate
-supporting hands can retain loaded support through the transition. An
+whose inward normal produces the requested joint direction. The guide also
+checks the tip displacement against the selected anchor's tangent plane.
+A similar normal on the neighboring facet can otherwise admit an outward
+displacement. Separate supporting hands can retain loaded support through
+the transition. An
 unavailable signed face releases stale moving-part guidance through the
 existing wrist slew and translation limits. The normal test screens acquisition
 geometry; achieved force and motion remain solver measurements.

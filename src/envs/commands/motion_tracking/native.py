@@ -594,10 +594,11 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
                 velocity = torch.linalg.cross(axis_w.expand_as(lever), lever)
             effort = -(normal[:, :, parts] * velocity).sum(-1) * sign[:, None, None]
             direction_safe[:, :, parts] &= (sign[:, None, None] == 0) | (effort > 0.)
-        # Keep the actual tip on the selected side of the live surface.
+        # Nearest normals can agree around an edge even when the target pushes outward.
+        aims_inward = (delta * normal).sum(-1) <= 0.
         supported = (query & valid & source_support[..., None] & moving[:, None] & direction_safe
                      & self.motion_lib.native_object_part_pose_support[ids][:, None]
-                     & (gap.abs() <= max_tip_distance_m) & (distance >= -.001)
+                     & (gap.abs() <= max_tip_distance_m) & (distance >= -.001) & aims_inward
                      & (delta.norm(dim=-1) <= max_tip_distance_m) & ((normal * gradient).sum(-1) > 0.))
         return moving, supported, delta
 

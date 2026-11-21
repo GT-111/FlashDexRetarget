@@ -217,6 +217,27 @@ def test_signed_approach_transports_the_moving_contact_and_switches_faces(tmp_pa
     assert part.tolist() == [[0, 0]] and not driving.any()
     assert moving.tolist() == [[False, True]]
 
+    # A nearby curved surface can give a similar normal while placing the tip
+    # behind the tangent plane of the actual intended anchor.
+    source_tips[0, 0, 1] = .016
+    tips[0, 0] = torch.tensor([-.003, .050, 0.])
+
+    def curved_surface(points, *, part_state_w, return_support):
+        live_pose = bool(part_state_w[0, 1, 5:].abs().any())
+        centre = [.005, .042, 0.] if live_pose else [.050, 0., 0.]
+        radial = points - points.new_tensor(centre)
+        gap = radial.norm(dim=-1) - .01
+        distances = torch.stack((torch.full_like(gap, .001), gap), -1)
+        normals = torch.zeros(*distances.shape, 3)
+        normals[..., 0, 2] = 1.
+        normals[..., 1, :] = torch.nn.functional.normalize(radial, dim=-1)
+        return distances, normals, torch.ones_like(distances, dtype=torch.bool)
+
+    command.sdf_query_parts = curved_surface
+    _, part, driving, moving = command.source_contact_approach_direction(torch.tensor([0]), **settings)
+    assert part.tolist() == [[0, 0]] and not driving.any()
+    assert moving.tolist() == [[False, True]]
+
 
 
 def write_native_scene_manifest(dataset: Path, scene: dict) -> Path:
