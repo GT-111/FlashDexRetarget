@@ -186,11 +186,10 @@ class NativeResidualAction(ActionTerm):
         self._finger_command_hand = torch.as_tensor(
             [i for i, hand in enumerate(self.layout.hands) for _ in range(hand.command_count)],
             dtype=torch.long, device=self.device)
-        if ((self._pad_travel_m or self._stationary_hold_force_n)
-                and getattr(getattr(env, "sim", None), "plant", None) is None):
-            raise ValueError("native pad compression and stationary hold require solved contact feedback")
         if self._pad_travel_m:
-            self._plant = env.sim.plant
+            self._plant = getattr(getattr(env, "sim", None), "plant", None)
+            if self._plant is None:
+                raise ValueError("native pad compression requires a solved contact differential")
             model = self._plant.model
             actuators = [model.actuator(name).id for name in self.finger_actuator_names]
             dofs = torch.as_tensor(model.jnt_dofadr[model.actuator_trnid[actuators, 0]],
@@ -273,9 +272,11 @@ class NativeResidualAction(ActionTerm):
         self._source_hold_pairs = ()
         self._source_hold_reference_rows = None
         if self._stationary_hold_force_n:
-            self._source_hold_pairs = tuple(key for key in self.layout.support_pair_bindings
-                                          if key in env.sim.plant.contact_facts)
-            if self._source_hold_pairs:
+            if env.scene.hand_part_contact_facts() is None:
+                raise ValueError("native stationary hold requires solved hand-part contact feedback")
+            support_pairs = env.scene.support_contact_interval_pairs()
+            if all(key in support_pairs for key in self.layout.support_pair_bindings):
+                self._source_hold_pairs = tuple(self.layout.support_pair_bindings)
                 object_index = {obj.entity_name: i for i, obj in enumerate(self.layout.objects)}
                 self._source_hold_weights_n = env.scene.native_object_weights_n[[
                     object_index[obj.entity_name] for obj, _ in self.layout.part_bindings]]
@@ -530,15 +531,16 @@ class NativeResidualAction(ActionTerm):
     def _supported_hold_translation(self, command, part, fallback):
         """Bound wrist motion using observed hand load on a stationary supported part."""
         scene = self._env.scene
-        plant = self._env.sim.plant
+        solved = scene.hand_part_contact_facts()
+        support_pairs = scene.support_contact_interval_pairs()
         index = part.clamp_min(0)
         if self._source_hold_reference_rows is None:
             reach_steps = max(1, round(self._source_contact_scale / (self._source_contact_speed_m_s * self._control_dt)))
             self._source_hold_reference_rows = command.source_stationary_part_rows(reach_steps)
         stationary = (part >= 0) & self._source_hold_reference_rows[command._motion_flat_ids].gather(1, index)
-        support_up = torch.stack([plant.contact_facts[key]["force_on_second_w_n"] @ scene.gravity_up_w
+        support_up = torch.stack([support_pairs[key]["force_on_second_w_n"][:, -1] @ scene.gravity_up_w
                                   for key in self._source_hold_pairs], 1).gather(1, index)
-        hand_contacts = [[plant.contact_facts[f"{hand.side}/{obj.entity_name}/{p.name}"]
+        hand_contacts = [[solved["pairs"][f"{hand.side}/{obj.entity_name}/{p.name}"]
                           for obj, p in self.layout.part_bindings] for hand in self.layout.hands]
 
         def selected(field):
@@ -547,7 +549,7 @@ class NativeResidualAction(ActionTerm):
 
         force = selected("normal_force_n")
         distance = torch.nan_to_num(selected("force_bearing_distance_max_m"))
-        measured = plant.contact_support[:, None] & torch.isfinite(force)
+        measured = solved["measurement_support"][:, None] & torch.isfinite(force)
         self._source_hold_force_n.lerp_(torch.where(measured, force, 0.), .4)
         supported = measured & (support_up >= .25 * self._source_hold_weights_n[index])
         stationary &= supported
@@ -575,8 +577,10 @@ class NativeResidualAction(ActionTerm):
         wrist_support = torch.stack([ml.native_root_pose_support[side][ids] for side in self.hand_sides], 1)
         eligible = (roles.sum(-1) == 1) & command.rigid_part_mask[index] & pose_support & wrist_support
 
-        plant = self._env.sim.plant
-        contacts = [[plant.contact_facts[f"{side}/{obj.entity_name}/{part.name}"]
+        scene = self._env.scene
+        solved = scene.hand_part_contact_facts()
+        support_pairs = scene.support_contact_interval_pairs()
+        contacts = [[solved["pairs"][f"{side}/{obj.entity_name}/{part.name}"]
                      for obj, part in self.layout.part_bindings] for side in self.hand_sides]
 
         def bearing_value(field):
@@ -585,15 +589,15 @@ class NativeResidualAction(ActionTerm):
 
         force = bearing_value("normal_force_n")
         depth = bearing_value("force_bearing_distance_max_m")
-        eligible &= plant.contact_support[:, None] & (force >= .08) & (depth <= .0025)
+        eligible &= solved["measurement_support"][:, None] & (force >= .08) & (depth <= .0025)
         same_clip = (self._installed_valid & (command.motion_ids == self._reference_motion_ids))[:, None]
         prior_ids = ml.length_starts[self._reference_motion_ids] + self._reference_motion_steps
         previous = command.source_hand_part_intent(prior_ids)
         prior_roles = (previous["active"] & previous["known"])[:, hands]
         previous_stationary = self._source_hold_reference_rows[prior_ids].gather(1, index)
         stationary = self._source_hold_reference_rows[ids].gather(1, index)
-        up = self._env.scene.gravity_up_w
-        support_up = torch.stack([plant.contact_facts[key]["force_on_second_w_n"] @ up
+        up = scene.gravity_up_w
+        support_up = torch.stack([support_pairs[key]["force_on_second_w_n"][:, -1] @ up
                                   for key in self._source_hold_pairs], 1).gather(1, index)
         capture = (eligible & same_clip & self._root_support & (ids == prior_ids + 1)[:, None]
                    & prior_roles.gather(2, index[..., None]).squeeze(-1)

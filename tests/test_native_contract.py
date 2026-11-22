@@ -868,18 +868,15 @@ def _native_action_case(
         close=lambda: None,
     )
     if support_contacts:
-        import mujoco
-
         layout = NativeSceneCfg.from_mapping(mapping)
-        facts = {key: {"force_on_second_w_n": torch.tensor([[0., 0., 2.], [0., 0., 2.]])}
-                 for key in layout.support_pair_bindings}
-        facts.update({f"{hand.side}/{obj.entity_name}/{part.name}": {
+        support = {key: {"force_on_second_w_n": torch.tensor([[[0., 0., 0.], [0., 0., 2.]]] * 2)}
+                   for key in layout.support_pair_bindings}
+        pairs = {f"{hand.side}/{obj.entity_name}/{part.name}": {
             "normal_force_n": torch.zeros(2), "force_bearing_distance_max_m": torch.full((2,), float("nan")),
-        } for hand in layout.hands for obj, part in layout.part_bindings})
-        env.sim = SimpleNamespace(plant=SimpleNamespace(
-            contact_facts=facts, contact_support=torch.ones(2, dtype=torch.bool),
-            model=mujoco.MjModel.from_xml_path(layout.scene_xml_path),
-        ))
+        } for hand in layout.hands for obj, part in layout.part_bindings}
+        measurement = dict(pairs=pairs, measurement_support=torch.ones(2, dtype=torch.bool))
+        env.scene.hand_part_contact_facts = lambda: measurement
+        env.scene.support_contact_interval_pairs = lambda: support
         env.scene.gravity_up_w = torch.tensor([0., 0., 1.])
         env.scene.native_object_weights_n = torch.full((len(layout.objects),), 5.)
     action = NativeResidualAction(
@@ -1002,7 +999,7 @@ def test_native_geometric_acquisition_keeps_pair_feedback_unavailable(tmp_path):
     action.apply_actions()
     assert action.installed_control["source_contact_part_index"].tolist() == [[0, -1], [0, -1]]
     assert env.scene.hand_part_contact_facts() is None
-    with pytest.raises(ValueError, match="require solved contact feedback"):
+    with pytest.raises(ValueError, match="requires solved hand-part contact feedback"):
         NativeResidualAction(replace(cfg, source_contact_approach=dict(guidance, stationary_hold_force_n=1.)), env)
 
 
@@ -1158,11 +1155,11 @@ def test_stationary_hold_pressure_requires_solved_support_and_retains_wrist_feed
     torch.testing.assert_close(action.installed_control["root_state_w"][0, 0, 7:10], torch.tensor([0., 0., -.035]))
 
     obj, part = action.layout.part_bindings[0]
-    facts = env.sim.plant.contact_facts[f"left/{obj.entity_name}/{part.name}"]
+    facts = env.scene.hand_part_contact_facts()["pairs"][f"left/{obj.entity_name}/{part.name}"]
     facts["force_bearing_distance_max_m"][0] = .003
     action.process_actions(raw)
     torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.0007))
-    env.sim.plant.contact_support[0] = False
+    env.scene.hand_part_contact_facts()["measurement_support"][0] = False
     action.process_actions(raw)
     assert action._source_hold_offset_m[0, 0] == 0.
     assert action._source_contact_translation[0, 0, 0] > 0.
@@ -1237,15 +1234,11 @@ def test_native_rigid_transport_preserves_a_solved_grasp_across_dwell_to_motion(
     }
     known_fingers = torch.ones(2, len(action.finger_command_names), dtype=torch.bool)
     command.requested_command_reference = lambda _: (torch.zeros_like(known_fingers, dtype=torch.float32), known_fingers)
-    plant = env.sim.plant
-    env.scene.hand_part_contact_facts = lambda: {
-        "pairs": plant.contact_facts, "measurement_support": plant.contact_support,
-    }
-    solved = plant.contact_facts["left/object/base"]
+    solved = env.scene.hand_part_contact_facts()["pairs"]["left/object/base"]
     solved["normal_force_n"][:] = 2.
     solved["force_bearing_distance_max_m"][:] = .001
     # The second clone has no fixed support.
-    plant.contact_facts["support/object/base"]["force_on_second_w_n"][1] = 0.
+    env.scene.support_contact_interval_pairs()["support/object/base"]["force_on_second_w_n"][1, -1] = 0.
     action.process_actions(torch.zeros_like(action.raw_action))
     action.apply_actions()
     grip = action.installed_control["finger_target_rad"][:, 0].clone()
@@ -1284,10 +1277,6 @@ def test_idle_plane_clearance_keeps_a_declared_support_hand_in_place(tmp_path):
         "metadata": {"hand_sides": ("left", "right"), "part_body_names": ("base", "lid")},
         "active": active, "known": known,
     }
-    plant = env.sim.plant
-    env.scene.hand_part_contact_facts = lambda: {
-        "pairs": plant.contact_facts, "measurement_support": plant.contact_support,
-    }
     # Both target wrists would cross the configured plane. The second clone has
     # unlabelled intent on the right, so it has no authority to move out of the way.
     known[1, 1, 0] = False
@@ -1306,7 +1295,7 @@ def test_idle_plane_clearance_keeps_a_declared_support_hand_in_place(tmp_path):
     action.apply_actions()
     torch.testing.assert_close(action.installed_control["root_state_w"][..., 9], first / env.step_dt)
     # Real solved support on an otherwise idle hand withdraws the correction.
-    plant.contact_facts["right/object/base"]["normal_force_n"][0] = 1.
+    env.scene.hand_part_contact_facts()["pairs"]["right/object/base"]["normal_force_n"][0] = 1.
     action.process_actions(raw)
     action.apply_actions()
     torch.testing.assert_close(action.installed_control["idle_support_offset_m"], first)
