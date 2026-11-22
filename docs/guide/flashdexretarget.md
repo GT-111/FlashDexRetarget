@@ -456,9 +456,11 @@ adapter still requires both hands.
 The readouts borrow stopped views of fixed storage until the next control,
 state change or reset. Capacity comes from `decimation`. Reset or authored
 state installation discards affected rows; physical restore preserves its
-last-solve facts but does not invent an executed control interval. Starting a
-control discards its old interval before action or physics work, so an
-interrupted control cannot reuse earlier completed evidence. Unknown force
+last-solve facts but does not invent an executed control interval. Action
+processing can read the preceding completed interval for causal contact
+feedback. The manager opens a fresh interval before the first new solve.
+A partial reset clears the affected worlds' evidence before the next action.
+An interrupted solve leaves its interval incomplete. Unknown force
 remains distinct from measured zero contact.
 
 `NativeRolloutRecord` copies these samples into `hand_part_interval_*` arrays

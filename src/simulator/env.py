@@ -267,8 +267,9 @@ class ManagerBasedRlEnv:
         if not self.cfg.auto_reset and torch.any(self._manual_reset_pending):
             raise RuntimeError("pending manual resets before step()")
 
-        self.sim.begin_control_step()
+        # Action feedback reads the completed solve interval before the next one opens.
         self.action_manager.process_action(action.to(self.device))
+        self.sim.begin_control_step()
 
         for _ in range(self.cfg.decimation):
             self._sim_step_counter += 1

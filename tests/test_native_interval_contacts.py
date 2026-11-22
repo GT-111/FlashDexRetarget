@@ -316,6 +316,7 @@ def test_real_backend_advance_methods_feed_the_same_interval_contact_owner(engin
 def test_normal_manager_brackets_all_substeps_before_partial_auto_reset():
     sim, scene = _sim(5)
     events = []
+    previous_samples = []
     for name in ("begin_control_step", "end_control_step", "reset"):
         method = getattr(sim, name)
 
@@ -328,8 +329,13 @@ def test_normal_manager_brackets_all_substeps_before_partial_auto_reset():
     class FixtureManager(ManagerBasedRlEnv):
         def load_managers(self):
             reset = lambda env_ids=None: {}
+
+            def process_action(_action):
+                events.append("process_action")
+                previous_samples.append(sim.plant.contact_interval.sample_recorded.sum(-1).tolist())
+
             self.action_manager = SimpleNamespace(
-                process_action=lambda action: events.append("process_action"),
+                process_action=process_action,
                 apply_action=lambda: events.append("apply_action"), reset=reset)
             self.command_manager = SimpleNamespace(compute=lambda dt: events.append("compute"),
                                                    compute_substep=lambda: None, reset=reset)
@@ -342,11 +348,13 @@ def test_normal_manager_brackets_all_substeps_before_partial_auto_reset():
 
     env = FixtureManager(ManagerEnvCfg(decimation=5, physics_dt=sim.plant.dt), scene, sim, "cpu")
     env.step(torch.zeros(2, 1))
-    assert events[0:2] == ["begin_control_step", "process_action"]
+    assert events[0:2] == ["process_action", "begin_control_step"]
     assert events.count("apply_action") == 5
     assert events.index("end_control_step") < events.index("reset") < events.index("compute")
     assert not sim.plant.contact_interval.sample_recorded[0].any()
     assert sim.plant.contact_interval.sample_recorded[1].all() and sim.plant.contact_interval.interval_complete[1]
+    env.step(torch.zeros(2, 1))
+    assert previous_samples == [[0, 0], [0, 5]]
 
 
 def _callback_env(sim, scene):
