@@ -329,10 +329,11 @@ def test_newton_adapter_uses_public_completed_state_and_actual_solver_clock(tmp_
         plant = NewtonPlant(scene_xml_path=layout.scene_xml_path, num_envs=2, sim_dt=.005,
                             device="cpu", contact_pairs={"left/base": ([hand], [part])})
     assert plant.identity["engine_versions"] == installed_versions
+    assert plant.identity["physics_device"] == "cpu"
     args, kwargs = factory.call_args
     assert args[0] == "newton" and isinstance(args[1], NativeSceneSpec)
     assert args[1].model_file == layout.scene_xml_path and args[1].collision_generation is None
-    assert args[2:] == (2, .005) and kwargs == {"device": "cpu", "cuda_graph": True}
+    assert args[2:] == (2, .005) and kwargs == {"device": "cpu", "device_collection": True, "cuda_graph": True}
     plant.external_body_wrench_w[:, 1:, 0] = 3.0
     plant.external_body_wrench_w[:, 1:, 5] = -2.0
     plant.advance()

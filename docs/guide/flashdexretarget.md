@@ -413,14 +413,20 @@ current manager control interval, with solver begin/end clocks, independent
 recording/measurement/clock support and named hand-subtree × object-part
 addresses. These discrete solved samples do not certify continuous force.
 
-Direct MjWarp and Newton expose `physics_execution_clock()`: int64 counts of
-accepted backend advances. MjWarp checks the installed fixed timestep against
+Direct MjWarp and Newton expose `physics_execution_clock()` with int64 counts
+of accepted backend advances. MjWarp checks the installed fixed timestep against
 its actual device cast; Newton checks the public compiled native timestep used
 by its owning backend and declares its own `accepted_newton_fixed_step_clock_v1`
 schema without claiming MjWarp's device-cast witness. Only an
 actual advance increments the count; forward and authored state installation do
 not. Selected reset clears only selected counts, and same-plant snapshot/restore
-retains them. Isaac leaves this clock unavailable.
+retains them. Native Isaac reads accepted step indices from the SDK callback.
+
+Native Newton uses batched SolverMuJoCo with MuJoCo Warp storage on both CPU
+and CUDA. Select `device=cpu` for synchronous CPU execution with the same
+named contact, applied wrench and accepted step readouts. The rollout's
+backend identity reports the physics device read from its published state.
+CUDA continues to use the owning stream and configured graph capture.
 
 Direct MjWarp synchronously checks the SDK's per-world `OverflowType` bits after
 each solver step, before accepting the advance or publishing solved contacts.

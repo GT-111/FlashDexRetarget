@@ -21,7 +21,7 @@ class NewtonPlant(NativePlant):
 
         self.backend = create_backend(
             "newton", NativeSceneSpec(scene_xml_path, collision_generation=collision_generation),
-            num_envs, sim_dt, device=device, cuda_graph=cuda_graph,
+            num_envs, sim_dt, device=device, device_collection=True, cuda_graph=cuda_graph,
         )
         if not isinstance(self.backend, DeviceTrackingBackend):
             raise ValueError("Flash Newton requires the real device backend")
@@ -35,6 +35,7 @@ class NewtonPlant(NativePlant):
         self.effort = torch.zeros(num_envs, self.model.nv, device=device)
         self.identity = {
             "backend": "newton", "solver": "SolverMuJoCo",
+            "physics_device": str(self._state.qpos.device),
             "contact_generation": collision_generation,
             "native_engine": "installed_dexforge_tracking",
             "engine_versions": {
