@@ -304,6 +304,11 @@ class NativeScene:
                       second_entity_name=second.entity_name, second_root_body_name=second.root_body_name)
             for key, (first, second) in layout.object_pair_bindings.items()
         }
+        self._fixed_support_contact_addresses = {
+            key: dict(part_entity_name=obj.entity_name, part_body_name=part.body_name,
+                      first_fixed_body_names=[model.body(body).name for body in sim.plant.contact_pairs[key][0]])
+            for key, (obj, part) in layout.support_pair_bindings.items() if key in sim.plant.contact_pairs
+        }
         self._object_part_body_ids = torch.tensor(
             [sim.plant.model.body(part.body_name).id for _, part in layout.part_bindings],
             device=sim.device, dtype=torch.long,
@@ -399,6 +404,9 @@ class NativeScene:
     def object_pair_contact_interval_facts(self):
         """Named pairs of distinct complete object trees on the shared solver clock."""
         return object_pair_interval_facts(self.sim.plant.contact_interval, self._object_pair_contact_addresses)
+
+    def fixed_support_contact_interval_facts(self):
+        return object_pair_interval_facts(self.sim.plant.contact_interval, self._fixed_support_contact_addresses)
 
     def support_contact_interval_pairs(self):
         """Fixed-world and independent object contacts from the same hand/part solve interval."""

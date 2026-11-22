@@ -861,18 +861,35 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
 
         env.scene.hand_part_contact_interval_facts = interval
         key = next(iter(command.native_layout.object_pair_bindings))
+        support_addresses = {
+            name: dict(part_entity_name=obj.entity_name, part_body_name=part.body_name,
+                       first_fixed_body_names=["world"])
+            for name, (obj, part) in command.native_layout.support_pair_bindings.items()
+        }
 
         def object_interval():
             row = int(command.reference_phase["motion_steps"].item())
             forces = torch.tensor([[0., 1.5, 0.25, 0.]]) if row == 1 else torch.zeros((1, 4))
             vectors = torch.stack((forces * 0.1, torch.zeros_like(forces), -forces), dim=-1)
-            return {**interval(), "pairs": {key: {"normal_force_n": forces, "force_on_second_w_n": vectors}}}
+            pairs = {key: dict(normal_force_n=forces, force_on_second_w_n=vectors)}
+            for name, address in support_addresses.items():
+                if address["part_body_name"] == "object_root":
+                    normal = forces * 2.
+                elif address["part_body_name"] == "object_lid":
+                    normal = torch.zeros_like(forces)
+                else:
+                    normal = torch.full_like(forces, torch.nan)
+                pairs[name] = dict(normal_force_n=normal, force_on_second_w_n=torch.stack(
+                    (normal * .1, torch.zeros_like(normal), normal), dim=-1))
+            return {**interval(), "pairs": pairs}
 
         receiver = SimpleNamespace(
             sim=SimpleNamespace(plant=SimpleNamespace(contact_interval=SimpleNamespace(facts=object_interval))),
             _object_pair_contact_addresses={key: dict(first_entity_name="object", first_root_body_name="object_root",
-                second_entity_name="loose_prop", second_root_body_name="prop_root")})
+                second_entity_name="loose_prop", second_root_body_name="prop_root")},
+            _fixed_support_contact_addresses=support_addresses)
         env.scene.object_pair_contact_interval_facts = lambda: NativeScene.object_pair_contact_interval_facts(receiver)
+        env.scene.fixed_support_contact_interval_facts = lambda: NativeScene.fixed_support_contact_interval_facts(receiver)
 
     manifest = record_reference_phase_fixture(tmp_path, binding, native=True, setup_scene=setup)
     recorded = load_flashdex_rollout(manifest, motion_id=0)
@@ -905,6 +922,23 @@ def test_native_contact_archive_retains_source_phase_and_normal_reader(tmp_path)
     assert np.isnan(arrays["object_pair_interval_force_on_second_w_n"][0]).all()
     np.testing.assert_allclose(arrays["object_pair_interval_force_on_second_w_n"][1, 1, 0],
                                [.15, 0., -1.5])
+    support = json.loads(str(arrays["fixed_support_interval_metadata_json"]))
+    assert support["schema"] == "solver_fixed_support_control_interval_v1" and support["num_substeps"] == 4
+    assert support["clock"] == pair["clock"]
+    columns = {entry["part_body_name"]: c for c, entry in enumerate(support["pairs"])}
+    base, lid, prop = (columns[name] for name in ("object_root", "object_lid", "prop_root"))
+    assert support["pairs"][base] == dict(part_entity_name="object", part_body_name="object_root",
+                                         first_fixed_body_names=["world"])
+    measured = arrays["fixed_support_interval_measurement_support"]
+    np.testing.assert_array_equal(measured[:, base], [False, True, True])
+    np.testing.assert_array_equal(measured[:, lid], [False, True, True])
+    assert not measured[:, prop].any()
+    normal = arrays["fixed_support_interval_normal_force_n"]
+    force = arrays["fixed_support_interval_force_on_part_w_n"]
+    np.testing.assert_allclose(normal[1, :, base], [0., 3., .5, 0.])
+    np.testing.assert_allclose(force[1, 1, base], [.3, 0., 3.])
+    np.testing.assert_array_equal(force[1:, :, lid], 0.)
+    assert np.isnan(normal[0]).all() and np.isnan(force[:, :, prop]).all()
     assert json.loads(str(arrays["native_backend_metadata_json"]))["backend"] == "synthetic_port_protocol_not_physics"
 
 

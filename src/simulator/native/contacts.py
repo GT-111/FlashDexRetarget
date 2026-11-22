@@ -33,7 +33,7 @@ def digit_body_groups(model, hand_root, tip_sites, finger_roles):
 
 
 def object_pair_interval_facts(interval, addresses):
-    """Reduce named complete object-tree pairs on the shared accepted clock."""
+    """Read completed named pairs on the shared accepted clock."""
     if interval is None or not addresses:
         return None
     facts = interval.facts()

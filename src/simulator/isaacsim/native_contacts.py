@@ -195,6 +195,8 @@ class IsaacNativeContactReadback:
         self.addresses = {name: pair.address for name, pair in pairs.items() if "hand_side" in pair.address}
         self.object_pair_addresses = {name: pair.address for name, pair in pairs.items()
                                       if "first_entity_name" in pair.address}
+        self.fixed_support_addresses = {name: pair.address for name, pair in pairs.items()
+                                        if "first_fixed_collider_paths" in pair.address}
         self.contact_support = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self._object_wrenches = object_wrenches or {}
         self._wrench_parts = wrench_parts
@@ -288,6 +290,9 @@ class IsaacNativeContactReadback:
 
     def object_pair_interval_facts(self):
         return object_pair_interval_facts(self.interval, self.object_pair_addresses)
+
+    def fixed_support_interval_facts(self):
+        return object_pair_interval_facts(self.interval, self.fixed_support_addresses)
 
     def applied_external_body_wrench(self):
         if not self._wrench_parts:

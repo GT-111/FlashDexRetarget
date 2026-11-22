@@ -106,6 +106,9 @@ class IsaacSceneAdapter:
     def object_pair_contact_interval_facts(self):
         return None if self.native_contacts is None else self.native_contacts.object_pair_interval_facts()
 
+    def fixed_support_contact_interval_facts(self):
+        return None if self.native_contacts is None else self.native_contacts.fixed_support_interval_facts()
+
     def support_contact_interval_pairs(self):
         if self.native_contacts is None:
             return {}

@@ -154,6 +154,11 @@ _APPLIED_WRENCH_INTERVAL_ARRAYS = (
     "peak_force_n", "peak_torque_nm", "substep_wrench_w", "substep_support", "measurement_support",
 )
 _OBJECT_PAIR_INTERVAL_ARRAYS = ("normal_force_n", "force_on_second_w_n", "peak_normal_force_n", "measurement_support")
+_FIXED_SUPPORT_INTERVAL_ARRAYS = {
+    "normal_force_n": "normal_force_n",
+    "force_on_part_w_n": "force_on_second_w_n",
+    "measurement_support": "measurement_support",
+}
 _SOURCE_TIP_GEOMETRY_ARRAYS = (
     "reference_motion_ids", "reference_motion_steps", "reference_time_ns", "execution_valid",
     "source_position_w", "source_position_support", "achieved_position_w", "achieved_position_support",
@@ -398,18 +403,16 @@ class NativeRolloutRecord(RolloutRecord):
                     for key in self._contact_names
                 ],
             )
-        self._object_pair_interval_reader = getattr(env.scene, "object_pair_contact_interval_facts", None)
-        self.object_pair_interval_metadata = None
-        object_pair_interval = (
-            None if self._object_pair_interval_reader is None else self._object_pair_interval_reader()
-        )
+        self._pair_interval_recordings = {}
+        parts = {(part["entity_name"], part["body_name"]) for part in self.binding["object_parts"].values()}
+        object_pair_reader = getattr(env.scene, "object_pair_contact_interval_facts", None)
+        object_pair_interval = None if object_pair_reader is None else object_pair_reader()
         if object_pair_interval is not None:
-            parts = {(part["entity_name"], part["body_name"]) for part in self.binding["object_parts"].values()}
             for pair in object_pair_interval["pairs"]:
                 if any((pair[f"{endpoint}_entity_name"], pair[f"{endpoint}_root_body_name"]) not in parts
                        for endpoint in ("first", "second")):
                     raise ValueError("object pair contact requires both actual root bodies in the recording binding")
-            self.object_pair_interval_metadata = dict(
+            metadata = dict(
                 schema="solver_object_pair_control_interval_v1", pairs=object_pair_interval["pairs"],
                 num_substeps=object_pair_interval["num_substeps"],
                 normal_force_authority="actual_solver_object_subtree_pair_positive_normal_force",
@@ -421,6 +424,30 @@ class NativeRolloutRecord(RolloutRecord):
                 peak_axes="recorded endpoint, named pair",
                 absent_contact="measured zero normal force",
                 unsupported="reset or incomplete solved interval returns NaN forces and false pair support",
+            )
+            self._pair_interval_recordings["object_pair_interval"] = (
+                object_pair_reader, metadata, {field: field for field in _OBJECT_PAIR_INTERVAL_ARRAYS},
+            )
+        support_reader = getattr(env.scene, "fixed_support_contact_interval_facts", None)
+        support_interval = None if support_reader is None else support_reader()
+        if support_interval is not None:
+            addresses = [(pair["part_entity_name"], pair["part_body_name"]) for pair in support_interval["pairs"]]
+            if len(addresses) != len(set(addresses)) or not set(addresses) <= parts:
+                raise ValueError("fixed support contact requires distinct actual part bodies in the recording binding")
+            metadata = dict(
+                schema="solver_fixed_support_control_interval_v1", pairs=support_interval["pairs"],
+                num_substeps=support_interval["num_substeps"],
+                normal_force_authority="actual_solver_fixed_collider_part_positive_normal_force",
+                force_authority="actual_solver_WORLD_force_on_part_from_fixed_colliders",
+                clock="shared hand_part_interval_* physical and accepted-step clock arrays",
+                normal_force_axes="recorded endpoint, configured substep, named part",
+                force_axes="recorded endpoint, configured substep, named part, xyz N",
+                measurement_support_axes="recorded endpoint, named part",
+                absent_contact="measured zero normal force and zero WORLD force",
+                unsupported="reset or incomplete solved part interval returns NaN forces and false part support",
+            )
+            self._pair_interval_recordings["fixed_support_interval"] = (
+                support_reader, metadata, _FIXED_SUPPORT_INTERVAL_ARRAYS,
             )
         self._source_tip_geometry_reader = getattr(self.cmd, "source_tip_geometry_facts", None)
         self.source_tip_geometry_metadata_json = None
@@ -549,10 +576,9 @@ class NativeRolloutRecord(RolloutRecord):
                              for group in ("thumb", "fingers")], dim=-1)
                 for key in self._contact_names
             ], dim=-2).detach().cpu().clone()
-        if self.object_pair_interval_metadata is not None:
-            pairs = self._object_pair_interval_reader()
-            frame["object_pair_interval"] = {field: pairs[field].detach().cpu().clone()
-                                               for field in _OBJECT_PAIR_INTERVAL_ARRAYS}
+        for name, (reader, _, fields) in self._pair_interval_recordings.items():
+            pairs = reader()
+            frame[name] = {field: pairs[source].detach().cpu().clone() for field, source in fields.items()}
         if self._source_tip_geometry_reader is not None:
             facts = self._source_tip_geometry_reader()
             if facts is not None:
@@ -625,9 +651,8 @@ class NativeRolloutRecord(RolloutRecord):
                 selected["execution_steps"] = frame["execution_steps"][select]
             if "contact_interval" in frame:
                 selected["contact_interval"] = {key: value[select] for key, value in frame["contact_interval"].items()}
-            if "object_pair_interval" in frame:
-                selected["object_pair_interval"] = {field: value[select]
-                                                      for field, value in frame["object_pair_interval"].items()}
+            for name in self._pair_interval_recordings:
+                selected[name] = {field: value[select] for field, value in frame[name].items()}
         return state
 
     def rollout_arrays(self, states, env_index):
@@ -760,12 +785,11 @@ class NativeRolloutRecord(RolloutRecord):
                         key = "digit_group_normal_force_n"
                         result["hand_part_interval_" + key] = np.stack([
                             frame["contact_interval"][key][row].numpy() for frame in frames])
-                if self.object_pair_interval_metadata is not None:
-                    prefix = "object_pair_interval_"
-                    result[prefix + "metadata_json"] = np.asarray(json.dumps(self.object_pair_interval_metadata))
-                    for field in _OBJECT_PAIR_INTERVAL_ARRAYS:
-                        result[prefix + field] = np.stack([frame["object_pair_interval"][field][row].numpy()
-                                                           for frame in frames])
+                for name, (_, metadata, fields) in self._pair_interval_recordings.items():
+                    prefix = name + "_"
+                    result[prefix + "metadata_json"] = np.asarray(json.dumps(metadata))
+                    for field in fields:
+                        result[prefix + field] = np.stack([frame[name][field][row].numpy() for frame in frames])
                 return result
             offset += size
         raise IndexError(env_index)

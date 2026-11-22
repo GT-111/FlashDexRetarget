@@ -486,6 +486,16 @@ interval and supported forces at every substep. Its values share the
 `hand_part_interval_*` solver clocks. Measured absence gives zero force. Reset
 and unsupported intervals carry false support and NaN forces.
 
+Native Newton, direct MuJoCo Warp and native Isaac record each installed
+fixed-collider and object-part pair on those same solver clocks.
+`fixed_support_interval_metadata_json` names the actual part bodies and fixed
+bodies or collider prims. The `fixed_support_interval_normal_force_n` and
+`fixed_support_interval_force_on_part_w_n` arrays contain the substep normal
+force and total WORLD force on each part. The corresponding
+`fixed_support_interval_measurement_support` flag is per endpoint and part.
+Supported zero force identifies the absence of solved load from those colliders.
+Missing fields and reset or incomplete intervals leave fixed support unknown.
+
 Isaac net-link forces and SDF association leave exact pair-force intervals
 unavailable. Derived target-force evidence does not replace original
 ARCTIC/OakInk source-contact support. Source roles, missing spans, phase
