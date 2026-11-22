@@ -1194,7 +1194,9 @@ Native source phases, exact source clocks, physical clocks, raw interval contact
 and their support retain the recorder's arrays and dtypes. When the underlying
 plant exposes post-solve `mjw_data.xfrc_applied`, the recorder stores per-part
 force and torque peaks across each control interval with independent solved
-substep support. Reset rows have false interval support. `evaluate.py` reports
+substep support. Reset and restored rows have false interval support. A
+restored native context retains its wrench request and resumes wrench readback
+after the first accepted solve. `evaluate.py` reports
 `MEASURED_ZERO_POST_SOLVE` only when every selected attempt has complete
 post-reset interval support and zero force and torque.
 

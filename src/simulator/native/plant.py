@@ -206,6 +206,10 @@ class NativePlant(ABC):
         self.restore_physics(snapshot.physics)
         self.control.copy_(snapshot.control)
         self.external_body_wrench_w.copy_(snapshot.external_body_wrench_w)
+        # A saved request resumes on the next solve. The latest observed
+        # wrench belongs to the pre-restore timeline.
+        self.applied_body_wrench_w.zero_()
+        self.applied_body_wrench_support.zero_()
         self.contact_support.copy_(snapshot.contact_support)
         self.contact_sample_time_s.copy_(snapshot.contact_sample_time_s)
         if self._execution_steps is not None:

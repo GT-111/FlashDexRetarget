@@ -1,4 +1,4 @@
-"""CPU contracts for real backend seams; no Kit, GPU, learned model or integration."""
+"""CPU contracts and solver checks for the native backend seams."""
 
 from __future__ import annotations
 
@@ -528,6 +528,61 @@ def test_mjwarp_execution_clock_rejects_an_actual_device_timestep_mismatch():
     plant._model = SimpleNamespace(opt=SimpleNamespace(timestep=torch.tensor([.006], dtype=torch.float32)))
     with pytest.raises(ValueError, match="installed fixed timestep cast"):
         plant._bind_execution_clock(.005)
+
+
+@pytest.mark.parametrize("backend", ("mjwarp", "newton"))
+def test_native_cpu_restore_invalidates_observed_wrench_until_next_solve(tmp_path, backend):
+    pytest.importorskip("mujoco_warp")
+    scene = tmp_path / "wrench-restore.xml"
+    scene.write_text("""<mujoco>
+      <option gravity="0 0 0"/>
+      <worldbody>
+        <body name="payload"><freejoint name="payload_root"/><geom name="payload_collision" size=".02" mass="1"/></body>
+        <body name="control_body" pos="1 0 0"><joint name="drive"/><geom name="control_collision" size=".02" mass="1"/></body>
+      </worldbody>
+      <actuator><motor name="drive_motor" joint="drive"/></actuator>
+    </mujoco>""")
+    options = dict(scene_xml_path=str(scene), num_envs=2, sim_dt=.002, device="cpu", contact_pairs={})
+    if backend == "newton":
+        pytest.importorskip("newton")
+        plant = NewtonPlant(**options, cuda_graph=False)
+    else:
+        plant = MjWarpPlant(**options, nconmax=64, njmax=128)
+    sim = NativeSim(plant)
+    payload = plant.model.body("payload").id
+    request = torch.tensor([[.3, 0., .1, 0., 0., .02], [-.2, .3, 0., 0., .03, 0.]])
+    plant.external_body_wrench_w[:, payload] = request
+    sim.step()
+    context = sim.capture_control_context()
+    saved_time = plant.physics_time()
+    saved_steps = plant.execution_clock()["steps"].clone()
+
+    plant.external_body_wrench_w[:, payload] = -2 * request
+    sim.step()
+    readback = plant.applied_external_body_wrench()
+    assert readback["support"].tolist() == [True, True]
+    assert readback["authority"] == "post_solve_mjw_xfrc_applied_WORLD_body_COM_wrench"
+    torch.testing.assert_close(readback["wrench_w"][:, payload], -2 * request, rtol=0, atol=0)
+    assert (plant.physics_time() > saved_time).all()
+
+    sim.restore_control_context(context)
+    sim.forward()
+    torch.testing.assert_close(plant.physics_time(), saved_time, rtol=0, atol=0)
+    torch.testing.assert_close(plant.execution_clock()["steps"], saved_steps, rtol=0, atol=0)
+    torch.testing.assert_close(plant.external_body_wrench_w[:, payload], request, rtol=0, atol=0)
+    readback = plant.applied_external_body_wrench()
+    assert readback["support"].tolist() == [False, False]
+    assert not readback["wrench_w"].any()
+
+    sim.step()
+    readback = plant.applied_external_body_wrench()
+    assert readback["support"].tolist() == [True, True]
+    torch.testing.assert_close(readback["wrench_w"][:, payload], request, rtol=0, atol=0)
+    sim.reset(torch.tensor([0]))
+    readback = plant.applied_external_body_wrench()
+    assert readback["support"].tolist() == [False, True]
+    assert not readback["wrench_w"][0].any()
+    torch.testing.assert_close(readback["wrench_w"][1, payload], request[1], rtol=0, atol=0)
 
 
 def _mjwarp_overflow_fixture(overflow_rows):
