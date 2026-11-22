@@ -1178,6 +1178,87 @@ def test_source_stationary_parts_follow_each_part_and_its_owning_root():
     assert command.source_stationary_part_rows(1).tolist() == [row for row in expected for _ in range(2)]
 
 
+def test_native_rigid_transport_preserves_a_solved_grasp_across_dwell_to_motion(tmp_path):
+    env, action, command, _ = _native_action_case(
+        tmp_path, wrist_target_twist="filtered_correction_feedforward",
+        source_contact_approach={
+            "translation_m": .024, "guard": 1., "stationary_hold_force_n": 1.,
+            "transport_position_gain": .5,
+        },
+        support_contacts=True,
+    )
+    command.motion_ids = torch.tensor([0, 1])
+    command.motion_steps = torch.zeros(2, dtype=torch.long)
+    command._motion_flat_ids = torch.tensor([0, 2])
+    command.motion_lib.length_starts = torch.tensor([0, 2])
+    for side in action.hand_sides:
+        command.motion_lib.native_root_state_w[side] = command.motion_lib.native_root_state_w[side].repeat(2, 1)
+    for name in ("native_root_pose_support", "native_root_linear_velocity_support",
+                 "native_root_angular_velocity_support"):
+        column = getattr(command.motion_lib, name)
+        for side in action.hand_sides:
+            column[side] = column[side].repeat(2)
+    # Two source episodes each have a locally stationary first row.
+    command.source_stationary_part_rows = lambda _: torch.tensor(
+        [[True, True], [False, False], [True, True], [False, False]]
+    )
+    command.rigid_part_mask = torch.tensor([True, False])
+    command.motion_lib.native_object_part_pose_support = torch.ones(4, 2, dtype=torch.bool)
+    reference = torch.zeros(4, 2, 13)
+    reference[..., 3] = 1.
+    reference[1, 0, 0] = .006
+    reference[3, 0, 0] = .006
+
+    def world_parts(ids):
+        parts = reference[ids].clone()
+        parts[..., :3] += env.scene.env_origins[:, None]
+        return parts
+
+    command.object_part_reference = world_parts
+    command.sim_object_part_state_w = world_parts(command._motion_flat_ids)
+    command.approach_dir_and_part = torch.zeros(2, 2, 3), torch.tensor([[0, -1], [0, -1]])
+    known = torch.ones(2, 2, 2, dtype=torch.bool)
+    role = torch.zeros_like(known)
+    role[:, 0, 0] = True
+    command.source_hand_part_intent = lambda _: {
+        "metadata": {"hand_sides": ("left", "right"), "part_body_names": ("base", "lid")},
+        "active": role, "known": known,
+    }
+    known_fingers = torch.ones(2, len(action.finger_command_names), dtype=torch.bool)
+    command.requested_command_reference = lambda _: (torch.zeros_like(known_fingers, dtype=torch.float32), known_fingers)
+    plant = env.sim.plant
+    env.scene.hand_part_contact_facts = lambda: {
+        "pairs": plant.contact_facts, "measurement_support": plant.contact_support,
+    }
+    solved = plant.contact_facts["left/object/base"]
+    solved["normal_force_n"][:] = 2.
+    solved["force_bearing_distance_max_m"][:] = .001
+    # The second clone has no fixed support.
+    plant.contact_facts["support/object/base"]["force_on_second_w_n"][1] = 0.
+    action.process_actions(torch.zeros_like(action.raw_action))
+    action.apply_actions()
+    grip = action.installed_control["finger_target_rad"][:, 0].clone()
+
+    command.motion_steps += 1
+    command._motion_flat_ids += 1
+    moving = torch.full_like(action.raw_action, .7)
+    action.process_actions(moving)
+    action.apply_actions()
+    assert action.installed_control["source_transport_part_index"].tolist() == [[0, -1], [-1, -1]]
+    torch.testing.assert_close(action.installed_control["finger_target_rad"][0, 0], grip[0])
+    assert action.installed_control["finger_target_rad"][1, 0] > grip[1]
+    # Lost contact clears the carrier and allows the ordinary action to reacquire.
+    carry = action.capture_control_context()
+    solved["normal_force_n"][0] = 0.
+    action.process_actions(moving)
+    action.apply_actions()
+    assert action.installed_control["source_transport_part_index"][0, 0] == -1
+    assert action.installed_control["finger_target_rad"][0, 0] > grip[0]
+    action.reset()
+    action.restore_control_context(carry)
+    assert action.installed_control["source_transport_part_index"][0, 0] == 0
+
+
 def test_rigid_stationary_hold_uses_the_prepared_interval_within_each_clip():
     command = object.__new__(NativeMotionTrackingCommand)
     pose = torch.zeros(8, 2, 13)

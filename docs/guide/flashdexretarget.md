@@ -665,6 +665,19 @@ guide to cover its configured distance at its speed limit. A later move can
 go back to surface acquisition. Articulated objects use whole-clip
 stationarity for this pressure guide.
 
+`actions.source_contact_approach.transport_position_gain` enables an
+additional rigid transport controller when positive. The controller starts
+when a named part is about to move after a supported stationary interval.
+It requires a measured shallow contact on the declared carrier hand and
+fixed support on the same part. The previous installed wrist and finger
+targets define a grasp relative to the source part. The controller follows
+the moving reference with planar position feedback from the achieved part
+pose. It retains the configured wrist translation rate and pose bounds,
+finger residuals and actuator limits. Contact loss and source release clear
+the carrier. In a recorded rollout, `installed_source_transport_part_index`
+identifies the active carrier per hand in the named part order. Select a
+fresh fit and freeze a new FULL policy when enabling this controller.
+
 Source-phase rewards use the action's consumed original source frame.
 Upward load credit is reduced
 when the object tilts away from the source pose. Articulation credit requires

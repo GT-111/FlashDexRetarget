@@ -101,6 +101,10 @@ class NativeActionControlContext:
     source_contact_compression: torch.Tensor
     source_hold_offset_m: torch.Tensor
     source_hold_force_n: torch.Tensor
+    source_transport_part: torch.Tensor
+    source_transport_pose: torch.Tensor
+    source_transport_commands: torch.Tensor
+    source_transport_rotation: torch.Tensor
     correction_twist: torch.Tensor
     correction_interval_valid: torch.Tensor
     finger_requested: torch.Tensor
@@ -139,6 +143,7 @@ class NativeResidualAction(ActionTerm):
         self._source_contact_speed_m_s = 0.12
         self._pad_travel_m = 0.
         self._stationary_hold_force_n = 0.
+        self._transport_position_gain = 0.
         if cfg.source_contact_approach is not None:
             self._source_contact_guard = dict(cfg.source_contact_approach)
             self._source_contact_scale = self._source_contact_guard.pop("translation_m")
@@ -146,6 +151,7 @@ class NativeResidualAction(ActionTerm):
                 "max_speed_m_s", self._source_contact_speed_m_s)
             self._pad_travel_m = self._source_contact_guard.pop("pad_compression_m", 0.)
             self._stationary_hold_force_n = self._source_contact_guard.pop("stationary_hold_force_n", 0.)
+            self._transport_position_gain = self._source_contact_guard.pop("transport_position_gain", 0.)
             if (not 0. < self._source_contact_scale <= cfg.translation_residual_m
                     or not all(math.isfinite(value) and value > 0. for value in self._source_contact_guard.values())):
                 raise ValueError("source contact approach requires positive pose and tip bounds within the wrist budget")
@@ -155,6 +161,9 @@ class NativeResidualAction(ActionTerm):
                 raise ValueError("source contact approach requires a finite positive speed")
             if not math.isfinite(self._stationary_hold_force_n) or self._stationary_hold_force_n < 0.:
                 raise ValueError("stationary hold force requires a finite nonnegative load")
+            if not 0. <= self._transport_position_gain <= 1. or (
+                    self._transport_position_gain and not self._stationary_hold_force_n):
+                raise ValueError("rigid transport requires a position gain in [0, 1] and a supported hold")
         self.layout = NativeSceneCfg.from_mapping(cfg.native_scene)
         self.hand_sides = tuple(h.side for h in self.layout.hands)
         self.hand_body_names = tuple(h.root_body_name for h in self.layout.hands)
@@ -169,6 +178,9 @@ class NativeResidualAction(ActionTerm):
         self.actuator_command_indices = torch.tensor(mapping, dtype=torch.long, device=self.device)
         counts = torch.bincount(self.actuator_command_indices, minlength=len(self.finger_command_names))
         self.actuator_command_weights = counts[self.actuator_command_indices].float().reciprocal()
+        self._finger_command_hand = torch.as_tensor(
+            [i for i, hand in enumerate(self.layout.hands) for _ in range(hand.command_count)],
+            dtype=torch.long, device=self.device)
         if ((self._pad_travel_m or self._stationary_hold_force_n)
                 and getattr(getattr(env, "sim", None), "plant", None) is None):
             raise ValueError("native pad compression and stationary hold require solved contact feedback")
@@ -186,9 +198,6 @@ class NativeResidualAction(ActionTerm):
             self._pad_body_part = torch.full_like(self._pad_body_hand, -1)
             for i, (_, part) in enumerate(self.layout.part_bindings):
                 self._pad_body_part[model.body(part.body_name).id] = i
-            self._pad_command_hand = torch.as_tensor(
-                [i for i, hand in enumerate(self.layout.hands) for _ in range(hand.command_count)],
-                dtype=torch.long, device=self.device)
         self._finger_ids = torch.tensor(
             finger_ids, dtype=torch.long, device=self.device
         )
@@ -240,6 +249,11 @@ class NativeResidualAction(ActionTerm):
             self.num_envs, len(self.finger_command_names), device=self.device)
         self._source_hold_offset_m = torch.zeros(self.num_envs, roots, device=self.device)
         self._source_hold_force_n = torch.zeros_like(self._source_hold_offset_m)
+        self._source_transport_part = torch.full_like(self._source_contact_part, -1)
+        self._source_transport_pose = torch.zeros(self.num_envs, roots, 7, device=self.device)
+        self._source_transport_pose[..., 3] = 1.
+        self._source_transport_commands = torch.full_like(self._source_contact_compression, torch.nan)
+        self._source_transport_rotation = torch.zeros_like(self._source_contact_translation)
         self._source_hold_pairs = ()
         self._source_hold_reference_rows = None
         if self._stationary_hold_force_n:
@@ -384,6 +398,7 @@ class NativeResidualAction(ActionTerm):
             "reference_motion_steps": self._reference_motion_steps,
             "source_contact_part_index": self._source_contact_part,
             "source_contact_part_body_names": tuple(part.body_name for _, part in self.layout.part_bindings),
+            "source_transport_part_index": self._source_transport_part,
             "root_force_n": self._root_force,
             "root_torque_nm": self._root_torque,
             "root_control": self._root_control_metadata,
@@ -415,6 +430,14 @@ class NativeResidualAction(ActionTerm):
         if self._source_contact_guard is not None:
             translation = (translation + self._source_contact_translation).clamp(-cap, cap)
         return translation
+
+    def _wrist_rotation(self) -> torch.Tensor:
+        rotation = self._processed_actions[:, self._rotation_slice].reshape(self.num_envs, -1, 3)
+        rotation = rotation * self.cfg.rotation_residual_rad
+        if self._transport_position_gain:
+            rotation = torch.where(self._source_transport_part[..., None] >= 0,
+                                   self._source_transport_rotation, rotation)
+        return rotation
 
     def _source_loaded_approach(self, command):
         """Approach from the declared carriers, then preserve achieved pad engagement."""
@@ -481,7 +504,7 @@ class NativeResidualAction(ActionTerm):
             len(self.finger_command_names), self._pad_travel_m,
         )
         self._source_contact_compression.lerp_(correction, .3)
-        self._source_contact_compression.masked_fill_(~bearing.any(-1)[:, self._pad_command_hand], 0.)
+        self._source_contact_compression.masked_fill_(~bearing.any(-1)[:, self._finger_command_hand], 0.)
         return direction, bearing
 
     def _supported_hold_translation(self, command, part, fallback):
@@ -518,6 +541,74 @@ class NativeResidualAction(ActionTerm):
         return torch.where(stationary[..., None],
                            -self._source_hold_offset_m[..., None] * scene.gravity_up_w, fallback)
 
+    def _rigid_transport_translation(self, command, fallback):
+        """Carry the prior solved hand target in a departing rigid part's source frame."""
+        ids, ml = command._motion_flat_ids, command.motion_lib
+        intent = command.source_hand_part_intent(ids)
+        if intent is None:
+            self._source_transport_part.fill_(-1)
+            return fallback
+        hands = [intent["metadata"]["hand_sides"].index(side) for side in self.hand_sides]
+        roles = (intent["active"] & intent["known"])[:, hands]
+        index = roles.long().argmax(-1)
+        pose_support = ml.native_object_part_pose_support[ids].gather(1, index)
+        wrist_support = torch.stack([ml.native_root_pose_support[side][ids] for side in self.hand_sides], 1)
+        eligible = (roles.sum(-1) == 1) & command.rigid_part_mask[index] & pose_support & wrist_support
+
+        plant = self._env.sim.plant
+        contacts = [[plant.contact_facts[f"{side}/{obj.entity_name}/{part.name}"]
+                     for obj, part in self.layout.part_bindings] for side in self.hand_sides]
+
+        def bearing_value(field):
+            return torch.stack([torch.stack([pair[field] for pair in hand], 1)
+                                for hand in contacts], 1).gather(2, index[..., None]).squeeze(-1)
+
+        force = bearing_value("normal_force_n")
+        depth = bearing_value("force_bearing_distance_max_m")
+        eligible &= plant.contact_support[:, None] & (force >= .08) & (depth <= .0025)
+        same_clip = (self._installed_valid & (command.motion_ids == self._reference_motion_ids))[:, None]
+        prior_ids = ml.length_starts[self._reference_motion_ids] + self._reference_motion_steps
+        previous = command.source_hand_part_intent(prior_ids)
+        prior_roles = (previous["active"] & previous["known"])[:, hands]
+        previous_stationary = self._source_hold_reference_rows[prior_ids].gather(1, index)
+        stationary = self._source_hold_reference_rows[ids].gather(1, index)
+        up = self._env.scene.gravity_up_w
+        support_up = torch.stack([plant.contact_facts[key]["force_on_second_w_n"] @ up
+                                  for key in self._source_hold_pairs], 1).gather(1, index)
+        capture = (eligible & same_clip & self._root_support & (ids == prior_ids + 1)[:, None]
+                   & prior_roles.gather(2, index[..., None]).squeeze(-1)
+                   & previous_stationary & ~stationary
+                   & (support_up >= .25 * self._source_hold_weights_n[index]))
+        retain = eligible & same_clip & (self._source_transport_part == index)
+        capture &= ~retain
+        active = retain | capture
+        self._source_transport_part.copy_(torch.where(active, index, -1))
+
+        xyz_wxyz = index[..., None].expand(-1, -1, 7)
+        prior_pose = command.object_part_reference(prior_ids)[..., :7].gather(1, xyz_wxyz)
+        inv = quat_inv(prior_pose[..., 3:7])
+        local = torch.cat((quat_apply(inv, self._root_target[..., :3] - prior_pose[..., :3]),
+                           quat_mul(inv, self._root_target[..., 3:7])), -1)
+        self._source_transport_pose.copy_(torch.where(capture[..., None], local, self._source_transport_pose))
+        last_commands = torch.where(self._finger_requested_support, self._finger_requested, torch.nan)
+        self._source_transport_commands.copy_(torch.where(capture[:, self._finger_command_hand], last_commands,
+                                                          self._source_transport_commands))
+
+        pose = command.object_part_reference(ids)[..., :7].gather(1, xyz_wxyz)
+        live_position = command.sim_object_part_state_w[..., :3].gather(
+            1, index[..., None].expand(-1, -1, 3))
+        error = pose[..., :3] - live_position
+        planar_error = error - (error @ up)[..., None] * up
+        goal = (pose[..., :3] + quat_apply(pose[..., 3:7], self._source_transport_pose[..., :3])
+                + self._transport_position_gain * planar_error)
+        wrist = torch.stack([ml.native_root_state_w[side][ids, :7] for side in self.hand_sides], 1)
+        offset = self._processed_actions[:, self._translation_slice].reshape_as(goal) * self.cfg.translation_residual_m
+        goal = goal - (wrist[..., :3] + self._env.scene.env_origins[:, None]) - offset
+        wanted_quat = quat_mul(pose[..., 3:7], self._source_transport_pose[..., 3:7])
+        cap = self.cfg.rotation_residual_rad
+        self._source_transport_rotation.copy_(quat_box_minus(wanted_quat, wrist[..., 3:7]).clamp(-cap, cap))
+        return torch.where(active[..., None], goal, fallback)
+
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
         processed = actions * self.cfg.action_scale + self.cfg.action_offset
@@ -526,7 +617,7 @@ class NativeResidualAction(ActionTerm):
         pending = self._filter_pending.clone()
         if self.cfg.wrist_target_twist == "filtered_correction_feedforward":
             previous_translation = self._wrist_translation()
-            previous_rotation = self._filter_state[:, self._rotation_slice].clone()
+            previous_rotation = self._wrist_rotation()
             self._correction_interval_valid[:] = ~pending
         self._filter_state[pending] = processed[pending]
         self._filter_state.lerp_(processed, self._alpha)
@@ -541,6 +632,8 @@ class NativeResidualAction(ActionTerm):
                 self._source_hold_offset_m.masked_fill_(changed_part, 0.)
                 self._source_hold_force_n.masked_fill_(changed_part, 0.)
                 desired = self._supported_hold_translation(command, part, desired)
+                if self._transport_position_gain:
+                    desired = self._rigid_transport_translation(command, desired)
             step = desired - self._source_contact_translation
             limit = self._source_contact_speed_m_s * self._control_dt
             self._source_contact_translation.add_(step * (limit / step.norm(dim=-1, keepdim=True).clamp_min(limit)))
@@ -549,16 +642,11 @@ class NativeResidualAction(ActionTerm):
             self._correction_twist[..., :3] = (
                 (self._wrist_translation() - previous_translation) / self._control_dt
             )
-            previous_rotation = previous_rotation.reshape(self.num_envs, -1, 3)
-            rotation = self._filter_state[:, self._rotation_slice].reshape(
-                self.num_envs, -1, 3
-            )
+            rotation = self._wrist_rotation()
             identity = rotation.new_zeros((*rotation.shape[:-1], 4))
             identity[..., 0] = 1.0
-            previous = quat_box_plus(
-                identity, previous_rotation * self.cfg.rotation_residual_rad
-            )
-            current = quat_box_plus(identity, rotation * self.cfg.rotation_residual_rad)
+            previous = quat_box_plus(identity, previous_rotation)
+            current = quat_box_plus(identity, rotation)
             rate = quat_box_minus(current, previous) / self._control_dt
             # Cancel static roundoff without discarding the rate's local Jacobian.
             self._correction_twist[..., 3:] = torch.where(
@@ -588,6 +676,13 @@ class NativeResidualAction(ActionTerm):
             if self.cfg.finger_residual_rad is not None:
                 requested = self.ref_command_pos_used + (requested - self.ref_command_pos_used).clamp(
                     -self.cfg.finger_residual_rad, self.cfg.finger_residual_rad)
+        if self._transport_position_gain:
+            locked = self._source_transport_commands
+            use_carried = (self._source_transport_part[:, self._finger_command_hand] >= 0) & torch.isfinite(locked)
+            if self.cfg.finger_residual_rad is not None:
+                residual = self.cfg.finger_residual_rad
+                locked = locked.clamp(self.ref_command_pos_used - residual, self.ref_command_pos_used + residual)
+            requested = torch.where(use_carried, locked, requested)
         self._finger_requested[:] = torch.where(support, requested, 0.0)
         self._finger_requested_support[:] = support
         mapping = self.actuator_command_indices
@@ -599,9 +694,7 @@ class NativeResidualAction(ActionTerm):
         self._finger_source_support[:] = actuator_support
         self._entity.set_joint_position_target(self._finger_target, self._finger_ids)
         translation = self._wrist_translation()
-        rotation = self._processed_actions[:, self._rotation_slice].reshape(
-            self.num_envs, -1, 3
-        )
+        rotation = self._wrist_rotation()
         for i, hand in enumerate(self.layout.hands):
             if ml.native_root_body_names[hand.side] != hand.root_body_name:
                 raise ValueError(
@@ -619,7 +712,7 @@ class NativeResidualAction(ActionTerm):
             target[:, :3] += translation[:, i]
             reference_quat = target[:, 3:7].clone()
             target[:, 3:7] = quat_box_plus(
-                reference_quat, rotation[:, i] * self.cfg.rotation_residual_rad
+                reference_quat, rotation[:, i]
             )
             target[:, 7:10] = torch.where(linear_support[:, None], target[:, 7:10], 0.0)
             angular = quat_apply(
@@ -650,6 +743,7 @@ class NativeResidualAction(ActionTerm):
         self._source_contact_compression[rows] = 0.0
         self._source_hold_offset_m[rows] = 0.0
         self._source_hold_force_n[rows] = 0.0
+        self._source_transport_part[rows] = -1
         self._correction_twist[rows] = 0.0
         self._correction_interval_valid[rows] = False
         self._installed_valid[rows] = False

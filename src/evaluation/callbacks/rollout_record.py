@@ -252,6 +252,8 @@ class NativeRolloutRecord(RolloutRecord):
             if "source_contact_part_index" in control:
                 self._installed_arrays = (*self._installed_arrays, "source_contact_part_index")
                 self.installed_metadata["source_contact_part_body_names"] = control["source_contact_part_body_names"]
+            if "source_transport_part_index" in control:
+                self._installed_arrays = (*self._installed_arrays, "source_transport_part_index")
         self.object_joint_metadata = self.joint_effort_metadata = None
         if hasattr(self.cmd, "native_objects"):
             self.object_joint_metadata = dict(object_root_body_names=self.cmd.native_layout.object_root_body_names,

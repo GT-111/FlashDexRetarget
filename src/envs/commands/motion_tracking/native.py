@@ -456,6 +456,13 @@ class NativeMotionTrackingCommand(MotionTrackingCommand):
             "reference_time_ns": ml.native_time_ns[ids],
         }
 
+    @cached_property
+    def rigid_part_mask(self):
+        return torch.as_tensor([
+            self._object_joint_slices[obj.entity_name].start == self._object_joint_slices[obj.entity_name].stop
+            for obj, _ in self.native_layout.part_bindings
+        ], dtype=torch.bool, device=self.device)
+
     @torch.no_grad()
     def source_stationary_part_rows(self, lookahead_steps):
         """Bound rigid source movement over the guide's reach time inside each clip."""
