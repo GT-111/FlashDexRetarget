@@ -824,7 +824,11 @@ def _native_rigid_object_cfg(binding, meta, usd_path) -> RigidObjectCfg:
         raise FileNotFoundError(usd_path)
     return RigidObjectCfg(
         prim_path=f"/World/envs/env_.*/{binding.entity_name}",
-        spawn=sim_utils.UsdFileCfg(usd_path=usd_path, activate_contact_sensors=True),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=usd_path,
+            activate_contact_sensors=True,
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(articulation_enabled=False),
+        ),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=tuple(meta.free_roots[0].default_pose[:3]),
             rot=tuple(meta.free_roots[0].default_pose[3:]),

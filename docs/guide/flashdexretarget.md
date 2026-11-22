@@ -221,6 +221,11 @@ links selected from the named source fingertip branches. This puts
 support, digit loads and the disturbance submission on the same step
 clock. Separate-object contact reports still require a named PhysX reader.
 
+The ordinary native Isaac evaluator checks its installed reporter bindings
+before an HOI qualification. A one-body rigid object uses the PhysX rigid
+view with imported articulation metadata disabled. Objects with scalar
+joints retain their actual floating articulation.
+
 Stock USD collision overrides are installed after the scene owner makes nested
 references editable, before material binding and the first physics reset.
 Robot and parked-object edits precede environment cloning; per-world objects,

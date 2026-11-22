@@ -8,13 +8,8 @@ from pathlib import Path
 
 _VENDOR_DIR = str(Path(__file__).resolve().parent / "_vendor")
 
-# Available before launching Kit so qualification cannot spend the training
-# budget on a plant whose required evidence ports have yet to be implemented.
-HOI_QUALIFICATION_UNAVAILABLE_READERS = (
-    "hand_part_contact_interval_facts",
-    "applied_object_wrench_interval_facts",
-    "physics_execution_clock",
-)
+# The ordinary evaluator checks the readers against the installed scene.
+HOI_QUALIFICATION_UNAVAILABLE_READERS = ()
 
 
 def bootstrap() -> None:
