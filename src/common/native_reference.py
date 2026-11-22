@@ -80,6 +80,8 @@ def bind_prepared_native_reference(cfg) -> None:
     from omegaconf import open_dict
 
     cfg.commands.motion_file = str(motion_file)
+    if len(scene["hands"]) == 1 and "per_hand_actor_critic" in cfg:
+        cfg.per_hand_actor_critic = False
     with open_dict(cfg), open_dict(cfg.robot):
         cfg.native_recording_binding = binding
         cfg.robot.native_scene = scene

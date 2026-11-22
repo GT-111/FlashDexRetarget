@@ -65,6 +65,21 @@ def test_prepared_native_profile_uses_ordered_source_roles_and_actual_actuators(
     ]
 
 
+def test_prepared_single_hand_uses_scalar_flashsac_and_its_actual_actuators(tmp_path):
+    _, mapping = _scene(tmp_path)
+    right = mapping["hands"][1]
+    right.update(tip_source_point_names=["thumb_tip"], tip_site_names=["right_tip"])
+    mapping["hands"] = [right]
+    cfg = _native_hoi_config(write_native_scene_manifest(tmp_path, mapping), "prepared_native")
+    bind_prepared_native_reference(cfg)
+    assert not cfg.per_hand_actor_critic
+    assert not cfg.runner.agent.reward_heads.enable
+    assert not cfg.runner.agent.reward_heads.side_actors
+    assert not cfg.rewards.split_sides
+    assert list(cfg.commands.joint_names.finger) == right["command_actuator_names"]
+    assert [hand.side for hand in cfg.robot.native_scene.hands] == ["right"]
+
+
 def test_prepared_native_profile_cannot_borrow_undeclared_roles(tmp_path):
     _, mapping = _scene(tmp_path)
     for hand in mapping["hands"]:

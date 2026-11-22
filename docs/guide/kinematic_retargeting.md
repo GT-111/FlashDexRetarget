@@ -73,6 +73,8 @@ and cadence use the following fields:
 For training and evaluation, the same manifest supplies `native_scene` and
 `recording_binding`. Resolve the MJCF scene and each named part mesh relative
 to the dataset directory. The manifest can also use absolute materialized paths.
+The prepared scene, clip carriers and recordings share the observed hand sides.
+For a one-hand scene, FlashSAC uses its scalar actor and critic configuration.
 
 `clip_directory` is relative to the dataset. `clips` contains NPZ stems without
 the suffix; only those clips enter `motion.pt`, even if the directory contains
