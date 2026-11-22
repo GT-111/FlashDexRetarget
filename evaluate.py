@@ -61,7 +61,7 @@ def _recorded_wrench_summary(outcome_dir):
         status = "MEASURED_ZERO_POST_SOLVE" if force == 0.0 and torque == 0.0 else "MEASURED_NONZERO_POST_SOLVE"
     qualification = outcome.get("frozen_authority", {}).get("hoi_qualification")
     schedule = {}
-    if qualification is not None:
+    if qualification is not None or any("hoi_evaluation_perturbation" in row for row in recordings):
         proof = [row.get("hoi_evaluation_perturbation", {}) for row in recordings]
         schedule = {
             "verified_perturbation_attempts": sum(row.get("status") == "verified" for row in proof),

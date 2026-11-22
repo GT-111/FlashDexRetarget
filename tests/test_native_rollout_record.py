@@ -14,6 +14,42 @@ from evaluation.callbacks.rollout_record import NativeRolloutRecord
 from evaluation.callbacks.success_export import export_success
 
 
+@pytest.mark.parametrize("qualified_mode", (None, "nominal", "perturbed"))
+def test_compiled_perturbation_exports_selected_mode_independently_of_qualification(tmp_path, qualified_mode):
+    from evaluation.callbacks.success_export import export_current_attempts
+
+    authority = {} if qualified_mode is None else {"hoi_qualification": {"mode": qualified_mode}}
+    plan = dict(status="planned", replica_index=0,
+                bursts=[dict(entity_name="object", root_body_name="part", start_substep=0, stop_substep_exclusive=1)])
+    attempt = dict(motion_id=0, evaluation_row=0, batch_index=0, env_index=0,
+                   hoi_evaluation_perturbation_plan=plan, hoi_evaluation_perturbation_mode="perturbed")
+    wrench = np.zeros((2, 1, 1, 6))
+    wrench[1, 0, 0, 0] = 1.
+    prefix = "applied_object_wrench_interval_"
+    recorder = SimpleNamespace(rollout_arrays=lambda *_: {
+        "motion_id": np.asarray(0), "joint_pos": np.zeros((2, 1)),
+        prefix + "measurement_support": np.array([False, True]),
+        prefix + "peak_force_n": np.array([[0.], [1.]]),
+        prefix + "peak_torque_nm": np.zeros((2, 1)),
+        prefix + "substep_wrench_w": wrench,
+        prefix + "metadata_json": np.asarray(json.dumps(dict(entity_names=["object"], part_body_names=["part"]))),
+    })
+    def export():
+        return export_current_attempts(tmp_path / "archive", recorder, [], [attempt],
+            evaluation_id="mode-protocol", env_step=0, frozen_authority=authority, motion_names=["source"],
+            num_per_motion=1, motion_file="source.pt", evaluation_report=tmp_path / "report.json")
+
+    if qualified_mode == "nominal":
+        with pytest.raises(ValueError, match="selected runtime mode"):
+            export()
+        return
+    manifest, motions = export()
+    recording = motions[0]["attempts"][0]["recording"]
+    assert recording["hoi_evaluation_perturbation_mode"] == "perturbed"
+    assert recording["hoi_evaluation_perturbation"]["status"] == "verified"
+    assert json.loads(manifest.read_text())["frozen_authority"] == authority
+
+
 def record_reference_phase_fixture(tmp_path, binding, *, native, rigid=False, setup_scene=None):
     """Run actual command/action owners with explicit synthetic backend facts.
 

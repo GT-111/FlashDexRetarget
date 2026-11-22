@@ -1094,6 +1094,11 @@ action layouts, physics, evaluation reset, thresholds and assistance settings.
 The config still selects the existing runtime and environment factory; this
 entry adds no environment profile or alternative actor architecture.
 
+A configured evaluation setup can enable the existing compiled phase
+disturbance for a frozen-policy diagnostic. The factual manifest records the
+selected runtime mode and the measured schedule. Qualification still requires
+the exact executable revision and the restored zero-assistance FULL receipt.
+
 The registered `runner.agent.class_name` supplies a policy-only loader.
 FlashSAC uses the same actor builder as normal learning and strictly restores
 its complete `actor_state_dict`, including running BatchNorm and trajectory

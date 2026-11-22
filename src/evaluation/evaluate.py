@@ -251,13 +251,15 @@ def _rollout(
                     for motion in motion_ids:
                         replicas.append(replica_counts[motion])
                         replica_counts[motion] += 1
-                    plans = ([None] * len(motion_ids) if getattr(command, "hoi_evaluation_mode", None) is None
+                    perturbation_mode = getattr(command, "hoi_evaluation_mode", None)
+                    plans = ([None] * len(motion_ids) if perturbation_mode is None
                              else command.plan_hoi_evaluation_attempts(selected, replicas))
                     for env_index, motion_id, plan in zip(selected.detach().cpu().tolist(), motion_ids, plans, strict=True):
                         attempt_rows.append({"evaluation_row": len(attempt_rows), "batch_index": b,
                                              "env_index": int(env_index), "motion_id": int(motion_id)})
                         if plan is not None:
                             attempt_rows[-1]["hoi_evaluation_perturbation_plan"] = plan
+                            attempt_rows[-1]["hoi_evaluation_perturbation_mode"] = perturbation_mode
                 completed = False
                 try:
                     for _ in range(n_steps):

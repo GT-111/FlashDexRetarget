@@ -142,8 +142,14 @@ def export_current_attempts(
                 recording.update(_write_rollout(out_dir / relative, arrays),
                                  status="recorded", rollout=relative, reason=None)
                 if plan is not None:
+                    qualified_mode = frozen_authority.get("hoi_qualification", {}).get("mode")
+                    mode = row.get("hoi_evaluation_perturbation_mode", qualified_mode)
+                    if (mode not in {"nominal", "perturbed"}
+                            or (qualified_mode is not None and qualified_mode != mode)):
+                        raise ValueError("HOI perturbation export requires the selected runtime mode")
+                    recording["hoi_evaluation_perturbation_mode"] = mode
                     recording["hoi_evaluation_perturbation"] = _measure_hoi_perturbation(
-                        arrays, plan, frozen_authority["hoi_qualification"]["mode"])
+                        arrays, plan, mode)
             entry["recording"] = recording
             attempts.append(entry)
         motions.append({"motion_id": motion_id, "motion_name": motion_name, "attempts": attempts})
