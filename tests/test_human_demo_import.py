@@ -7,7 +7,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 from retarget.human_demo.sources import hot3d
-from retarget.human_demo.sources.base import Source
+from retarget.human_demo.sources.base import Source, overlapping_frames
 
 
 def test_near_matches_bounded_kdtree_for_both_object_scales(tmp_path, monkeypatch):
@@ -32,6 +32,24 @@ def test_near_matches_bounded_kdtree_for_both_object_scales(tmp_path, monkeypatc
         np.testing.assert_array_equal(
             source.near("shared", points, 0.02, scale), expected
         )
+
+
+def test_world_bounds_enclose_the_actual_local_distance_query(tmp_path, monkeypatch):
+    source = Source(tmp_path, None)
+    mesh = trimesh.creation.box()
+    monkeypatch.setattr(source, "load_mesh", lambda obj_id: mesh)
+    poses = np.repeat(np.eye(4)[None], repeats=2, axis=0)
+    poses[:, :3, :3] = [[0.1, 0.1, 0], [0, 1, 0], [0, 0, 1]]
+    poses[:, 0, 3] = [0.6, 1.0]
+    local = np.asarray(mesh.vertices)[0] + [[-0.01, 0, 0], [-2, 0, 0]]
+    world = (local[:, None] @ np.linalg.inv(poses[:, :3, :3])).squeeze(1) + poses[
+        :, :3, 3
+    ]
+    selected = overlapping_frames(
+        (world, world), source.mesh_world_bounds("shared", poses, 0.02)
+    )
+    np.testing.assert_array_equal(selected, [0])
+    np.testing.assert_allclose(source.near("shared", local[selected], 0.02), [0.01])
 
 
 def test_hot3d_segments_keep_contact_near_rotating_mesh_bounds(tmp_path, monkeypatch):

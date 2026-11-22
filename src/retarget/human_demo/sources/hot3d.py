@@ -8,7 +8,14 @@ import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation
 
-from retarget.human_demo.sources.base import Demo, Hand, Source as Base, _forward, _mano
+from retarget.human_demo.sources.base import (
+    Demo,
+    Hand,
+    Source as Base,
+    _forward,
+    _mano,
+    overlapping_frames,
+)
 
 
 class Source(Base):
@@ -67,28 +74,20 @@ class Source(Base):
         object (gaps < gap_frames bridged); windows of activity split where the touched object changes; segments
         shorter than min_frames dropped. Mode A: one hand active, B: both on one object, C: on two objects."""
         cfg = self.cfg.segment
-        bounds = {}
-        for u, pose in poses.items():
-            vertices = np.asarray(self.mesh(u).vertices)
-            lo, hi = vertices.min(0), vertices.max(0)
-            rot, pos = pose[:, :3, :3], pose[:, :3, 3]
-            centre = rot @ ((lo + hi) / 2) + pos
-            # The padded world-space box encloses every vertex within either contact distance.
-            extent = np.abs(rot) @ ((hi - lo) / 2) + max(cfg.tip_contact, cfg.link_contact)
-            bounds[u] = centre - extent, centre + extent
+        bound = max(cfg.tip_contact, cfg.link_contact)
+        bounds = {u: self.mesh_world_bounds(u, pose, bound) for u, pose in poses.items()}
         active, links = {}, {}
         for side, hand in hands.items():
             model = _mano(self.mano_dir, side, tuple(sorted(self.mano.items())))
             _, verts = _forward(model, hand)
-            hand_min, hand_max = verts.min(axis=1), verts.max(axis=1)
+            hand_bounds = verts.min(axis=1), verts.max(axis=1)
             link_of = model.lbs_weights.numpy().argmax(1)  # (778,) the MANO link each vertex follows
             tips = verts[:, list(self.tip_vertex[side].values())]
             tip_dist = np.full(tips.shape[:2], np.inf)
             link_body = np.zeros((len(verts), 16), dtype=int)
             link_dist = np.full((len(verts), 16), np.inf)
             for k, u in enumerate(uids, 1):
-                lo, hi = bounds[u]
-                frames = np.flatnonzero(((hand_max >= lo) & (hand_min <= hi)).all(axis=1))
+                frames = overlapping_frames(hand_bounds, bounds[u])
                 if not len(frames):
                     continue
                 pose = poses[u][frames]

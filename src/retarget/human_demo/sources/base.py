@@ -75,6 +75,16 @@ class Source:
             self._meshes[obj_id] = self.load_mesh(obj_id)
         return self._meshes[obj_id]
 
+    def mesh_world_bounds(self, obj_id: str, poses: np.ndarray, bound: float) -> tuple[np.ndarray, np.ndarray]:
+        """Enclose every point within the object-local vertex distance bound on each frame."""
+        vertices = np.asarray(self.mesh(obj_id).vertices)
+        lo, hi = vertices.min(0), vertices.max(0)
+        # Local distance queries right-multiply world points by the recorded rotation.
+        world_from_query = np.linalg.inv(poses[:, :3, :3]).swapaxes(-1, -2)
+        centre = world_from_query @ ((lo + hi) / 2) + poses[:, :3, 3]
+        extent = np.abs(world_from_query) @ ((hi - lo) / 2) + bound * np.linalg.norm(world_from_query, axis=-1)
+        return centre - extent, centre + extent
+
     def near(self, obj_id: str, pts: np.ndarray, bound: float, scale: float = 1.0) -> np.ndarray:
         """Distance from each (N, 3) object-frame point to the nearest vertex of the scaled mesh where below bound,
         else inf; points outside the vertices' box padded by bound skip the KD-tree."""
@@ -89,6 +99,13 @@ class Source:
             box &= (pts[:, axis] >= lower[axis]) & (pts[:, axis] <= upper[axis])
         d[box] = tree.query(pts[box], distance_upper_bound=bound)[0]
         return d
+
+
+def overlapping_frames(first, second) -> np.ndarray:
+    """Frame indices with overlapping world-space boxes."""
+    first_min, first_max = first
+    second_min, second_max = second
+    return np.flatnonzero(((first_max >= second_min) & (first_min <= second_max)).all(axis=1))
 
 
 def assign(wrists: dict[str, np.ndarray], centres: dict[str, np.ndarray]) -> dict[str, str]:
