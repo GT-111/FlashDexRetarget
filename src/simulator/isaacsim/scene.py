@@ -1058,6 +1058,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     adapter.native_layout = layout
     adapter.backend_identity.update(
         engine_versions={package: package_metadata.version(package) for package in ("isaacsim", "isaaclab")},
+        physics_device_ordinal=sim_ctx.physics_sim_view.device_ordinal,
         scene_xml_path=str(layout.scene_xml_path),
         installed_usds={
             "static": str(cfg.sim.native_assets.static),
