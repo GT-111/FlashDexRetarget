@@ -783,9 +783,14 @@ def test_native_isaac_contacts_resolve_named_rigid_descendants_before_reset(monk
 def _native_action_case(
     tmp_path, *, wrist_target_twist="source_only", dt=.02, cutoff_hz=None,
     hand_sides=("left", "right"), fanout=False, source_contact_approach=None, support_contacts=False,
+    fixed_support_kind="box",
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     layout, mapping = _scene(tmp_path)
+    if fixed_support_kind != "box":
+        tree = ET.parse(layout.scene_xml_path)
+        tree.find(".//geom[@name='support']").set("type", fixed_support_kind)
+        tree.write(layout.scene_xml_path)
     mapping["hands"] = [hand for hand in mapping["hands"] if hand["side"] in hand_sides]
     if fanout:
         right = next(hand for hand in mapping["hands"] if hand["side"] == "right")
@@ -804,6 +809,9 @@ def _native_action_case(
 
     target = torch.tensor([[0.2, 0.3, 0.4, 0.5]]).repeat(2, 1)
     entity = SimpleNamespace(
+        body_names=[f"{s}_{link}" for s, links in [
+            ("left", ("root", "driver", "follower")), ("right", ("root", "driver", "second"))
+        ] for link in links if s in hand_sides],
         data=SimpleNamespace(joint_pos_target=target),
         hands={
             s: SimpleNamespace(apply_root_pose_target=install)
@@ -860,6 +868,8 @@ def _native_action_case(
         close=lambda: None,
     )
     if support_contacts:
+        import mujoco
+
         layout = NativeSceneCfg.from_mapping(mapping)
         facts = {key: {"force_on_second_w_n": torch.tensor([[0., 0., 2.], [0., 0., 2.]])}
                  for key in layout.support_pair_bindings}
@@ -868,6 +878,7 @@ def _native_action_case(
         } for hand in layout.hands for obj, part in layout.part_bindings})
         env.sim = SimpleNamespace(plant=SimpleNamespace(
             contact_facts=facts, contact_support=torch.ones(2, dtype=torch.bool),
+            model=mujoco.MjModel.from_xml_path(layout.scene_xml_path),
         ))
         env.scene.gravity_up_w = torch.tensor([0., 0., 1.])
         env.scene.native_object_weights_n = torch.full((len(layout.objects),), 5.)
@@ -1257,6 +1268,48 @@ def test_native_rigid_transport_preserves_a_solved_grasp_across_dwell_to_motion(
     action.reset()
     action.restore_control_context(carry)
     assert action.installed_control["source_transport_part_index"][0, 0] == 0
+
+
+def test_idle_plane_clearance_keeps_a_declared_support_hand_in_place(tmp_path):
+    env, action, command, _ = _native_action_case(
+        tmp_path, wrist_target_twist="filtered_correction_feedforward",
+        source_contact_approach={"translation_m": .024, "guard": 1., "idle_support_clearance_m": .0015},
+        support_contacts=True, fixed_support_kind="plane",
+    )
+    command.approach_dir_and_part = torch.zeros(2, 2, 3), torch.full((2, 2), -1)
+    active = torch.zeros(2, 2, 2, dtype=torch.bool)
+    active[:, 0, 0] = True
+    known = torch.ones_like(active)
+    command.source_hand_part_intent = lambda _: {
+        "metadata": {"hand_sides": ("left", "right"), "part_body_names": ("base", "lid")},
+        "active": active, "known": known,
+    }
+    plant = env.sim.plant
+    env.scene.hand_part_contact_facts = lambda: {
+        "pairs": plant.contact_facts, "measurement_support": plant.contact_support,
+    }
+    # Both target wrists would cross the configured plane. The second clone has
+    # unlabelled intent on the right, so it has no authority to move out of the way.
+    known[1, 1, 0] = False
+    pose = action._entity.data
+    pose.body_link_pos_w = env.scene.env_origins[:, None].repeat(1, 6, 1)
+    pose.body_link_pos_w[..., 2] += .02
+    pose.body_link_quat_w = torch.tensor([1., 0., 0., 0.]).expand(2, 6, -1)
+    raw = torch.zeros_like(action.raw_action)
+    action.process_actions(raw)
+    action.apply_actions()
+    first = torch.tensor([[0., .0024], [0., 0.]])
+    torch.testing.assert_close(action.installed_control["idle_support_offset_m"], first)
+    torch.testing.assert_close(action.installed_control["root_state_w"][..., 2],
+                               env.scene.env_origins[:, 2, None] + first)
+    action.process_actions(raw)
+    action.apply_actions()
+    torch.testing.assert_close(action.installed_control["root_state_w"][..., 9], first / env.step_dt)
+    # Real solved support on an otherwise idle hand withdraws the correction.
+    plant.contact_facts["right/object/base"]["normal_force_n"][0] = 1.
+    action.process_actions(raw)
+    action.apply_actions()
+    torch.testing.assert_close(action.installed_control["idle_support_offset_m"], first)
 
 
 def test_rigid_stationary_hold_uses_the_prepared_interval_within_each_clip():

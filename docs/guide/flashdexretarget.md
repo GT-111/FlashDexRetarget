@@ -678,6 +678,14 @@ the carrier. In a recorded rollout, `installed_source_transport_part_index`
 identifies the active carrier per hand in the named part order. Select a
 fresh fit and freeze a new FULL policy when enabling this controller.
 
+`actions.source_contact_approach.idle_support_clearance_m` enables upward
+wrist clearance over installed horizontal support planes. The guide requires
+known inactive source roles and solved evidence that the hand carries no
+object load. It projects bounds of the actual hand's collision geometry into
+the requested wrist pose using achieved finger configuration. The wrist rate
+and residual caps still apply. The recorder exposes the guide offset as
+`installed_idle_support_offset_m`.
+
 Source-phase rewards use the action's consumed original source frame.
 Upward load credit is reduced
 when the object tilts away from the source pose. Articulation credit requires
