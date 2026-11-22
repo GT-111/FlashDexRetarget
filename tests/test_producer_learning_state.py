@@ -585,6 +585,27 @@ def test_warmup_stop_request_commits_without_update(monkeypatch, tmp_path):
     assert (tmp_path / "stop2" / "stop.request").read_text() == "stop during warmup\n"
 
 
+@pytest.mark.parametrize("save_full", [False, True])
+def test_requested_periodic_full_checkpoints_cover_replay_warmup(monkeypatch, tmp_path, save_full):
+    runner, events = _stop_loop(tmp_path, monkeypatch, ready=False)
+    runner._cfg.save_replay_buffer = save_full
+    runner._save_stride = 2
+    runner._eval_supported = lambda: False
+    runner._finish = lambda: None
+    runner._agent.update = lambda: pytest.fail("warmup must not perform an optimizer step")
+    writes = []
+
+    def write(step, name, *, full):
+        writes.append((step, name, full))
+        return tmp_path / name
+
+    runner._write_checkpoint = write
+    runner.learn(2)
+
+    assert events == ["collect", "collect"]
+    assert writes == ([(2, "step2", True), (4, "step4", True)] if save_full else [])
+
+
 def test_native_hoi_with_disabled_training_eval_finishes_without_a_second_evaluator(monkeypatch, tmp_path):
     runner, events = _stop_loop(tmp_path, monkeypatch)
     runner._hoi_curriculum = SimpleNamespace(has_zero_gains=lambda: False, hoi_zero_receipt=lambda: None)

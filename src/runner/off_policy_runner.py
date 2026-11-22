@@ -205,6 +205,8 @@ class OffPolicyRunner:
                 if self._stop_if_requested(env_step):
                     return
                 if not ready:
+                    if self._cfg.get("save_replay_buffer", False) and self._crossed(env_step, self._save_stride):
+                        self._save_checkpoint(env_step)
                     continue
 
                 if self._hoi_curriculum is not None and not self._started_at_hoi_zero:
