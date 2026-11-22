@@ -164,7 +164,6 @@ def quat_unique(q: torch.Tensor) -> torch.Tensor:
     return torch.where(q[..., 0:1] < 0, -q, q)
 
 
-@torch.jit.script
 def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
     """Convert rotations given as quaternions to rotation matrices.
 
@@ -196,6 +195,10 @@ def matrix_from_quat(quaternions: torch.Tensor) -> torch.Tensor:
         -1,
     )
     return o.reshape(quaternions.shape[:-1] + (3, 3))
+
+
+matrix_from_quat_eager = matrix_from_quat
+matrix_from_quat = torch.jit.script(matrix_from_quat)
 
 
 def convert_quat(quat: torch.Tensor | np.ndarray, to: Literal["xyzw", "wxyz"] = "xyzw") -> torch.Tensor | np.ndarray:

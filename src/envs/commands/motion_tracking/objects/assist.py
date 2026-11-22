@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 from mjlab.utils.lab_api.math import (
     axis_angle_from_quat,
-    matrix_from_quat,
+    matrix_from_quat_eager,
     quat_conjugate,
     quat_mul,
 )
@@ -31,7 +31,8 @@ def object_pose_pd_wrench(
     rotation_error = axis_angle_from_quat(quat_mul(
         reference_w[..., 3:7], quat_conjugate(state_w[..., 3:7]),
     ))
-    rotation = matrix_from_quat(state_w[..., 3:7])
+    # Freeze the rounding of the submitted torque across TorchScript fusion histories.
+    rotation = matrix_from_quat_eager(state_w[..., 3:7])
     inertia_world = rotation @ inertia_com_body @ rotation.transpose(-1, -2)
     angular_acceleration = kp_rot * rotation_error + kd_rot * (
         reference_w[..., 10:13] - state_w[..., 10:13]
