@@ -167,8 +167,9 @@ class _BeforeFirstPhysicsReset(Exception):
 
 @pytest.mark.parametrize("per_env", [False, True])
 @pytest.mark.parametrize("collision_enabled", [False, True])
+@pytest.mark.parametrize("offsets", [(0.005, 0.001), (None, None)])
 def test_stock_scene_installs_selected_properties_after_deinstance_before_first_reset(
-    collision_scene, monkeypatch, tmp_path, per_env, collision_enabled,
+    collision_scene, monkeypatch, tmp_path, per_env, collision_enabled, offsets,
 ):
     module, stage = collision_scene
     monkeypatch.setenv("FDR_ABL_NOOBJCOL", "0" if collision_enabled else "1")
@@ -190,7 +191,7 @@ def test_stock_scene_installs_selected_properties_after_deinstance_before_first_
         "commands": {"object": {"support_disks": {"enable": False}}},
         "sim": {"physx": {"solver_position_iteration_count": 8,
                            "solver_velocity_iteration_count": 0,
-                           "contact_offset": 0.005, "rest_offset": 0.001}},
+                           "contact_offset": offsets[0], "rest_offset": offsets[1]}},
     })
     if per_env:
         slots = [
@@ -218,7 +219,8 @@ def test_stock_scene_installs_selected_properties_after_deinstance_before_first_
     for shape in shapes:
         robot = "/Robot/" in shape.path
         assert shape.properties == {"collision_enabled": True if robot else collision_enabled,
-                                    "contact_offset": 0.005, "rest_offset": 0.001}
+                                    "contact_offset": 0.02 if offsets[0] is None else offsets[0],
+                                    "rest_offset": -0.001 if offsets[1] is None else offsets[1]}
         expected_material = "/World/Materials/handContact" if robot else "/World/Materials/objContact"
         assert shape.material == expected_material
     for i, event in enumerate(stage.events):

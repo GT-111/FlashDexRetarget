@@ -163,7 +163,7 @@ class IsaacSceneAdapter:
 def _robot_articulation_cfg(
     meta: RobotMjcfMeta, asset: IsaacRobotAsset,
     self_collision: bool, pos_iters: int, vel_iters: int,
-    contact_offset: float = 0.002, rest_offset: float = 0.0,
+    contact_offset: float | None = 0.002, rest_offset: float | None = 0.0,
     max_depen: float = 5.0, max_contact_impulse: float | None = None,
 ) -> ArticulationCfg:
     """Explicit converted USD with MJCF-derived implicit PD gains."""
@@ -239,7 +239,7 @@ def _usd_scale(scale: float) -> tuple[float, float, float] | None:
 
 def _object_rigid_cfg(
     entity_name: str, usd_path: str, park: tuple, pos_iters: int, vel_iters: int,
-    scale: float = 1.0, contact_offset: float = 0.002, rest_offset: float = 0.0,
+    scale: float = 1.0, contact_offset: float | None = 0.002, rest_offset: float | None = 0.0,
     max_depen: float = 5.0, max_contact_impulse: float | None = None,
 ) -> RigidObjectCfg:
     return RigidObjectCfg(
@@ -269,7 +269,9 @@ def _object_rigid_cfg(
 
 
 
-def _spawn_support_disks(cfg, stage, num_envs: int, coff: float, roff: float, mat_path: str) -> dict:
+def _spawn_support_disks(
+    cfg, stage, num_envs: int, coff: float | None, roff: float | None, mat_path: str,
+) -> dict:
     """CHORD support disks: count x radii kinematic cylinders per env (parked), one RigidObject
     view per (k, radius bucket). Same grid as envs/scene/_support_disk_setup.py (mujoco)."""
     sd = cfg.commands.object.support_disks
@@ -468,8 +470,10 @@ def build_isaac_scene(
     px = cfg.sim.physx
     pos_iters = int(px.solver_position_iteration_count)
     vel_iters = int(px.solver_velocity_iteration_count)
-    coff = float(px.get("contact_offset", 0.002))
-    roff = float(px.get("rest_offset", 0.0))
+    coff = px.get("contact_offset", 0.002)
+    roff = px.get("rest_offset", 0.0)
+    coff = None if coff is None else float(coff)
+    roff = None if roff is None else float(roff)
     mdep = float(px.get("max_depenetration_velocity", 5.0))
     mimp = px.get("max_contact_impulse", None)
     mimp = None if mimp is None else float(mimp)

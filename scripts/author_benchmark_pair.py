@@ -81,7 +81,12 @@ def main() -> None:
     for label, root, directory_key in (("author", author, "save_path"), ("candidate", _CURRENT, "run_dir")):
         overrides = [*shared, f"{directory_key}={json.dumps(str(output / label))}"]
         if label == "candidate":
-            overrides.append(f"sim.robot_asset.usd_path={json.dumps(str(usd))}")
+            overrides.extend((
+                f"sim.robot_asset.usd_path={json.dumps(str(usd))}",
+                # The pinned author writes these properties before resolving USD instances.
+                "sim.physx.contact_offset=null",
+                "sim.physx.rest_offset=null",
+            ))
         with initialize_config_dir(config_dir=str(root / "config"), version_base=None):
             cfg = compose(config_name="flashdexretarget", overrides=overrides)
         evaluators.append(OmegaConf.to_container(cfg.eval, resolve=False))

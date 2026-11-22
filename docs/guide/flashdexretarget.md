@@ -136,6 +136,13 @@ helper defaults to seed 42 and the author's 400M Sharpa or 300M XHand step
 budget. Use `--compose-only` for a rehearsal before assets are present. A
 rehearsal verifies the configuration and does not qualify a simulator run.
 
+For the candidate stock arm the helper selects
+`sim.physx.contact_offset=null` and `sim.physx.rest_offset=null`. This retains
+offsets authored on the USD and lets PhysX resolve its per-shape defaults
+where the asset has none. The pinned author's property writes encounter the
+instanced shapes before they are editable. In an ordinary stock run, a
+numeric override explicitly installs that offset before the first solve.
+
 For a short stock physics comparison, run both revisions with one shared
 packed library, selected motion and reset. Record the motion actually sampled,
 installed collision properties and body inertials, issued targets and wrenches,

@@ -18,6 +18,7 @@ sim:
     # max: hand/disk-object friction stays at `friction`, object_friction acts on object-object only
     nonobject_friction_combine_mode: average
     disk_friction: null   # null = support disks share the object material
+    # Null keeps the authored USD value or PhysX per-shape default.
     contact_offset: 0.005
     rest_offset: 0.0
     max_depenetration_velocity: 1.0
