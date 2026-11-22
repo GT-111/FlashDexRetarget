@@ -33,6 +33,7 @@ dependencies = [
   "numpy==1.26.4",
   "scipy==1.15.3",
   "trimesh==4.5.1",
+  "fast-simplification==0.1.13", # runtime SDF mesh decimation
   "coacd==1.0.10",              # data preparation only (src/retarget/object/obj_convex_decompose.py)
   "cuacd==0.1.0",               # data preparation only, convex=cuacd
   "smplx==0.1.28",              # data preparation only: MANO layer (src/retarget/human_demo)

@@ -90,6 +90,9 @@ each named articulation into `<dataset>/native-usd`.
 
 The native scene declares an ordered `objects` collection of actual FREE-base
 articulations. Each owns its original passive joints and named part surfaces.
+First use of a part surface above 16,000 triangles uses the installed
+`fast-simplification` pin through Trimesh for the SDF bake. The installed
+collision geometry still comes from the native scene.
 Prepared native clips bind the same entities through `object_root_body_names`;
 part/joint rows remain flat, named, and independently supported. Objects are not
 assigned to hand-side slots. All declared objects participate in the same coupled

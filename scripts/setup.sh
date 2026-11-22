@@ -126,7 +126,7 @@ if [[ "$PROFILE" == isaac ]]; then
         --extra-index-url https://download.pytorch.org/whl/cu128 \
         --extra-index-url https://pypi.nvidia.com
     pip install --no-deps rsl-rl-lib==5.5.1 tensordict==0.13.0 pyvers==0.2.2
-    pip install --no-deps coacd==1.0.10 cuacd==0.1.0 smplx==0.1.28
+    pip install --no-deps coacd==1.0.10 cuacd==0.1.0 smplx==0.1.28 fast-simplification==0.1.13
 elif [[ -n "$REQUIREMENTS_LOCK" ]]; then
     # The selected lock already contains the complete third-party closure.
     pip install --no-deps -r "$REQUIREMENTS_LOCK"
