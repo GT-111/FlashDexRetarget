@@ -575,21 +575,21 @@ class NativeResidualAction(ActionTerm):
         index = roles.long().argmax(-1)
         pose_support = ml.native_object_part_pose_support[ids].gather(1, index)
         wrist_support = torch.stack([ml.native_root_pose_support[side][ids] for side in self.hand_sides], 1)
-        eligible = (roles.sum(-1) == 1) & command.rigid_part_mask[index] & pose_support & wrist_support
+        carrier = (roles.sum(-1) == 1) & command.rigid_part_mask[index] & pose_support & wrist_support
 
         scene = self._env.scene
         solved = scene.hand_part_contact_facts()
         support_pairs = scene.support_contact_interval_pairs()
-        contacts = [[solved["pairs"][f"{side}/{obj.entity_name}/{part.name}"]
-                     for obj, part in self.layout.part_bindings] for side in self.hand_sides]
+        keys = [[f"{side}/{obj.entity_name}/{part.name}" for obj, part in self.layout.part_bindings]
+                for side in self.hand_sides]
 
-        def bearing_value(field):
-            return torch.stack([torch.stack([pair[field] for pair in hand], 1)
-                                for hand in contacts], 1).gather(2, index[..., None]).squeeze(-1)
+        def bearing_values(pairs, field, indices):
+            values = torch.stack([torch.stack([pairs[key][field] for key in hand], -1) for hand in keys], -2)
+            return values.gather(-1, indices).squeeze(-1)
 
-        force = bearing_value("normal_force_n")
-        depth = bearing_value("force_bearing_distance_max_m")
-        eligible &= solved["measurement_support"][:, None] & (force >= .08) & (depth <= .0025)
+        force = bearing_values(solved["pairs"], "normal_force_n", index[..., None])
+        depth = bearing_values(solved["pairs"], "force_bearing_distance_max_m", index[..., None])
+        eligible = carrier & solved["measurement_support"][:, None] & (force >= .08) & (depth <= .0025)
         same_clip = (self._installed_valid & (command.motion_ids == self._reference_motion_ids))[:, None]
         prior_ids = ml.length_starts[self._reference_motion_ids] + self._reference_motion_steps
         previous = command.source_hand_part_intent(prior_ids)
@@ -599,16 +599,29 @@ class NativeResidualAction(ActionTerm):
         up = scene.gravity_up_w
         support_up = torch.stack([support_pairs[key]["force_on_second_w_n"][:, -1] @ up
                                   for key in self._source_hold_pairs], 1).gather(1, index)
-        capture = (eligible & same_clip & self._root_support & (ids == prior_ids + 1)[:, None]
+        adjacent = (ids == prior_ids + 1)[:, None]
+        capture = (eligible & same_clip & self._root_support & adjacent
                    & prior_roles.gather(2, index[..., None]).squeeze(-1)
                    & previous_stationary & ~stationary
                    & (support_up >= .25 * self._source_hold_weights_n[index]))
-        retain = eligible & same_clip & (self._source_transport_part == index)
+        xyz_wxyz = index[..., None].expand(-1, -1, 7)
+        pose = command.object_part_reference(ids)[..., :7].gather(1, xyz_wxyz)
+        live_position = command.sim_object_part_state_w[..., :3].gather(1, index[..., None].expand(-1, -1, 3))
+        error = pose[..., :3] - live_position
+        interval = scene.hand_part_contact_interval_facts()
+        samples = interval["measurement_support"]
+        columns = index[:, None, :, None].expand(-1, samples.shape[1], -1, 1)
+        loaded = (samples[:, :, None]
+                  & (bearing_values(interval["pairs"], "normal_force_n", columns) >= .08)
+                  & (bearing_values(interval["pairs"], "force_bearing_distance_max_m", columns) <= .0025))
+        recent = interval["interval_complete"][:, None] & (loaded.sum(1) >= (samples.shape[1] + 1) // 2)
+        nearby = error.norm(dim=-1) <= self._source_contact_guard["max_part_position_error_m"]
+        retain = (same_clip & (self._source_transport_part == index)
+                  & (eligible | (carrier & adjacent & nearby & recent)))
         capture &= ~retain
         active = retain | capture
         self._source_transport_part.copy_(torch.where(active, index, -1))
 
-        xyz_wxyz = index[..., None].expand(-1, -1, 7)
         prior_pose = command.object_part_reference(prior_ids)[..., :7].gather(1, xyz_wxyz)
         inv = quat_inv(prior_pose[..., 3:7])
         local = torch.cat((quat_apply(inv, self._root_target[..., :3] - prior_pose[..., :3]),
@@ -618,10 +631,6 @@ class NativeResidualAction(ActionTerm):
         self._source_transport_commands.copy_(torch.where(capture[:, self._finger_command_hand], last_commands,
                                                           self._source_transport_commands))
 
-        pose = command.object_part_reference(ids)[..., :7].gather(1, xyz_wxyz)
-        live_position = command.sim_object_part_state_w[..., :3].gather(
-            1, index[..., None].expand(-1, -1, 3))
-        error = pose[..., :3] - live_position
         planar_error = error - (error @ up)[..., None] * up
         goal = (pose[..., :3] + quat_apply(pose[..., 3:7], self._source_transport_pose[..., :3])
                 + self._transport_position_gain * planar_error)

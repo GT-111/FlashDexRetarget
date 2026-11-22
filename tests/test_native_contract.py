@@ -1190,32 +1190,32 @@ def test_native_rigid_transport_preserves_a_solved_grasp_across_dwell_to_motion(
     env, action, command, _ = _native_action_case(
         tmp_path, wrist_target_twist="filtered_correction_feedforward",
         source_contact_approach={
-            "translation_m": .024, "guard": 1., "stationary_hold_force_n": 1.,
+            "translation_m": .024, "max_part_position_error_m": .02, "stationary_hold_force_n": 1.,
             "transport_position_gain": .5,
         },
         support_contacts=True,
     )
     command.motion_ids = torch.tensor([0, 1])
     command.motion_steps = torch.zeros(2, dtype=torch.long)
-    command._motion_flat_ids = torch.tensor([0, 2])
-    command.motion_lib.length_starts = torch.tensor([0, 2])
+    command._motion_flat_ids = torch.tensor([0, 3])
+    command.motion_lib.length_starts = torch.tensor([0, 3])
     for side in action.hand_sides:
-        command.motion_lib.native_root_state_w[side] = command.motion_lib.native_root_state_w[side].repeat(2, 1)
+        command.motion_lib.native_root_state_w[side] = command.motion_lib.native_root_state_w[side].repeat(3, 1)
     for name in ("native_root_pose_support", "native_root_linear_velocity_support",
                  "native_root_angular_velocity_support"):
         column = getattr(command.motion_lib, name)
         for side in action.hand_sides:
-            column[side] = column[side].repeat(2)
+            column[side] = column[side].repeat(3)
     # Two source episodes each have a locally stationary first row.
     command.source_stationary_part_rows = lambda _: torch.tensor(
-        [[True, True], [False, False], [True, True], [False, False]]
+        [[True, True], [False, False], [False, False]] * 2
     )
     command.rigid_part_mask = torch.tensor([True, False])
-    command.motion_lib.native_object_part_pose_support = torch.ones(4, 2, dtype=torch.bool)
-    reference = torch.zeros(4, 2, 13)
+    command.motion_lib.native_object_part_pose_support = torch.ones(6, 2, dtype=torch.bool)
+    reference = torch.zeros(6, 2, 13)
     reference[..., 3] = 1.
     reference[1, 0, 0] = .006
-    reference[3, 0, 0] = .006
+    reference[4, 0, 0] = .006
 
     def world_parts(ids):
         parts = reference[ids].clone()
@@ -1237,6 +1237,14 @@ def test_native_rigid_transport_preserves_a_solved_grasp_across_dwell_to_motion(
     solved = env.scene.hand_part_contact_facts()["pairs"]["left/object/base"]
     solved["normal_force_n"][:] = 2.
     solved["force_bearing_distance_max_m"][:] = .001
+    previous = {key: {field: pair[field][:, None].repeat(1, 4) for field in
+                      ("normal_force_n", "force_bearing_distance_max_m")}
+                for key, pair in env.scene.hand_part_contact_facts()["pairs"].items()}
+    completed = torch.zeros(2, dtype=torch.bool)
+    env.scene.hand_part_contact_interval_facts = lambda: {
+        "pairs": previous, "measurement_support": torch.ones(2, 4, dtype=torch.bool),
+        "interval_complete": completed,
+    }
     # The second clone has no fixed support.
     env.scene.support_contact_interval_pairs()["support/object/base"]["force_on_second_w_n"][1, -1] = 0.
     action.process_actions(torch.zeros_like(action.raw_action))
@@ -1251,9 +1259,19 @@ def test_native_rigid_transport_preserves_a_solved_grasp_across_dwell_to_motion(
     assert action.installed_control["source_transport_part_index"].tolist() == [[0, -1], [-1, -1]]
     torch.testing.assert_close(action.installed_control["finger_target_rad"][0, 0], grip[0])
     assert action.installed_control["finger_target_rad"][1, 0] > grip[1]
-    # Lost contact clears the carrier and allows the ordinary action to reacquire.
+    # A brief contact gap at the endpoint can retain the previous solved grasp.
     carry = action.capture_control_context()
     solved["normal_force_n"][0] = 0.
+    previous["left/object/base"]["normal_force_n"][0, 2:] = 0.
+    completed[:] = True
+    command.motion_steps += 1
+    command._motion_flat_ids += 1
+    action.process_actions(moving)
+    action.apply_actions()
+    assert action.installed_control["source_transport_part_index"].tolist() == [[0, -1], [-1, -1]]
+    torch.testing.assert_close(action.installed_control["finger_target_rad"][0, 0], grip[0])
+    # Partial reset evidence is insufficient for continuing the carried grasp.
+    completed[0] = False
     action.process_actions(moving)
     action.apply_actions()
     assert action.installed_control["source_transport_part_index"][0, 0] == -1

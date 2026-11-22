@@ -536,6 +536,13 @@ The optional pad compression and stationary load feedback require a solved
 contact plant. Installed control records the selected part column and its
 named body axis, with `-1` for no selected part.
 
+Rigid transport captures the attained grasp using the solved endpoint and
+fixed support. A short gap at a later endpoint can retain that grasp while
+the source role remains active and the object stays within its configured
+position bound. This uses a completed preceding interval with force-bearing
+contact in at least half its substeps. Unmeasured intervals and reset worlds
+cannot supply that continuation.
+
 ### Initial native control contexts
 
 `ManagerBasedRlEnv.capture_initial_control_context()` captures a committed
