@@ -22,7 +22,7 @@ from simulator.native.contacts import digit_body_groups
 from simulator.native.entity import NativeRobotAdapter, _FreshnessClock
 
 from .assets import IsaacRobotAsset, resolve_robot_asset
-from .convert_assets import colvis_enabled, validate_native_usd
+from .convert_assets import colvis_enabled, condition_gpu_convex_colliders, validate_native_usd
 from .entity import (
     ArticulationAdapter,
     FreeArticulationAdapter,
@@ -1023,6 +1023,9 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
             assets[binding.entity_name] = Articulation(
                 _native_articulation_cfg(binding, meta, cfg)
             )
+    gpu_convex_charts = []
+    if torch.device(device).type == "cuda":
+        gpu_convex_charts = condition_gpu_convex_colliders(scene.stage, scene.env_prim_paths[0])
     body_paths = {name: _native_rigid_body_paths(scene, asset) for name, asset in assets.items()}
     contacts, contact_links = {}, {}
     for hand in layout.hands:
@@ -1062,6 +1065,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
     adapter.backend_identity.update(
         engine_versions={package: package_metadata.version(package) for package in ("isaacsim", "isaaclab")},
         physics_device_ordinal=sim_ctx.physics_sim_view.device_ordinal,
+        gpu_convex_charts=gpu_convex_charts,
         scene_xml_path=str(layout.scene_xml_path),
         installed_usds={
             "static": str(cfg.sim.native_assets.static),

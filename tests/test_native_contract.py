@@ -18,12 +18,53 @@ from envs.actions.native import (
 from envs.commands.motion_tracking.native import NativeMotionTrackingCommand
 from envs.scene.native import NativeSceneCfg
 from simulator.isaacsim.convert_assets import (
+    condition_gpu_convex_colliders,
     native_mimic_imports,
     validate_native_mjcf_import,
     write_native_mjcf_assets,
 )
 from simulator.isaacsim.entity import FreeArticulationAdapter, _FreshnessClock
 from simulator.mjcf_meta import load_robot_mjcf_meta
+
+
+def test_native_gpu_convex_conditioning_keeps_the_instanced_world_geometry():
+    Usd = pytest.importorskip("pxr.Usd")
+    from pxr import Gf, UsdGeom, UsdPhysics
+
+    source = Usd.Stage.CreateInMemory()
+    source.DefinePrim("/ColliderAsset", "Xform")
+    thin_points = [(x, y, z) for x in (-.1, .1) for y in (-.03, .03) for z in (-.001, .001)]
+    for name, points in (("thin", thin_points), ("visual", thin_points), ("box", [
+        (x, y, z) for x in (-.1, .1) for y in (-.05, .05) for z in (-.03, .03)
+    ])):
+        mesh = UsdGeom.Mesh.Define(source, f"/ColliderAsset/{name}")
+        mesh.CreatePointsAttr(points)
+        if name != "visual":
+            UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
+            UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim()).CreateApproximationAttr().Set("convexHull")
+
+    stage = Usd.Stage.CreateInMemory()
+    root = UsdGeom.Xform.Define(stage, "/World")
+    root.AddTranslateOp().Set(Gf.Vec3d(1., 2., 3.))
+    root.AddRotateYOp().Set(21.)
+    asset = stage.DefinePrim("/World/Instance", "Xform")
+    asset.GetReferences().AddReference(source.GetRootLayer().identifier, "/ColliderAsset")
+    asset.SetInstanceable(True)
+    path = "/World/Instance/thin"
+
+    def world_points():
+        prim = stage.GetPrimAtPath(path)
+        transform = UsdGeom.XformCache().GetLocalToWorldTransform(prim)
+        return np.asarray([transform.Transform(Gf.Vec3d(point))
+                           for point in UsdGeom.Mesh(prim).GetPointsAttr().Get()])
+
+    assert stage.GetPrimAtPath(path).IsInstanceProxy()
+    before = world_points()
+    assert condition_gpu_convex_colliders(stage, "/World") == [path]
+    np.testing.assert_allclose(world_points(), before, rtol=0., atol=1.e-7)
+    for name in ("visual", "box"):
+        assert not stage.GetPrimAtPath(f"/World/Instance/{name}").HasAttribute("xformOp:scale:gpuConvexChart")
+    assert condition_gpu_convex_colliders(stage, "/World") == []
 
 
 def test_pad_normal_travel_respects_endpoint_owner_roles_and_shared_commands():

@@ -185,6 +185,14 @@ Runtime damping, armature and friction tensors use the dtype of their actual
 SDK destination buffers. Shared compiled metadata retains its original numeric
 precision; this boundary does not change Torch's global default dtype.
 
+Before cloning a native CUDA world, the Isaac installer conditions thin convex
+collision meshes for GPU cooking. It rescales their local mesh coordinates and
+authors the inverse scale in USD, preserving the installed world-space
+geometry, inertials and collider roster. The backend identity records the
+edited collider paths. In a matched installed rigid-body witness, this removes
+the spurious airborne impulse from CPU-fallback convex hulls near a fixed
+support. Use the exact plant and accepted solver steps to qualify each rollout.
+
 Native contact sensors resolve their configured body names against the actual
 spawned asset's rigid-body prims before reset. Their paths retain the asset's
 environment regex and the imported body's relative hierarchy. An importer

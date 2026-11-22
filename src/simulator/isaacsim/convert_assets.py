@@ -277,6 +277,51 @@ def _complete_native_articulation_roots(stage) -> None:
         prim.RemoveAppliedSchema("PhysxArticulationAPI")
 
 
+def condition_gpu_convex_colliders(stage, root_path) -> list[str]:
+    """Keep thin convex hulls in a well-scaled local chart before GPU cooking."""
+    import numpy as np
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics, Vt
+
+    updates = []
+    root = stage.GetPrimAtPath(root_path)
+    for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):
+        collider = UsdPhysics.CollisionAPI(prim)
+        mesh = UsdGeom.Mesh(prim)
+        if not mesh or not collider or not collider.GetCollisionEnabledAttr().Get():
+            continue
+        approximation = UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr().Get()
+        if approximation != UsdPhysics.Tokens.convexHull:
+            continue
+        points = np.asarray(mesh.GetPointsAttr().Get())
+        widths = np.ptp(points, axis=0)
+        if widths.min() > 0.0 and widths.max() > 20.0 * widths.min():
+            updates.append((prim.GetPath(), points, widths / widths.max()))
+
+    for path, points, scale in updates:
+        prim = stage.GetPrimAtPath(path)
+        while prim.IsInstanceProxy():
+            parent = prim.GetParent()
+            while parent.IsInstanceProxy():
+                parent = parent.GetParent()
+            parent.SetInstanceable(False)
+            prim = stage.GetPrimAtPath(path)
+        if prim.IsInstance():
+            prim.SetInstanceable(False)
+        mesh = UsdGeom.Mesh(prim)
+        chart_points = points / scale
+        mesh.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(chart_points))
+        extent = np.stack((chart_points.min(0), chart_points.max(0)))
+        mesh.GetExtentAttr().Set(Vt.Vec3fArray.FromNumpy(extent))
+        normals = mesh.GetNormalsAttr()
+        if values := normals.Get():
+            normals.Set(Vt.Vec3fArray.FromNumpy(np.asarray(values) * scale))
+        # PhysX checks the input hull before applying this shape-local scale.
+        mesh.AddScaleOp(UsdGeom.XformOp.PrecisionDouble, "gpuConvexChart").Set(
+            Gf.Vec3d(*scale.tolist()),
+        )
+    return [str(path) for path, _, _ in updates]
+
+
 def complete_native_usd(usd_path, meta) -> None:
     """Install the native constraints missing from pinned MJCF import, pre-parse."""
     from omni.physx.bindings._physx import (
