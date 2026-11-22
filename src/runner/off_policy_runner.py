@@ -205,7 +205,7 @@ class OffPolicyRunner:
                 if self._stop_if_requested(env_step):
                     return
                 if not ready:
-                    if self._cfg.get("save_replay_buffer", False) and self._crossed(env_step, self._save_stride):
+                    if self._crossed(env_step, self._save_stride) and self._cfg.get("save_replay_buffer", False):
                         self._save_checkpoint(env_step)
                     continue
 
