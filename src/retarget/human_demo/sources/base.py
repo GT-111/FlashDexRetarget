@@ -83,7 +83,10 @@ class Source:
             self._trees[obj_id, scale] = cKDTree(v), v.min(0), v.max(0)
         tree, lo, hi = self._trees[obj_id, scale]
         d = np.full(len(pts), np.inf)
-        box = ((pts >= lo - bound) & (pts <= hi + bound)).all(1)
+        lower, upper = lo - bound, hi + bound
+        box = (pts[:, 0] >= lower[0]) & (pts[:, 0] <= upper[0])
+        for axis in (1, 2):
+            box &= (pts[:, axis] >= lower[axis]) & (pts[:, axis] <= upper[axis])
         d[box] = tree.query(pts[box], distance_upper_bound=bound)[0]
         return d
 

@@ -136,6 +136,12 @@ Per clip: MANO forward pass with `assets/mano/MANO_{RIGHT,LEFT}.pkl`, rotation i
 `mano_tip_vertex`), and resampling to `fps` (60 Hz). A clip is skipped when a hand has no object or an object
 flips more than `max_obj_rot_step_deg` in one frame.
 
+The HOT3D author-compatible importer selects timestamps with both hands and
+every declared object, then uses the nominal 30 Hz basis for segmentation and
+resampling. Its segment names and clocks follow the author benchmark recipe.
+Use the DexForge `hot3d_recordings` source for production runs that retain the
+published integer camera clock and separate per-hand and per-object support.
+
 ### Clip format (`human_demo/<clip>.npz`)
 
 All arrays at `fps`, z-up world, metres; `s` is `right` or `left`:

@@ -67,24 +67,42 @@ class Source(Base):
         object (gaps < gap_frames bridged); windows of activity split where the touched object changes; segments
         shorter than min_frames dropped. Mode A: one hand active, B: both on one object, C: on two objects."""
         cfg = self.cfg.segment
+        bounds = {}
+        for u, pose in poses.items():
+            vertices = np.asarray(self.mesh(u).vertices)
+            lo, hi = vertices.min(0), vertices.max(0)
+            rot, pos = pose[:, :3, :3], pose[:, :3, 3]
+            centre = rot @ ((lo + hi) / 2) + pos
+            # The padded world-space box encloses every vertex within either contact distance.
+            extent = np.abs(rot) @ ((hi - lo) / 2) + max(cfg.tip_contact, cfg.link_contact)
+            bounds[u] = centre - extent, centre + extent
         active, links = {}, {}
         for side, hand in hands.items():
             model = _mano(self.mano_dir, side, tuple(sorted(self.mano.items())))
             _, verts = _forward(model, hand)
+            hand_min, hand_max = verts.min(axis=1), verts.max(axis=1)
             link_of = model.lbs_weights.numpy().argmax(1)  # (778,) the MANO link each vertex follows
             tips = verts[:, list(self.tip_vertex[side].values())]
             tip_dist = np.full(tips.shape[:2], np.inf)
             link_body = np.zeros((len(verts), 16), dtype=int)
             link_dist = np.full((len(verts), 16), np.inf)
             for k, u in enumerate(uids, 1):
-                rot, pos = poses[u][:, :3, :3], poses[u][:, :3, 3]
-                local = lambda x, pos=pos, rot=rot: np.matmul(x - pos[:, None], rot).reshape(-1, 3)  # noqa: E731
-                tip_dist = np.minimum(tip_dist, self.near(u, local(tips), cfg.tip_contact).reshape(tip_dist.shape))
-                d = self.near(u, local(verts), cfg.link_contact).reshape(verts.shape[:2])
+                lo, hi = bounds[u]
+                frames = np.flatnonzero(((hand_max >= lo) & (hand_min <= hi)).all(axis=1))
+                if not len(frames):
+                    continue
+                pose = poses[u][frames]
+                rot, pos = pose[:, :3, :3], pose[:, :3, 3]
+                local_tips = (tips[frames] - pos[:, None]) @ rot
+                td = self.near(u, local_tips.reshape(-1, 3), cfg.tip_contact).reshape(local_tips.shape[:2])
+                tip_dist[frames] = np.minimum(tip_dist[frames], td)
+                local_vertices = (verts[frames] - pos[:, None]) @ rot
+                d = self.near(u, local_vertices.reshape(-1, 3), cfg.link_contact).reshape(local_vertices.shape[:2])
                 for link in range(16):
                     dl = d[:, link_of == link].min(1)
-                    closer = dl < link_dist[:, link]
-                    link_dist[closer, link], link_body[closer, link] = dl[closer], k
+                    closer = dl < link_dist[frames, link]
+                    rows = frames[closer]
+                    link_dist[rows, link], link_body[rows, link] = dl[closer], k
             active[side] = _fill_gaps(tip_dist.min(1) < cfg.tip_contact, cfg.gap_frames)
             links[side] = np.where(np.isfinite(link_dist), link_body, 0)
 
