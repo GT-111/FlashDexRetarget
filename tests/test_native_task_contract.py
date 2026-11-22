@@ -523,6 +523,7 @@ def test_native_object_wrench_clear_uses_actual_bodies_not_rigid_api(tmp_path):
     adapter._isaac_body_ids = torch.tensor([3, 1])
     adapter._external_force_w = torch.ones(2, 2, 3)
     adapter._external_torque_w = torch.full((2, 2, 3), 2.0)
+    adapter.native_object_wrench = None
     adapter._art = SimpleNamespace(
         num_instances=2,
         set_external_force_and_torque=lambda f, t, **kw: calls.append(
