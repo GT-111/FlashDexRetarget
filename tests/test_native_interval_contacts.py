@@ -512,6 +512,55 @@ def test_isaac_named_pair_filter_order_must_resolve_in_the_matching_clone():
     assert create_named_contact_view(SDK, sensors, filters)[0] is None
 
 
+def test_isaac_complete_object_pair_uses_signed_link_reports_and_shared_reset(monkeypatch):
+    from simulator.isaacsim.native_contacts import IsaacNativeContactReadback, IsaacObjectPairContact
+
+    def link_report(normal, force):
+        support = torch.full((2,), True)
+        return SimpleNamespace(
+            facts=dict(normal_force_n=torch.tensor(normal), force_on_second_w_n=torch.tensor(force)),
+            support=support, read=lambda dt: support,
+        )
+
+    base = link_report([1., 0.], [[.2, 0., 1.], [0., 0., 0.]])
+    lid = link_report([2., 0.], [[-.3, 0., -2.], [0., 0., 0.]])
+    address = dict(first_entity_name="receiver", first_root_body_name="base",
+                   second_entity_name="assembly", second_root_body_name="root")
+    pair = IsaacObjectPairContact(address, [base, lid])
+    name = "objects/receiver/assembly"
+    context = SimpleNamespace(current_time_step_index=0, current_time=0., get_physics_dt=lambda: .005)
+
+    def advance_step(*, render):
+        context.current_time += .005
+        context.current_time_step_index += 1
+
+    context.step = advance_step
+    scene = _isaac_scene_type(monkeypatch)(SimpleNamespace(cfg=SimpleNamespace(num_envs=2)), "cpu", context)
+    scene.native_layout = SimpleNamespace(support_pair_bindings={}, object_pair_bindings={name: ()})
+    sim = IsaacSimAdapter(context, "cpu")
+    sim._clock = SimpleNamespace(bump=lambda: None)
+    sim.native_contacts = scene.native_contacts = IsaacNativeContactReadback(
+        context, 2, "cpu", .005, 2, {name: pair},
+    )
+    assert not scene.object_pair_contact_interval_facts()["measurement_support"].any()
+    _advance_control(sim, 2)
+    facts = scene.object_pair_contact_interval_facts()
+    assert facts["pairs"] == [address]
+    assert facts["measurement_support"].tolist() == [[True], [True]]
+    assert facts["normal_force_n"][:, :, 0].tolist() == [[3., 3.], [0., 0.]]
+    torch.testing.assert_close(facts["force_on_second_w_n"][0, 0, 0], torch.tensor([-.1, 0., -1.]))
+    torch.testing.assert_close(scene.support_contact_interval_pairs()[name]["force_on_second_w_n"],
+                               facts["force_on_second_w_n"][:, :, 0])
+    sim.reset(torch.tensor([0]))
+    assert scene.physics_execution_clock()["steps"].tolist() == [2, 2]
+    assert scene.object_pair_contact_interval_facts()["measurement_support"].tolist() == [[False], [True]]
+    lid.support[1] = False
+    _advance_control(sim, 2)
+    facts = scene.object_pair_contact_interval_facts()
+    assert facts["measurement_support"].tolist() == [[True], [False]]
+    assert torch.isnan(facts["force_on_second_w_n"][1]).all()
+
+
 def test_isaac_external_wrench_records_actual_named_sdk_payload_on_accepted_steps():
     from simulator.isaacsim.entity import IsaacObjectWrench
     from simulator.isaacsim.native_contacts import IsaacNativeContactReadback

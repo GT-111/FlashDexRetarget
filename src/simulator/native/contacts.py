@@ -32,6 +32,25 @@ def digit_body_groups(model, hand_root, tip_sites, finger_roles):
     return {group: sorted(members) for group, members in groups.items()}
 
 
+def object_pair_interval_facts(interval, addresses):
+    """Reduce named complete object-tree pairs on the shared accepted clock."""
+    if interval is None or not addresses:
+        return None
+    facts = interval.facts()
+    if "execution_interval_complete" not in facts:
+        return None
+    force = torch.stack([facts["pairs"][key]["normal_force_n"] for key in addresses], dim=-1)
+    force_on_second = torch.stack([facts["pairs"][key]["force_on_second_w_n"] for key in addresses], dim=-2)
+    complete = (facts["interval_complete"] & facts["execution_interval_complete"]
+                & facts["measurement_support"].all(-1))
+    support = complete[:, None] & torch.isfinite(force).all(dim=1) & torch.isfinite(force_on_second).all(-1).all(1)
+    force = torch.where(support[:, None, :], force, torch.nan)
+    force_on_second = torch.where(support[:, None, :, None], force_on_second, torch.nan)
+    return dict(pairs=list(addresses.values()), num_substeps=facts["num_substeps"],
+                normal_force_n=force, force_on_second_w_n=force_on_second,
+                peak_normal_force_n=force.amax(dim=1), measurement_support=support)
+
+
 class ControlIntervalContacts:
     """Fixed storage: worlds × configured substeps × actual named pairs.
 

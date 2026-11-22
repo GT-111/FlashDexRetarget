@@ -7,7 +7,7 @@ import math
 import torch
 from mjlab.utils.lab_api.math import quat_apply
 
-from simulator.native.contacts import ControlIntervalContacts
+from simulator.native.contacts import ControlIntervalContacts, object_pair_interval_facts
 
 
 def create_named_contact_view(sim_view, sensors, filters):
@@ -162,6 +162,28 @@ class IsaacHandPartContact:
         return supported
 
 
+class IsaacObjectPairContact:
+    """Accumulate all installed link reports of the second object in a named pair."""
+
+    def __init__(self, address, link_reports):
+        self.address = address
+        self._link_reports = link_reports
+        self.facts = {key: torch.full_like(link_reports[0].facts[key], torch.nan)
+                      for key in ("normal_force_n", "force_on_second_w_n")}
+
+    def discard(self, rows):
+        for value in self.facts.values():
+            value[rows] = torch.nan
+
+    def read(self, dt):
+        support = torch.stack([report.read(dt) for report in self._link_reports]).all(0)
+        for key, output in self.facts.items():
+            summed = torch.stack([report.facts[key] for report in self._link_reports]).sum(0)
+            mask = support if output.ndim == 1 else support[:, None]
+            output.copy_(torch.where(mask, summed, torch.nan))
+        return support
+
+
 class IsaacNativeContactReadback:
     """Carry observed SDK step indices and exact pair samples through the manager."""
 
@@ -171,6 +193,8 @@ class IsaacNativeContactReadback:
         self._pairs = pairs
         self.contact_facts = {name: pair.facts for name, pair in pairs.items()}
         self.addresses = {name: pair.address for name, pair in pairs.items() if "hand_side" in pair.address}
+        self.object_pair_addresses = {name: pair.address for name, pair in pairs.items()
+                                      if "first_entity_name" in pair.address}
         self.contact_support = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self._object_wrenches = object_wrenches or {}
         self._wrench_parts = wrench_parts
@@ -261,6 +285,9 @@ class IsaacNativeContactReadback:
                 for name in self.addresses
             }
         return result
+
+    def object_pair_interval_facts(self):
+        return object_pair_interval_facts(self.interval, self.object_pair_addresses)
 
     def applied_external_body_wrench(self):
         if not self._wrench_parts:

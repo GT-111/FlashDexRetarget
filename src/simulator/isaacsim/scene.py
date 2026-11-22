@@ -31,6 +31,7 @@ from .entity import (
 from .native_contacts import (
     IsaacHandPartContact,
     IsaacNativeContactReadback,
+    IsaacObjectPairContact,
     create_named_contact_view,
 )
 from .sensors import build_tracking_contact_views
@@ -102,12 +103,15 @@ class IsaacSceneAdapter:
     def applied_object_wrench_interval_facts(self):
         return None if self.native_contacts is None else self.native_contacts.applied_wrench_interval_facts()
 
+    def object_pair_contact_interval_facts(self):
+        return None if self.native_contacts is None else self.native_contacts.object_pair_interval_facts()
+
     def support_contact_interval_pairs(self):
         if self.native_contacts is None:
             return {}
         interval = self.native_contacts.interval
-        return {name: interval.pairs[name] for name in self.native_layout.support_pair_bindings
-                if name in interval.pairs}
+        names = (*self.native_layout.support_pair_bindings, *self.native_layout.object_pair_bindings)
+        return {name: interval.pairs[name] for name in names if name in interval.pairs}
 
     def physics_time_s(self):
         """Raw scene-global SDK physics time, repeated over the clone-world axis."""
@@ -906,7 +910,7 @@ def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths)
 
     env_zero = scene.env_prim_paths[0]
     layout = adapter.native_layout
-    pairs, unavailable, unavailable_support = {}, {}, {}
+    pairs, unavailable, unavailable_support, unavailable_objects = {}, {}, {}, {}
     model = mujoco.MjModel.from_xml_path(layout.scene_xml_path)
     tip_sites = cfg.robot.site_names.tip
     finger_roles = cfg.robot.body_names.fingers
@@ -918,8 +922,8 @@ def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths)
             layout.support_pair_bindings, "no installed fixed collider resolved for the authored support",
         ))
 
-    def view_for(obj, part, filter_paths):
-        sensor = body_paths[obj.entity_name][1][part.body_name].removeprefix(env_zero)
+    def view_for(entity, body_name, filter_paths):
+        sensor = body_paths[entity][1][body_name].removeprefix(env_zero)
         sensors = [env + sensor for env in scene.env_prim_paths]
         filters = [[env + path for path in filter_paths] for env in scene.env_prim_paths]
         return create_named_contact_view(sim_ctx.physics_sim_view, sensors, filters)
@@ -932,7 +936,7 @@ def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths)
         digit_groups = {group: [model.body(body).name for body in bodies] for group, bodies in groups.items()}
         for obj, part in layout.part_bindings:
             key = f"{hand.side}/{obj.entity_name}/{part.name}"
-            view, problem = view_for(obj, part, hand_bodies)
+            view, problem = view_for(obj.entity_name, part.body_name, hand_bodies)
             if problem is not None:
                 unavailable[key] = problem
             object_entity = adapter.entities[obj.entity_name]
@@ -945,7 +949,7 @@ def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths)
             )
     if fixed_paths:
         for key, (obj, part) in layout.support_pair_bindings.items():
-            view, problem = view_for(obj, part, fixed_paths)
+            view, problem = view_for(obj.entity_name, part.body_name, fixed_paths)
             if problem is not None:
                 unavailable_support[key] = problem
             object_entity = adapter.entities[obj.entity_name]
@@ -954,6 +958,20 @@ def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths)
                 dict(part_entity_name=obj.entity_name, part_body_name=part.body_name,
                      first_fixed_collider_paths=fixed_paths), adapter.device,
             )
+    for key, (first, second) in layout.object_pair_bindings.items():
+        first_paths = body_paths[first.entity_name][1]
+        filters = [first_paths[name].removeprefix(env_zero)
+                   for name in adapter.entities[first.entity_name].body_names]
+        second_entity = adapter.entities[second.entity_name]
+        links = []
+        for index, name in enumerate(second_entity.body_names):
+            view, problem = view_for(second.entity_name, name, filters)
+            if problem is not None:
+                unavailable_objects[f"{key}/{name}"] = problem
+            links.append(IsaacHandPartContact(view, None, (), second_entity, index, {}, adapter.device))
+        address = dict(first_entity_name=first.entity_name, first_root_body_name=first.root_body_name,
+                       second_entity_name=second.entity_name, second_root_body_name=second.root_body_name)
+        pairs[key] = IsaacObjectPairContact(address, links)
     readback = IsaacNativeContactReadback(
         sim_ctx, adapter.num_envs, adapter.device, float(cfg.sim.dt), int(cfg.decimation), pairs,
         object_wrenches={obj.entity_name: adapter.entities[obj.entity_name].native_object_wrench
@@ -967,6 +985,7 @@ def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths)
     adapter.backend_identity["execution_clock"] = readback.execution_clock()["metadata"]
     adapter.backend_identity["unavailable_hand_part_reports"] = unavailable
     adapter.backend_identity["unavailable_fixed_support_reports"] = unavailable_support
+    adapter.backend_identity["unavailable_object_pair_reports"] = unavailable_objects
 
 
 def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):

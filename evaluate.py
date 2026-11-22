@@ -91,6 +91,8 @@ def _native_evaluation_backend(env):
         missing.append(readers[0])
     if identity.get("unavailable_fixed_support_reports"):
         missing.append("support_contact_interval_pairs")
+    if identity.get("unavailable_object_pair_reports"):
+        missing.append("object_pair_contact_interval_facts")
     return {
         "identity": identity,
         "physics_dt_s": float(env.physics_dt),

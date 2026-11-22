@@ -219,7 +219,10 @@ Fixed support reporters use the installed collider paths in each clone.
 Thumb and finger-group loads sum the same patch reports over installed
 links selected from the named source fingertip branches. This puts
 support, digit loads and the disturbance submission on the same step
-clock. Separate-object contact reports still require a named PhysX reader.
+clock. For a named pair of independent objects, the readers accumulate
+the signed force on every installed link of the second object from the first
+object's links in the same clone. One unavailable link report leaves that
+object-pair sample unknown.
 
 The ordinary native Isaac evaluator checks its installed reporter bindings
 before an HOI qualification. A one-body rigid object uses the PhysX rigid
