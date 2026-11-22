@@ -133,6 +133,15 @@ class MotionLibrary:
             setattr(self, "native_" + field, {
                 side: _concat([reference[field][side] for reference in references], self.device, dtype=dtype)
                 for side in self.native_root_body_names})
+        self.native_root_servo_twist_w = None
+        if any("root_servo_twist_w" in reference for reference in references):
+            self.native_root_servo_twist_w = {
+                side: _concat([
+                    reference["root_servo_twist_w"][side] if "root_servo_twist_w" in reference
+                    else reference["root_state_w"][side][:, 7:13] for reference in references
+                ], self.device, dtype=torch.float32)
+                for side in self.native_root_body_names
+            }
         source_present = ["source_point_position_support" in reference for reference in references]
         if any(source_present):
             if not all(source_present):

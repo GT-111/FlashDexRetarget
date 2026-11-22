@@ -98,6 +98,13 @@ their independent pose/rate support and original prepared clock phase.
 the cadence to the selected physical scene and actual control period. Unknown
 rates remain zero with false support; they are not filled by this entry point.
 
+An optional `native_reference.root_servo_twist_w` maps the installed hand sides
+to finite arrays of shape `(frames, 6)` on the same prepared clock. Each row
+contains WORLD linear velocity in metres per second followed by WORLD angular
+velocity in radians per second. Packing and cropping carry these servo targets
+with their reference rows. Observations and resets use the kinematic
+`root_state_w`.
+
 Supply the original `objects/<id>/visual.obj` files needed by the normal packer.
 Native MJCF mechanics, per-part meshes and static support still come from the
 configured native scene. The existing convex/USD/SDF steps are independently

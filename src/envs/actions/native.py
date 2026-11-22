@@ -786,12 +786,15 @@ class NativeResidualAction(ActionTerm):
         self._entity.set_joint_position_target(self._finger_target, self._finger_ids)
         translation = self._wrist_translation()
         rotation = self._wrist_rotation()
+        servo_twist = getattr(ml, "native_root_servo_twist_w", None)
         for i, hand in enumerate(self.layout.hands):
             if ml.native_root_body_names[hand.side] != hand.root_body_name:
                 raise ValueError(
                     "source native root reference names a different physical body"
                 )
             target = ml.native_root_state_w[hand.side][ids].clone()
+            if servo_twist is not None:
+                target[:, 7:13] = servo_twist[hand.side][ids]
             target[:, :3] += self._env.scene.env_origins
             pose_support = ml.native_root_pose_support[hand.side][ids]
             linear_support = (

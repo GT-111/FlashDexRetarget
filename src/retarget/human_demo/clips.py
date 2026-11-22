@@ -60,7 +60,8 @@ def native_reference(clip: dict) -> dict | None:
     The nested carrier is preserved in the author's trusted NPZ/PT formats.
     Q/Qvel describe named physical scalar joints. Optional named logical
     command targets are authored independently of Q. FREE roots are separate
-    p/WXYZ/world-link-velocity/world-omega states. Unknown rates are zero with
+    p/WXYZ/world-link-velocity/world-omega states. An optional WORLD servo twist
+    supplies the wrist feedforward. Unknown kinematic rates are zero with
     independent false support. ``time_ns`` is the actual prepared query clock,
     retaining its original phase after crop, rather than a capture-time claim.
     """
@@ -129,6 +130,15 @@ def native_reference(clip: dict) -> dict | None:
             raise ValueError("native unknown root rates require zero values and independent false support")
         for field in _NATIVE_ROOT_ARRAYS:
             reference[field][side] = state[field]
+    if "root_servo_twist_w" in reference:
+        values = reference["root_servo_twist_w"]
+        if not isinstance(values, Mapping) or set(values) != set(roots):
+            raise ValueError("native reference root_servo_twist_w must match the installed hand sides")
+        twist = {side: np.asarray(value) for side, value in values.items()}
+        for side, rows in twist.items():
+            if rows.shape != (frames, 6) or rows.dtype.kind not in "fiu" or not np.isfinite(rows).all():
+                raise ValueError(f"native reference root_servo_twist_w for {side} requires finite ({frames}, 6) rows")
+        reference["root_servo_twist_w"] = twist
     source_fields = ("source_point_names", "source_point_position_support")
     if any(field in reference for field in source_fields):
         if not all(field in reference for field in source_fields):
@@ -229,6 +239,8 @@ def crop_native_reference(reference: dict, start: int) -> dict:
             result[field] = reference[field][start:]
     for field in _NATIVE_ROOT_ARRAYS:
         result[field] = {side: value[start:] for side, value in reference[field].items()}
+    if "root_servo_twist_w" in reference:
+        result["root_servo_twist_w"] = {side: value[start:] for side, value in reference["root_servo_twist_w"].items()}
     if "source_point_position_support" in reference:
         result["source_point_position_support"] = {
             side: value[start:] for side, value in reference["source_point_position_support"].items()}

@@ -1118,6 +1118,32 @@ def test_actual_native_action_derives_dimensions_and_records_accepted_supported_
     np.testing.assert_array_equal(record["installed_valid"], [False, True])
 
 
+def test_native_action_installs_servo_twist_with_source_support_and_residual_rotation(tmp_path):
+    _env, action, command, accepted = _native_action_case(tmp_path)
+    ml = command.motion_lib
+    ml.native_root_servo_twist_w = {
+        "left": torch.tensor([[0., 0., 0., 0., 0., 0.], [3., 0., 0., 0., 2., 0.]]),
+        "right": torch.tensor([[1., 2., 3., 1., 2., 3.], [1., 2., 3., 1., 2., 3.]]),
+    }
+    ml.native_root_linear_velocity_support["left"][0] = True
+    ml.native_root_linear_velocity_support["right"][:] = True
+    ml.native_root_angular_velocity_support["right"][0] = False
+    ml.native_root_pose_support["right"][1] = False
+    kinematic = {side: state.clone() for side, state in ml.native_root_state_w.items()}
+    raw = torch.zeros_like(action.raw_action)
+    raw[:, [8, 11]] = 1.
+    action.process_actions(raw)
+    action.apply_actions()
+
+    target = action.installed_control["root_state_w"][:, :, 7:13]
+    expected = torch.tensor([[[0., 0., 0., 0., 0., 0.], [1., 2., 3., 0., 0., 0.]],
+                             [[0., 0., 0., -2., 0., 0.], [0., 0., 0., 0., 0., 0.]]])
+    torch.testing.assert_close(target, expected, atol=1e-6, rtol=0.)
+    for i, side in enumerate(action.hand_sides):
+        torch.testing.assert_close(accepted[i][0][:, 7:13], expected[:, i], atol=1e-6, rtol=0.)
+        torch.testing.assert_close(ml.native_root_state_w[side], kinematic[side])
+
+
 def test_native_logical_residual_expands_to_independently_limited_drives(tmp_path):
     _env, action, _command, _accepted = _native_action_case(tmp_path, fanout=True)
     action.cfg.finger_residual_rad = 1.0

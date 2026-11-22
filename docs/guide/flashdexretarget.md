@@ -529,10 +529,10 @@ durations and full-horizon outcomes retain their separate source/task authority.
 ### Native wrist target twists
 
 `actions.wrist_target_twist` selects the velocity convention for the existing
-WORLD-left wrist correction. The default `source_only` retains supported source
-linear velocity and transports supported source angular velocity by the current
-correction. Pose targets, action filtering, finger commands and root gains are
-unchanged.
+WORLD-left wrist correction. The default `source_only` uses the clip's
+`root_servo_twist_w` when provided and the kinematic root velocities otherwise.
+The action applies the existing independent linear and angular support and
+transports the supported angular component by the current rotation correction.
 
 `filtered_correction_feedforward` also adds the change of the filtered translation
 and the WORLD rotation increment between consecutive filtered corrections, divided

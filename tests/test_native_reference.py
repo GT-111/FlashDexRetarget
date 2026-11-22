@@ -187,6 +187,52 @@ def _pipeline_config(dataset, *, prepared=True):
         return compose(config_name="kinematic_retargeting", overrides=overrides)
 
 
+def test_optional_servo_twist_follows_crop_and_packs_with_legacy_references(tmp_path):
+    from retarget import kinematic_retargeting as pipeline
+
+    dataset, legacy = _prepared_native_dataset(tmp_path)
+    clip = deepcopy(legacy)
+    native = clip["native_reference"]
+    native["root_servo_twist_w"] = {
+        "left": np.zeros((3, 6), np.float32),
+        "right": np.arange(18, dtype=np.float32).reshape(3, 6) / 10,
+    }
+    for state in native["root_state_w"].values():
+        state[:, 10] = 3.
+    C.save_clip(dataset / "native_reference/with-servo.npz", _crop(clip, 1))
+    manifest = dataset / "native-reference.json"
+    declaration = json.loads(manifest.read_text())
+    declaration["clips"].append("with-servo")
+    manifest.write_text(json.dumps(declaration))
+    pipeline.main.__wrapped__(_pipeline_config(dataset))
+
+    path = dataset / "motion.pt"
+    originals = torch.load(path, weights_only=False)["motion_native_reference"]
+    assert "root_servo_twist_w" not in originals[0]
+    library = _reader(path)
+    for side, original in legacy["native_reference"]["root_state_w"].items():
+        np.testing.assert_array_equal(originals[1]["root_servo_twist_w"][side], native["root_servo_twist_w"][side][1:])
+        np.testing.assert_array_equal(library.native_root_state_w[side],
+                                      np.concatenate([original, native["root_state_w"][side][1:]]))
+        np.testing.assert_array_equal(library.native_root_servo_twist_w[side],
+                                      np.concatenate([original[:, 7:13], native["root_servo_twist_w"][side][1:]]))
+
+
+@pytest.mark.parametrize("invalid", ("roster", "shape", "nonfinite"))
+def test_native_reference_checks_declared_servo_twist(invalid):
+    clip = _clip()
+    twist = {side: np.zeros((3, 6)) for side in C.sides(clip)}
+    if invalid == "roster":
+        twist.pop("right")
+    elif invalid == "shape":
+        twist["right"] = np.zeros((3, 13))
+    else:
+        twist["right"][0, 0] = np.nan
+    clip["native_reference"]["root_servo_twist_w"] = twist
+    with pytest.raises(ValueError, match="root_servo_twist_w"):
+        C.native_reference(clip)
+
+
 @pytest.mark.parametrize("fanout", (False, True), ids=("one-to-one", "logical-fanout"))
 def test_prepared_native_entry_packs_selected_stems_and_admits_normal_library_command(tmp_path, fanout):
     from envs.commands.common.motion_library import MotionLibrary
