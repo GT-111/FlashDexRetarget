@@ -681,10 +681,15 @@ The optional guide follows the known source hand role. Existing solved load
 can preserve guidance through the approach pose guard. When a role changes
 or contact is lost, guidance moves at up to `max_speed_m_s` while the installed
 wrist feedforward follows the actual bounded change. With
-`stationary_hold_force_n` enabled, solved load from a fixed support admits
-vertical pressure guidance for a stationary source part. The guide uses
-the last solved hand–part and fixed-support samples from the installed
-scene on Newton, MJWarp and native Isaac. For rigid objects,
+`stationary_hold_force_n` enabled, surface acquisition continues until both
+the assigned hand and fixed support show load on a stationary source part.
+The same vertical travel bound applies throughout a supported approach
+and hold. Pressure control starts from the current approach displacement
+and retains its tangential component. It uses mean hand–part and fixed-support
+forces from the preceding complete solver interval on Newton, MJWarp and
+native Isaac. A shallow contact receives gradual pressure relief as force
+rises. Contacts beyond the depth limit receive the full bounded retreat.
+For rigid objects,
 stationarity is checked over the upcoming prepared samples within the same
 clip. The horizon is the control interval nearest the time it takes the
 guide to cover its configured distance at its speed limit. A later move can

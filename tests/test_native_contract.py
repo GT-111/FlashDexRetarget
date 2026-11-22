@@ -869,13 +869,20 @@ def _native_action_case(
     )
     if support_contacts:
         layout = NativeSceneCfg.from_mapping(mapping)
-        support = {key: {"force_on_second_w_n": torch.tensor([[[0., 0., 0.], [0., 0., 2.]]] * 2)}
+        support = {key: {"force_on_second_w_n": torch.tensor([[[0., 0., 2.], [0., 0., 2.]]] * 2)}
                    for key in layout.support_pair_bindings}
         pairs = {f"{hand.side}/{obj.entity_name}/{part.name}": {
             "normal_force_n": torch.zeros(2), "force_bearing_distance_max_m": torch.full((2,), float("nan")),
         } for hand in layout.hands for obj, part in layout.part_bindings}
         measurement = dict(pairs=pairs, measurement_support=torch.ones(2, dtype=torch.bool))
+        interval = dict(
+            pairs={key: {field: value[:, None].repeat(1, 2) for field, value in pair.items()}
+                   for key, pair in pairs.items()},
+            measurement_support=torch.ones(2, 2, dtype=torch.bool),
+            interval_complete=torch.ones(2, dtype=torch.bool),
+        )
         env.scene.hand_part_contact_facts = lambda: measurement
+        env.scene.hand_part_contact_interval_facts = lambda: interval
         env.scene.support_contact_interval_pairs = lambda: support
         env.scene.gravity_up_w = torch.tensor([0., 0., 1.])
         env.scene.native_object_weights_n = torch.full((len(layout.objects),), 5.)
@@ -982,6 +989,7 @@ def test_loaded_contact_outlives_approach_guard_until_contact_or_role_ends(tmp_p
 def test_native_geometric_acquisition_keeps_pair_feedback_unavailable(tmp_path):
     env, ordinary, command, _ = _native_action_case(tmp_path)
     env.scene.hand_part_contact_facts = lambda: None
+    env.scene.hand_part_contact_interval_facts = lambda: None
     command.source_hand_part_intent = lambda ids: dict(
         active=torch.tensor([[[True, False], [False, False]]]).expand(2, -1, -1),
         known=torch.ones(2, 2, 2, dtype=torch.bool),
@@ -999,7 +1007,7 @@ def test_native_geometric_acquisition_keeps_pair_feedback_unavailable(tmp_path):
     action.apply_actions()
     assert action.installed_control["source_contact_part_index"].tolist() == [[0, -1], [0, -1]]
     assert env.scene.hand_part_contact_facts() is None
-    with pytest.raises(ValueError, match="requires solved hand-part contact feedback"):
+    with pytest.raises(ValueError, match="requires solved hand-part contact intervals"):
         NativeResidualAction(replace(cfg, source_contact_approach=dict(guidance, stationary_hold_force_n=1.)), env)
 
 
@@ -1140,32 +1148,51 @@ def test_stationary_hold_pressure_requires_solved_support_and_retains_wrist_feed
         return torch.tensor([True, False])[:, None].expand(2, part_count)
 
     command.source_stationary_part_rows = stationary_part_rows
-    direction = torch.tensor([1., 0., 0.]).expand(2, 2, 3)
+    direction = torch.tensor([.6, 0., -.8]).expand(2, 2, 3)
     command.approach_dir_and_part = direction, torch.tensor([[0, -1], [0, -1]])
     raw = torch.zeros_like(action.raw_action)
     action.process_actions(raw)
     action.apply_actions()
     first = action.installed_control["root_state_w"][..., :3].clone()
-    torch.testing.assert_close(first[0, 0] - env.scene.env_origins[0], torch.tensor([0., 0., -.0007]))
-    torch.testing.assert_close(first[1, 0] - env.scene.env_origins[1], torch.tensor([.0024, 0., 0.]))
-    assert action._source_hold_offset_m[0, 1] == 0.
-    carry = action.capture_control_context()
-    action.process_actions(raw)
-    action.apply_actions()
-    torch.testing.assert_close(action.installed_control["root_state_w"][0, 0, 7:10], torch.tensor([0., 0., -.035]))
+    torch.testing.assert_close(first[:, 0] - env.scene.env_origins, .0024 * direction[:, 0])
+    assert not action._source_hold_active.any()
 
     obj, part = action.layout.part_bindings[0]
-    facts = env.scene.hand_part_contact_facts()["pairs"][f"left/{obj.entity_name}/{part.name}"]
-    facts["force_bearing_distance_max_m"][0] = .003
+    interval = env.scene.hand_part_contact_interval_facts()
+    facts = interval["pairs"][f"left/{obj.entity_name}/{part.name}"]
+    facts["normal_force_n"][:, 0] = 4.
+    facts["force_bearing_distance_max_m"][:, 0] = .001
+    command.approach_dir_and_part = torch.tensor([0., .6, -.8]).expand(2, 2, 3), command.approach_dir_and_part[1]
     action.process_actions(raw)
-    torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.0007))
-    env.scene.hand_part_contact_facts()["measurement_support"][0] = False
+    action.apply_actions()
+    second = action.installed_control["root_state_w"][..., :3]
+    assert action._source_hold_active.tolist() == [[True, False], [False, False]]
+    torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.00188))
+    torch.testing.assert_close(action.installed_control["root_state_w"][0, 0, 7:10], (second[0, 0] - first[0, 0]) / .02)
+    torch.testing.assert_close(second[0, 0, :2], first[0, 0, :2])
+    carry = action.capture_control_context()
+    facts["force_bearing_distance_max_m"][0, 0] = .003
     action.process_actions(raw)
+    torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.00118))
+    interval["measurement_support"][0, 1] = False
+    action.process_actions(raw)
+    assert not action._source_hold_active.any()
     assert action._source_hold_offset_m[0, 0] == 0.
     assert action._source_contact_translation[0, 0, 0] > 0.
     action.reset()
     action.restore_control_context(carry)
-    torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.0007))
+    assert action._source_hold_active[0, 0]
+    torch.testing.assert_close(action._source_hold_offset_m[0, 0], torch.tensor(.00188))
+
+    action.reset()
+    command.approach_dir_and_part = torch.tensor([0., 0., -1.]).expand(2, 2, 3), command.approach_dir_and_part[1]
+    interval["measurement_support"][:] = True
+    facts["normal_force_n"].zero_()
+    for _ in range(16):
+        action.process_actions(raw)
+    assert not action._source_hold_active.any()
+    torch.testing.assert_close(action._source_contact_translation[:, 0, 2], torch.tensor([-.020, -.024]),
+                               rtol=0., atol=5e-4)
 
 
 def test_source_stationary_parts_follow_each_part_and_its_owning_root():

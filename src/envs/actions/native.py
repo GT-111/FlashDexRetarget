@@ -99,6 +99,7 @@ class NativeActionControlContext:
     source_contact_translation: torch.Tensor
     source_contact_part: torch.Tensor
     source_contact_compression: torch.Tensor
+    source_hold_active: torch.Tensor
     source_hold_offset_m: torch.Tensor
     source_hold_force_n: torch.Tensor
     source_transport_part: torch.Tensor
@@ -253,6 +254,7 @@ class NativeResidualAction(ActionTerm):
             self.num_envs, len(self.finger_command_names), device=self.device)
         self._source_hold_offset_m = torch.zeros(self.num_envs, roots, device=self.device)
         self._source_hold_force_n = torch.zeros_like(self._source_hold_offset_m)
+        self._source_hold_active = torch.zeros_like(self._source_hold_offset_m, dtype=torch.bool)
         self._source_transport_part = torch.full_like(self._source_contact_part, -1)
         self._source_transport_pose = torch.zeros(self.num_envs, roots, 7, device=self.device)
         self._source_transport_pose[..., 3] = 1.
@@ -272,8 +274,8 @@ class NativeResidualAction(ActionTerm):
         self._source_hold_pairs = ()
         self._source_hold_reference_rows = None
         if self._stationary_hold_force_n:
-            if env.scene.hand_part_contact_facts() is None:
-                raise ValueError("native stationary hold requires solved hand-part contact feedback")
+            if env.scene.hand_part_contact_interval_facts() is None:
+                raise ValueError("native stationary hold requires solved hand-part contact intervals")
             support_pairs = env.scene.support_contact_interval_pairs()
             if all(key in support_pairs for key in self.layout.support_pair_bindings):
                 self._source_hold_pairs = tuple(self.layout.support_pair_bindings)
@@ -363,6 +365,8 @@ class NativeResidualAction(ActionTerm):
             self._action_recipe["source_contact_approach"] = {
                 **cfg.source_contact_approach, "max_speed_m_s": self._source_contact_speed_m_s,
             }
+            if self._stationary_hold_force_n:
+                self._action_recipe["stationary_hold_feedback"] = "acquired_load_from_completed_solver_interval"
         self.ref_command_pos_used = None
 
     @property
@@ -529,39 +533,54 @@ class NativeResidualAction(ActionTerm):
         return direction, bearing
 
     def _supported_hold_translation(self, command, part, fallback):
-        """Bound wrist motion using observed hand load on a stationary supported part."""
+        """Keep the contact approach until it has established a supported load."""
         scene = self._env.scene
-        solved = scene.hand_part_contact_facts()
+        solved = scene.hand_part_contact_interval_facts()
         support_pairs = scene.support_contact_interval_pairs()
         index = part.clamp_min(0)
         if self._source_hold_reference_rows is None:
             reach_steps = max(1, round(self._source_contact_scale / (self._source_contact_speed_m_s * self._control_dt)))
             self._source_hold_reference_rows = command.source_stationary_part_rows(reach_steps)
         stationary = (part >= 0) & self._source_hold_reference_rows[command._motion_flat_ids].gather(1, index)
-        support_up = torch.stack([support_pairs[key]["force_on_second_w_n"][:, -1] @ scene.gravity_up_w
+        up = scene.gravity_up_w
+        support_up = torch.stack([support_pairs[key]["force_on_second_w_n"].mean(1) @ up
                                   for key in self._source_hold_pairs], 1).gather(1, index)
         hand_contacts = [[solved["pairs"][f"{hand.side}/{obj.entity_name}/{p.name}"]
                           for obj, p in self.layout.part_bindings] for hand in self.layout.hands]
 
         def selected(field):
-            return torch.stack([torch.stack([pair[field] for pair in hand], dim=1)
-                                for hand in hand_contacts], dim=1).gather(2, index[..., None]).squeeze(-1)
+            by_part = torch.stack([torch.stack([pair[field] for pair in hand], dim=1)
+                                   for hand in hand_contacts], dim=1)
+            address = index[..., None, None].expand(-1, -1, 1, by_part.shape[-1])
+            return by_part.gather(2, address).squeeze(2)
 
-        force = selected("normal_force_n")
-        distance = torch.nan_to_num(selected("force_bearing_distance_max_m"))
-        measured = solved["measurement_support"][:, None] & torch.isfinite(force)
-        self._source_hold_force_n.lerp_(torch.where(measured, force, 0.), .4)
-        supported = measured & (support_up >= .25 * self._source_hold_weights_n[index])
-        stationary &= supported
-        delta = .001 * (self._stationary_hold_force_n - self._source_hold_force_n)
-        delta = torch.where(stationary & (distance <= .0025), delta, -self._source_hold_offset_m)
+        normal = selected("normal_force_n")
+        force = normal.mean(-1)
+        raw_distance = selected("force_bearing_distance_max_m")
+        distance = torch.where(normal > 0., torch.nan_to_num(raw_distance, nan=float("inf")), 0.).amax(-1)
+        measured = solved["interval_complete"] & solved["measurement_support"].all(-1)
+        stationary &= measured[:, None] & torch.isfinite(force) & (support_up >= .25 * self._source_hold_weights_n[index])
+        limit = min(.02, self._source_contact_scale)
+        approach_down = (-fallback @ up - limit).clamp_min(0.)
+        fallback = fallback + (torch.where(stationary, approach_down, 0.)[..., None] * up)
+        capture = stationary & ~self._source_hold_active & (force >= .08) & (distance <= .0025)
+        self._source_hold_active.copy_(stationary & (self._source_hold_active | capture))
+        prior_vertical = self._source_contact_translation @ up
+        prior_offset = (-prior_vertical).clamp(0., limit)
+        self._source_hold_offset_m.copy_(torch.where(capture, prior_offset, self._source_hold_offset_m))
+        self._source_hold_force_n.lerp_(torch.where(self._source_hold_active, force, 0.), .4)
+        self._source_hold_force_n.copy_(torch.where(capture, force, self._source_hold_force_n))
+        error = self._stationary_hold_force_n - self._source_hold_force_n
+        # Relieve normal load gradually so one strong interval cannot undo the acquired approach.
+        delta = torch.where(error >= 0., .001 * error, .00004 * error)
+        delta = torch.where(distance <= .0025, delta, -self._source_hold_offset_m)
         max_step_m = .035 * self._control_dt
-        self._source_hold_offset_m.add_(delta.clamp(-max_step_m, max_step_m)).clamp_(
-            0., min(.02, self._source_contact_scale))
-        self._source_hold_offset_m.masked_fill_(~stationary, 0.)
-        self._source_hold_force_n.masked_fill_(~stationary, 0.)
-        return torch.where(stationary[..., None],
-                           -self._source_hold_offset_m[..., None] * scene.gravity_up_w, fallback)
+        self._source_hold_offset_m.add_(delta.clamp(-max_step_m, max_step_m)).clamp_(0., limit)
+        self._source_hold_offset_m.masked_fill_(~self._source_hold_active, 0.)
+        self._source_hold_force_n.masked_fill_(~self._source_hold_active, 0.)
+        tangent = self._source_contact_translation - prior_vertical[..., None] * up
+        return torch.where(self._source_hold_active[..., None],
+                           tangent - self._source_hold_offset_m[..., None] * up, fallback)
 
     def _rigid_transport_translation(self, command, fallback):
         """Carry the prior solved hand target in a departing rigid part's source frame."""
@@ -697,6 +716,7 @@ class NativeResidualAction(ActionTerm):
             desired = self._source_contact_translation.lerp(direction * self._source_contact_scale, 0.35)
             if self._source_hold_pairs:
                 changed_part = part != self._source_contact_part
+                self._source_hold_active.masked_fill_(changed_part, False)
                 self._source_hold_offset_m.masked_fill_(changed_part, 0.)
                 self._source_hold_force_n.masked_fill_(changed_part, 0.)
                 desired = self._supported_hold_translation(command, part, desired)
@@ -812,6 +832,7 @@ class NativeResidualAction(ActionTerm):
         self._source_contact_translation[rows] = 0.0
         self._source_contact_part[rows] = -1
         self._source_contact_compression[rows] = 0.0
+        self._source_hold_active[rows] = False
         self._source_hold_offset_m[rows] = 0.0
         self._source_hold_force_n[rows] = 0.0
         self._source_transport_part[rows] = -1
