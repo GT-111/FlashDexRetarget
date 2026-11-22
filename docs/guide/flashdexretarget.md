@@ -34,6 +34,10 @@ MOTION=<output_dataset_path>/xhand/motion.pt bash scripts/train_flashdexretarget
 | `--config_name` | profile default | existing run config; use `--profile isaac --config_name native` for the native Isaac task |
 | `envs/robot@robot` | run-config default | actual Hydra robot configuration and its asset bindings |
 
+The stock Isaac command computes object assistance on the control clock and
+holds that wrench through the physics substeps. Native articulated commands
+recompute assistance per solve and retain the actual applied-wrench record.
+
 The run is named `flashdexretarget-<directory>-<profile>` and tagged
 `<directory>`, `<profile>` in wandb, where `<directory>` is the immediate parent
 of `MOTION`;

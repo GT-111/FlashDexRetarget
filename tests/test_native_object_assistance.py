@@ -431,6 +431,8 @@ def test_shared_pd_keeps_stock_omega_and_configured_world_mass_behavior():
     command.cfg.object.xfrc.omega_rot = 2.0
     command.cfg.object.xfrc.zeta_rot = 1.0
     command.apply_substep()
+    assert not writes
+    command._apply_object_assist()
     assert len(writes) == 1  # Both hand roles address one real object entity.
     force, torque = writes[-1][:2]
     torch.testing.assert_close(force[:, 0, 0], torch.tensor([7., 7.]))

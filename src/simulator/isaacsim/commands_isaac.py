@@ -37,6 +37,11 @@ class IsaacMotionTrackingCommand(MotionTrackingCommand):
         self._slot_motion_table = table
         self._slot_motion_count = counts
 
+    def apply_substep(self) -> None:
+        """Hold the stock control-clock assist target between control steps."""
+        if self.has_objects and not self.cfg.object.pin_objects:
+            self.clear_object_wrenches()
+
     def clear_object_wrenches(self, env_ids=None):
         names = {name for side in self._side_list for name in self.obj_entity_names(side)}
         count = self.num_envs if env_ids is None else len(env_ids)
