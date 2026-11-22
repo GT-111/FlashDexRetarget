@@ -878,16 +878,16 @@ def _native_rigid_body_paths(scene, asset):
 
 
 def _native_fixed_support_paths(scene):
-    from pxr import UsdPhysics
+    from pxr import Usd, UsdPhysics
 
     root = f"{scene.env_prim_paths[0]}/NativeStatic"
-    colliders = sim_utils.get_all_matching_child_prims(
-        root, predicate=lambda prim: prim.HasAPI(UsdPhysics.CollisionAPI)
-        and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get(),
-        stage=scene.stage,
-    )
     paths = set()
-    for collider in colliders:
+    prim = scene.stage.GetPrimAtPath(root)
+    # The native importer may keep the collision shape behind a reference instance.
+    for collider in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
+        if (not collider.HasAPI(UsdPhysics.CollisionAPI)
+                or not UsdPhysics.CollisionAPI(collider).GetCollisionEnabledAttr().Get()):
+            continue
         actor = collider
         while str(actor.GetPath()).startswith(root + "/") and not actor.HasAPI(UsdPhysics.RigidBodyAPI):
             actor = actor.GetParent()
@@ -907,6 +907,12 @@ def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths)
     tip_sites = cfg.robot.site_names.tip
     finger_roles = cfg.robot.body_names.fingers
     fixed_paths = tuple(path.removeprefix(env_zero) for path in _native_fixed_support_paths(scene))
+    expected_fixed = ((model.body_weldid[model.geom_bodyid] == 0)
+                      & ((model.geom_contype | model.geom_conaffinity) != 0)).any()
+    if expected_fixed and not fixed_paths:
+        unavailable_support.update(dict.fromkeys(
+            layout.support_pair_bindings, "no installed fixed collider resolved for the authored support",
+        ))
 
     def view_for(obj, part, filter_paths):
         sensor = body_paths[obj.entity_name][1][part.body_name].removeprefix(env_zero)
