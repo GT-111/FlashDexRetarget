@@ -448,7 +448,8 @@ def test_isaac_named_pair_solve_uses_the_sdk_clock_and_discards_only_reset_world
         body_link_ang_vel_w=torch.zeros(2, 2, 3)))
     address = dict(hand_side="left", hand_body_name="wrist", part_entity_name="assembly", part_body_name="part")
     view = _SdkContactView()
-    pair = IsaacHandPartContact(view, hand, [0, 1], parts, 0, address, "cpu")
+    pair = IsaacHandPartContact(view, hand, [0, 1], parts, 0, address, "cpu",
+                                digit_groups={"thumb": ["pad_a"], "fingers": ["pad_b"]})
     ctx = SimpleNamespace(current_time_step_index=7, current_time=.035, get_physics_dt=lambda: .005)
 
     def solve(*, render):
@@ -471,6 +472,9 @@ def test_isaac_named_pair_solve_uses_the_sdk_clock_and_discards_only_reset_world
     assert scene.physics_execution_clock()["steps"].tolist() == [9, 9]
     pair = facts["pairs"]["left/assembly/part"]
     assert pair["normal_force_n"].tolist() == [[5., 5.], [0., 0.]]
+    groups = facts["digit_groups"]["left/assembly/part"]
+    assert groups["thumb"]["normal_force_n"].tolist() == [[3., 3.], [0., 0.]]
+    assert groups["fingers"]["normal_force_n"].tolist() == [[2., 2.], [0., 0.]]
     torch.testing.assert_close(pair["force_on_second_w_n"][0, 0], torch.tensor([1., 0., 5. * normal_sign]))
     torch.testing.assert_close(pair["moment_on_second_about_root_w_nm"][0, 0], torch.tensor([8. * normal_sign, 0., -1.]))
     torch.testing.assert_close(pair["joint_effort_on_second"][0, 0], torch.full((2,), 5. * normal_sign))
@@ -506,6 +510,59 @@ def test_isaac_named_pair_filter_order_must_resolve_in_the_matching_clone():
     assert create_named_contact_view(SDK, sensors, filters) == (view, None)
     view.filter_paths = [filters[1], filters[0]]
     assert create_named_contact_view(SDK, sensors, filters)[0] is None
+
+
+def test_isaac_external_wrench_records_actual_named_sdk_payload_on_accepted_steps():
+    from simulator.isaacsim.entity import IsaacObjectWrench
+    from simulator.isaacsim.native_contacts import IsaacNativeContactReadback
+
+    centers = torch.tensor([[[.4, 0., 0.], [0., .2, 0.]]] * 2)
+    entity = SimpleNamespace(data=SimpleNamespace(
+        body_link_pos_w=torch.zeros(2, 2, 3),
+        body_link_quat_w=torch.tensor([[[1., 0., 0., 0.]] * 2] * 2)),
+        body_inertial_properties=lambda: SimpleNamespace(com_position_body_m=centers))
+    calls = []
+    view = SimpleNamespace(
+        apply_forces_and_torques_at_position=lambda *args: calls.append(
+            tuple(x.clone() if isinstance(x, torch.Tensor) else x for x in args)
+        ),
+    )
+    force = torch.tensor([[[1., 0., 0.], [2., 0., 0.]], [[3., 0., 0.], [4., 0., 0.]]])
+    torque = force * .1
+    port = IsaacObjectWrench(view, entity, torch.tensor([1, 0]), force, torque)
+    context = SimpleNamespace(current_time_step_index=7, current_time=.035, get_physics_dt=lambda: .005)
+
+    def step(*, render):
+        context.current_time += .005
+        context.current_time_step_index += 1
+
+    context.step = step
+    bank = IsaacNativeContactReadback(
+        context, 2, "cpu", .005, 2, {}, object_wrenches={"fixture": port},
+        wrench_parts=(("fixture", "mover", 1),),
+    )
+    sim = IsaacSimAdapter(context, "cpu")
+    sim._clock = SimpleNamespace(bump=lambda: None)
+    sim.native_contacts = bank
+    assert not bank.applied_wrench_interval_facts()["measurement_support"].any()
+    _advance_control(sim, 2)
+    assert len(calls) == 2
+    sent_force, sent_torque, points, ids, world = calls[-1]
+    torch.testing.assert_close(sent_force.reshape_as(force), force.flip(1))
+    torch.testing.assert_close(sent_torque.reshape_as(torque), torque.flip(1))
+    torch.testing.assert_close(points.reshape_as(centers), centers.flip(1))
+    assert ids.tolist() == [0, 1] and world is True
+    recorded = bank.applied_wrench_interval_facts()
+    torch.testing.assert_close(recorded["peak_force_n"], torch.tensor([[2.], [4.]]))
+    torch.testing.assert_close(recorded["peak_torque_nm"], torch.tensor([[.2], [.4]]))
+    assert recorded["measurement_support"].tolist() == [True, True]
+    sim.reset(torch.tensor([0]))
+    assert bank.applied_wrench_interval_facts()["measurement_support"].tolist() == [False, True]
+    context.step = lambda render: None
+    _advance_control(sim, 2)
+    recorded = bank.applied_wrench_interval_facts()
+    assert not recorded["measurement_support"].any()
+    assert not recorded["substep_wrench_w"].any()
 
 
 def test_recorder_retains_substep_tape_reset_unknown_and_original_phase(tmp_path):

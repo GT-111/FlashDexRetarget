@@ -207,12 +207,19 @@ the SDK's measured link COM velocities. The result covers the normal and
 friction forces reported at patch points.
 [PhysX articulation Jacobian](https://nvidia-omniverse.github.io/PhysX/physx/5.6.1/docs/Articulations.html#jacobian)
 
-The public SDK accepts external wrench submissions. An isolated free-body
-pulse can be checked against measured changes in momentum. Production
-qualification requires an exact applied object-wrench reader in the presence
-of contact and passive constraints. Fixed and independent-object support
-pairs and digit opposition still need their own installed PhysX bindings.
-The native Isaac reporter currently serves engineering runs.
+Native object disturbances use the public PhysX tensor submission directly.
+The submission supplies the installed body order, WORLD force in N and
+torque in N·m, and the explicit WORLD location of each live link COM. The
+recorder retains the exact issued tensors on an accepted SDK physics
+substep. Reset, an incomplete interval, and a failed solve have separate
+support masks. An isolated free-body pulse checks the realized response
+against measured linear and angular momentum changes.
+
+Fixed support reporters use the installed collider paths in each clone.
+Thumb and finger-group loads sum the same patch reports over installed
+links selected from the named source fingertip branches. This puts
+support, digit loads and the disturbance submission on the same step
+clock. Separate-object contact reports still require a named PhysX reader.
 
 Stock USD collision overrides are installed after the scene owner makes nested
 references editable, before material binding and the first physics reset.

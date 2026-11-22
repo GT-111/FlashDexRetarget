@@ -234,6 +234,31 @@ class ArticulationAdapter(NamedArticulationView):
         )
 
 
+class IsaacObjectWrench:
+    """Submit native object wrenches at the actual WORLD body COMs."""
+
+    def __init__(self, view, entity, body_ids, force, torque):
+        self._view, self._entity = view, entity
+        self._body_ids = body_ids
+        self._sdk_order = torch.argsort(body_ids)
+        self._world_ids = torch.arange(len(force), dtype=torch.int32, device=force.device)
+        self.force, self.torque = force, torque
+
+    @torch.no_grad()
+    def submit(self):
+        data = self._entity.data
+        local_com = self._entity.body_inertial_properties().com_position_body_m
+        center = data.body_link_pos_w + quat_apply(data.body_link_quat_w, local_com)
+        force = self.force.index_select(1, self._sdk_order)
+        torque = self.torque.index_select(1, self._sdk_order)
+        position = center.index_select(1, self._sdk_order)
+        self._view.apply_forces_and_torques_at_position(
+            force.flatten(0, 1), torque.flatten(0, 1), position.flatten(0, 1),
+            self._world_ids, True,
+        )
+        return torch.cat((force, torque), -1).index_select(1, self._body_ids)
+
+
 class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
     """One actual floating articulation; scalar joints remain named DOFs.
 
@@ -243,7 +268,7 @@ class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
 
     is_fixed_base = False
 
-    def __init__(self, articulation, meta, clock, device, *, root_body_name):
+    def __init__(self, articulation, meta, clock, device, *, root_body_name, native_object=False):
         super().__init__(articulation, meta, clock, device)
         if articulation.is_fixed_base:
             raise ValueError(f"native articulation {root_body_name!r} has a fixed base")
@@ -260,8 +285,14 @@ class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
         self._default_joint_pos[:] = torch.as_tensor(
             meta.joint_default, dtype=torch.float32, device=device
         )
-        self._external_force_w = torch.zeros(b, len(self.body_names), 3, device=device)
+        self._external_force_w = torch.zeros(b, len(self.body_names), 3, device=device, dtype=torch.float32)
         self._external_torque_w = torch.zeros_like(self._external_force_w)
+        self.native_object_wrench = None
+        if native_object:
+            self.native_object_wrench = IsaacObjectWrench(
+                articulation.root_physx_view, self, self._isaac_body_ids,
+                self._external_force_w, self._external_torque_w,
+            )
 
     def write_root_state_to_sim(self, root_state, env_ids=None) -> None:
         self._art.write_root_link_state_to_sim(root_state, env_ids=env_ids)
@@ -292,6 +323,8 @@ class FreeArticulationAdapter(FloatingRootView, ArticulationAdapter):
         return self._cache.get("body_com_scalar_jacobians", fetch)
 
     def _submit_external_wrenches(self):
+        if self.native_object_wrench is not None:
+            return  # The native step owns the direct object submission.
         # Lab derives has_external_wrench from the submitted slice. Submit the
         # complete request so clearing one world cannot disable the others.
         self._art.set_external_force_and_torque(
@@ -382,6 +415,7 @@ class RigidObjectAdapter:
         default_root_state: torch.Tensor,
         *,
         body_name: str,
+        native_object: bool = False,
     ) -> None:
         self._obj = obj
         self._clock = clock
@@ -399,6 +433,13 @@ class RigidObjectAdapter:
         )
         self._com_local = self._body_properties.com_position_body_m[:, 0]
         self.data = RigidObjectData(self)
+        self.native_object_wrench = None
+        if native_object:
+            force = self._com_local.new_zeros(obj.num_instances, 1, 3)
+            self.native_object_wrench = IsaacObjectWrench(
+                view, self, torch.zeros(1, dtype=torch.long, device=device),
+                force, torch.zeros_like(force),
+            )
         # world-frame external wrench support probe (isaaclab >= is_global)
         sig = inspect.signature(obj.set_external_force_and_torque)
         self._has_is_global = "is_global" in sig.parameters
@@ -455,6 +496,11 @@ class RigidObjectAdapter:
             raise ValueError("a rigid object wrench selects its sole named body")
         f = forces.reshape(-1, 1, 3)
         t = torques.reshape(-1, 1, 3)
+        if self.native_object_wrench is not None:
+            rows = slice(None) if env_ids is None else env_ids
+            self.native_object_wrench.force[rows] = f.detach()
+            self.native_object_wrench.torque[rows] = t.detach()
+            return
         # Apply at the COM (mujoco xfrc parity); FDR_PIN_AT_COM=0
         # reverts to the default application point for A/B probing.
         import os as _os
@@ -488,6 +534,8 @@ class RigidObjectAdapter:
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
         self._obj.reset(env_ids=env_ids)
+        if self.native_object_wrench is not None:
+            self.clear_external_wrenches(env_ids)
 
     def clear_external_wrenches(self, env_ids=None):
         count = self._obj.num_instances if env_ids is None else len(env_ids)

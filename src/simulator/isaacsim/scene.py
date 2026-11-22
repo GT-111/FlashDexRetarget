@@ -18,6 +18,7 @@ from isaaclab.sensors import ContactSensor, ContactSensorCfg
 from envs.scene._object_setup import object_park_position
 from envs.scene.native import NativeSceneCfg
 from simulator.mjcf_meta import RobotMjcfMeta
+from simulator.native.contacts import digit_body_groups
 from simulator.native.entity import NativeRobotAdapter, _FreshnessClock
 
 from .assets import IsaacRobotAsset, resolve_robot_asset
@@ -98,9 +99,15 @@ class IsaacSceneAdapter:
     def hand_part_contact_interval_facts(self):
         return None if self.native_contacts is None else self.native_contacts.interval_facts()
 
+    def applied_object_wrench_interval_facts(self):
+        return None if self.native_contacts is None else self.native_contacts.applied_wrench_interval_facts()
+
     def support_contact_interval_pairs(self):
-        # TODO(Isaac HOI): bind exact fixed support and independent object reporters.
-        return {}
+        if self.native_contacts is None:
+            return {}
+        interval = self.native_contacts.interval
+        return {name: interval.pairs[name] for name in self.native_layout.support_pair_bindings
+                if name in interval.pairs}
 
     def physics_time_s(self):
         """Raw scene-global SDK physics time, repeated over the clone-world axis."""
@@ -870,20 +877,52 @@ def _native_rigid_body_paths(scene, asset):
     }
 
 
+def _native_fixed_support_paths(scene):
+    from pxr import UsdPhysics
+
+    root = f"{scene.env_prim_paths[0]}/NativeStatic"
+    colliders = sim_utils.get_all_matching_child_prims(
+        root, predicate=lambda prim: prim.HasAPI(UsdPhysics.CollisionAPI)
+        and UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get(),
+        stage=scene.stage,
+    )
+    paths = set()
+    for collider in colliders:
+        actor = collider
+        while str(actor.GetPath()).startswith(root + "/") and not actor.HasAPI(UsdPhysics.RigidBodyAPI):
+            actor = actor.GetParent()
+        if not actor.HasAPI(UsdPhysics.RigidBodyAPI):
+            actor = collider
+        paths.add(str(actor.GetPath()))
+    return sorted(paths)
+
+
 def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths):
+    import mujoco
+
     env_zero = scene.env_prim_paths[0]
     layout = adapter.native_layout
-    pairs, unavailable = {}, {}
+    pairs, unavailable, unavailable_support = {}, {}, {}
+    model = mujoco.MjModel.from_xml_path(layout.scene_xml_path)
+    tip_sites = cfg.robot.site_names.tip
+    finger_roles = cfg.robot.body_names.fingers
+    fixed_paths = tuple(path.removeprefix(env_zero) for path in _native_fixed_support_paths(scene))
+
+    def view_for(obj, part, filter_paths):
+        sensor = body_paths[obj.entity_name][1][part.body_name].removeprefix(env_zero)
+        sensors = [env + sensor for env in scene.env_prim_paths]
+        filters = [[env + path for path in filter_paths] for env in scene.env_prim_paths]
+        return create_named_contact_view(sim_ctx.physics_sim_view, sensors, filters)
+
     for hand in layout.hands:
         hand_entity = adapter.entities[hand.entity_name]
         hand_paths = body_paths[hand.entity_name][1]
         hand_bodies = [hand_paths[name].removeprefix(env_zero) for name in hand_entity.body_names]
-        filters = [[env + path for path in hand_bodies] for env in scene.env_prim_paths]
+        groups = digit_body_groups(model, hand.root_body_name, tip_sites[hand.side], finger_roles)
+        digit_groups = {group: [model.body(body).name for body in bodies] for group, bodies in groups.items()}
         for obj, part in layout.part_bindings:
             key = f"{hand.side}/{obj.entity_name}/{part.name}"
-            part_path = body_paths[obj.entity_name][1][part.body_name].removeprefix(env_zero)
-            sensors = [env + part_path for env in scene.env_prim_paths]
-            view, problem = create_named_contact_view(sim_ctx.physics_sim_view, sensors, filters)
+            view, problem = view_for(obj, part, hand_bodies)
             if problem is not None:
                 unavailable[key] = problem
             object_entity = adapter.entities[obj.entity_name]
@@ -892,13 +931,32 @@ def _bind_native_contact_readback(cfg, scene, sim_ctx, adapter, sim, body_paths)
                 object_entity.body_names.index(part.body_name),
                 dict(hand_side=hand.side, hand_body_name=hand.root_body_name,
                      part_entity_name=obj.entity_name, part_body_name=part.body_name), adapter.device,
+                digit_groups=digit_groups,
+            )
+    if fixed_paths:
+        for key, (obj, part) in layout.support_pair_bindings.items():
+            view, problem = view_for(obj, part, fixed_paths)
+            if problem is not None:
+                unavailable_support[key] = problem
+            object_entity = adapter.entities[obj.entity_name]
+            pairs[key] = IsaacHandPartContact(
+                view, None, (), object_entity, object_entity.body_names.index(part.body_name),
+                dict(part_entity_name=obj.entity_name, part_body_name=part.body_name,
+                     first_fixed_collider_paths=fixed_paths), adapter.device,
             )
     readback = IsaacNativeContactReadback(
         sim_ctx, adapter.num_envs, adapter.device, float(cfg.sim.dt), int(cfg.decimation), pairs,
+        object_wrenches={obj.entity_name: adapter.entities[obj.entity_name].native_object_wrench
+                         for obj in layout.objects},
+        wrench_parts=tuple(
+            (obj.entity_name, part.body_name, adapter.entities[obj.entity_name].body_names.index(part.body_name))
+            for obj, part in layout.part_bindings
+        ),
     )
     adapter.native_contacts = sim.native_contacts = readback
     adapter.backend_identity["execution_clock"] = readback.execution_clock()["metadata"]
     adapter.backend_identity["unavailable_hand_part_reports"] = unavailable
+    adapter.backend_identity["unavailable_fixed_support_reports"] = unavailable_support
 
 
 def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
@@ -985,7 +1043,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
             default = torch.zeros(asset.num_instances, 13, device=device)
             default[:, :7] = torch.as_tensor(meta.free_roots[0].default_pose, device=device)
             ent = RigidObjectAdapter(
-                asset, clock, device, default, body_name=binding.root_body_name,
+                asset, clock, device, default, body_name=binding.root_body_name, native_object=True,
             )
             adapter.entities[binding.entity_name] = ent
             continue
@@ -995,6 +1053,7 @@ def _build_native_isaac_scene(cfg, sim_ctx, device, scene_meta):
             clock,
             device,
             root_body_name=binding.root_body_name,
+            native_object=binding in layout.objects,
         )
         _install_native_joint_properties(
             asset, meta, ent._isaac_joint_ids.tolist(), device,

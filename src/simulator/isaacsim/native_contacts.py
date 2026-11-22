@@ -47,12 +47,13 @@ def _point_velocity(data, rows, bodies, point):
 
 
 class IsaacHandPartContact:
-    """One object-side reporter against the actual installed links of one hand."""
+    """One object-side reporter against named links or fixed colliders."""
 
-    def __init__(self, view, hand, hand_body_ids, obj, body_id, address, device):
+    def __init__(self, view, hand, hand_body_ids, obj, body_id, address, device, *, digit_groups=None):
         self.view, self.hand, self.obj, self.body_id = view, hand, obj, body_id
         self.address = address
         self._hand_body_ids = torch.as_tensor(hand_body_ids, dtype=torch.long, device=device)
+        self.digit_groups = digit_groups or {}
         self._body_properties = obj.body_inertial_properties()
         sample = self._body_properties.mass_kg[:, 0]
         number = sample.new_full(sample.shape, torch.nan)
@@ -67,6 +68,12 @@ class IsaacHandPartContact:
         }
         if len(obj.joint_names):
             self.facts["joint_effort_on_second"] = sample.new_full((len(sample), len(obj.joint_names)), torch.nan)
+        if self.digit_groups:
+            self._digit_membership = torch.tensor(
+                [[hand.body_names[int(body)] in names for names in self.digit_groups.values()]
+                 for body in hand_body_ids], dtype=torch.bool, device=device,
+            )
+            self.facts["digit_group_force_n"] = sample.new_full((len(sample), len(self.digit_groups)), torch.nan)
         if view is not None:
             self._slots = torch.arange(view.max_contact_data_count, device=device)
 
@@ -99,9 +106,9 @@ class IsaacHandPartContact:
         com = data.body_link_pos_w + quat_apply(data.body_link_quat_w, props.com_position_body_m)
         center = (com * props.mass_kg[..., None]).sum(1) / props.mass_kg.sum(1, keepdim=True)
         moment = torch.linalg.cross(point - center[rows], force)
-        relative = _point_velocity(data, rows, self.body_id, point) - _point_velocity(
-            self.hand.data, rows, self._hand_body_ids[columns], point,
-        )
+        relative = _point_velocity(data, rows, self.body_id, point)
+        if self.hand is not None:
+            relative = relative - _point_velocity(self.hand.data, rows, self._hand_body_ids[columns], point)
         slip = (relative - (relative * normal).sum(-1, keepdim=True) * normal).norm(dim=-1)
 
         def sum_vector(values, patch_rows, mask):
@@ -140,6 +147,12 @@ class IsaacHandPartContact:
         for name, (value, valid) in actual.items():
             self.facts[name].copy_(torch.where(valid, value, torch.nan))
         self.facts["force_bearing_contact_present"].copy_(present)
+        if self.digit_groups:
+            digit_force = coefficient.abs()[:, None] * self._digit_membership[columns]
+            digit_force = digit_force.new_zeros(len(load), len(self.digit_groups)).scatter_add_(
+                0, rows[:, None].expand_as(digit_force), digit_force,
+            )
+            self.facts["digit_group_force_n"].copy_(torch.where(supported[:, None], digit_force, torch.nan))
         if (effort := self.facts.get("joint_effort_on_second")) is not None:
             jacobian = self.obj.body_com_scalar_jacobians()[:, self.body_id]
             moment_at_part = moment_on_part + torch.linalg.cross(center - com[:, self.body_id], force_on_part)
@@ -152,12 +165,17 @@ class IsaacHandPartContact:
 class IsaacNativeContactReadback:
     """Carry observed SDK step indices and exact pair samples through the manager."""
 
-    def __init__(self, context, num_envs, device, timestep_s, num_substeps, pairs):
+    def __init__(self, context, num_envs, device, timestep_s, num_substeps, pairs, *,
+                 object_wrenches=None, wrench_parts=()):
         self.context, self.num_envs, self.device = context, num_envs, device
         self._pairs = pairs
         self.contact_facts = {name: pair.facts for name, pair in pairs.items()}
-        self.addresses = {name: pair.address for name, pair in pairs.items()}
+        self.addresses = {name: pair.address for name, pair in pairs.items() if "hand_side" in pair.address}
         self.contact_support = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self._object_wrenches = object_wrenches or {}
+        self._wrench_parts = wrench_parts
+        self._wrench = torch.zeros(num_envs, len(wrench_parts), 6, dtype=torch.float32, device=device)
+        self._wrench_supported = torch.zeros_like(self.contact_support)
         self.contact_sample_time_s = torch.full((num_envs,), torch.nan, dtype=torch.float64, device=device)
         self.contact_sample_execution_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
         self._steps = self.contact_sample_execution_step.clone()
@@ -186,6 +204,8 @@ class IsaacNativeContactReadback:
         self.contact_sample_time_s[rows] = torch.nan
         self.contact_sample_execution_step[rows] = -1
         self.contact_support[rows] = False
+        self._wrench[rows] = 0
+        self._wrench_supported[rows] = False
         for pair in self._pairs.values():
             pair.discard(rows)
 
@@ -197,6 +217,12 @@ class IsaacNativeContactReadback:
         self.interval.before_substep()
         self._begin = self.context.current_time
         self._begin_step = self.context.current_time_step_index
+        self._wrench_supported.zero_()
+        if self._wrench_parts:
+            committed = {name: port.submit() for name, port in self._object_wrenches.items()}
+            for column, (entity, _, body_id) in enumerate(self._wrench_parts):
+                self._wrench[:, column].copy_(committed[entity][:, body_id])
+            self._wrench_supported.fill_(True)
 
     def after_substep(self):
         dt = self.context.current_time - self._begin
@@ -206,15 +232,17 @@ class IsaacNativeContactReadback:
             self.contact_sample_time_s.fill_(self._begin)
             self.contact_sample_execution_step.fill_(self._begin_step)
             self.contact_support.fill_(True)
-            for pair in self._pairs.values():
-                self.contact_support &= pair.read(dt)
+            for name, pair in self._pairs.items():
+                supported = pair.read(dt)
+                if name in self.addresses:
+                    self.contact_support &= supported
         else:
             self._discard_sample(slice(None))
         self.interval.append(self)
 
     def facts(self):
         return {
-            "pairs": self.contact_facts, "addresses": self.addresses,
+            "pairs": {name: self.contact_facts[name] for name in self.addresses}, "addresses": self.addresses,
             "measurement_support": self.contact_support, "sample_time_s": self.contact_sample_time_s,
             "clock": "Isaac Sim physics-step callback time at the measured substep begin",
             "normal_force_authority": "actual_solver_body_pair_positive_normal_force",
@@ -225,4 +253,29 @@ class IsaacNativeContactReadback:
         result = self.interval.facts()
         facts = self.facts()
         result.update({key: facts[key] for key in ("addresses", "normal_force_authority", "distance_authority")})
+        result["pairs"] = {name: self.interval.pairs[name] for name in self.addresses}
+        if self.addresses and all(self._pairs[name].digit_groups for name in self.addresses):
+            result["digit_groups"] = {
+                name: {group: dict(body_names=names, normal_force_n=self.interval.pairs[name]["digit_group_force_n"][..., i])
+                       for i, (group, names) in enumerate(self._pairs[name].digit_groups.items())}
+                for name in self.addresses
+            }
         return result
+
+    def applied_external_body_wrench(self):
+        if not self._wrench_parts:
+            return None
+        return dict(wrench_w=self._wrench, support=self._wrench_supported,
+                    authority="accepted_physx_apply_WORLD_body_COM_wrench")
+
+    def applied_wrench_interval_facts(self):
+        readback = self.interval.applied_wrench_facts()
+        if readback is None:
+            return None
+        return {
+            **readback,
+            "entity_names": tuple(entity for entity, _, _ in self._wrench_parts),
+            "part_body_names": tuple(body for _, body, _ in self._wrench_parts),
+            "peak_force_n": readback["peaks"][..., 0],
+            "peak_torque_nm": readback["peaks"][..., 1],
+        }

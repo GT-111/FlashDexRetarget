@@ -32,7 +32,7 @@ from simulator.runtime import launch_runtime
 
 
 def test_native_digit_contact_groups_follow_installed_tip_branches():
-    from simulator.native.create import _digit_body_groups
+    from simulator.native.contacts import digit_body_groups
 
     model = mujoco.MjModel.from_xml_string("""
         <mujoco><worldbody><body name="root"><body name="palm">
@@ -46,7 +46,7 @@ def test_native_digit_contact_groups_follow_installed_tip_branches():
           </body>
         </body></body></worldbody></mujoco>
     """)
-    groups = _digit_body_groups(model, "root", ("far_tip", "near_tip"), ("index", "thumb"))
+    groups = digit_body_groups(model, "root", ("far_tip", "near_tip"), ("index", "thumb"))
     assert {group: [model.body(i).name for i in ids] for group, ids in groups.items()} == {
         "thumb": ["branch_a", "a_pad"], "fingers": ["branch_b", "b_link"],
     }

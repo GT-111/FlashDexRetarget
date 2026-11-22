@@ -86,8 +86,13 @@ def _native_evaluation_backend(env):
     readers = ("hand_part_contact_interval_facts", "applied_object_wrench_interval_facts",
                "physics_execution_clock")
     missing = [name for name in readers if (read := getattr(scene, name, None)) is None or read() is None]
+    identity = dict(scene.backend_identity)
+    if identity.get("unavailable_hand_part_reports") and readers[0] not in missing:
+        missing.append(readers[0])
+    if identity.get("unavailable_fixed_support_reports"):
+        missing.append("support_contact_interval_pairs")
     return {
-        "identity": dict(scene.backend_identity),
+        "identity": identity,
         "physics_dt_s": float(env.physics_dt),
         "control_dt_s": float(env.step_dt),
         "qualification_evidence_available": not missing,

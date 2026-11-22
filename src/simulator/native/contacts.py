@@ -5,6 +5,33 @@ from __future__ import annotations
 import torch
 
 
+def digit_body_groups(model, hand_root, tip_sites, finger_roles):
+    """Assign only bodies below anatomically unique, physically installed tip paths."""
+    if len(tip_sites) != len(finger_roles) or "thumb" not in finger_roles or len(tip_sites) < 2:
+        return {}
+    root = model.body(hand_root).id
+    paths = {"thumb": set(), "fingers": set()}
+    for tip, role in zip(tip_sites, finger_roles, strict=True):
+        current = int(model.site_bodyid[model.site(tip).id])
+        path = paths["thumb" if role == "thumb" else "fingers"]
+        while current != root:
+            if current == 0:
+                raise ValueError("native digit tip is outside its declared physical hand")
+            path.add(current)
+            current = int(model.body_parentid[current])
+    shared = paths["thumb"] & paths["fingers"]
+    groups = {name: branch - shared for name, branch in paths.items()}
+    if not all(groups.values()):
+        return {}
+    # Include pad/collider descendants that live on a child body of a digit link.
+    for body in range(1, model.nbody):
+        parent = int(model.body_parentid[body])
+        for group in groups.values():
+            if parent in group:
+                group.add(body)
+    return {group: sorted(members) for group, members in groups.items()}
+
+
 class ControlIntervalContacts:
     """Fixed storage: worlds × configured substeps × actual named pairs.
 
