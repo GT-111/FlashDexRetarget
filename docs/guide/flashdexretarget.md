@@ -748,7 +748,8 @@ identifies the active carrier per hand in the named part order. Select a
 fresh fit and freeze a new FULL policy when enabling this controller.
 
 `actions.source_contact_approach.idle_support_clearance_m` enables upward
-wrist clearance over installed horizontal support planes. The guide requires
+wrist clearance over installed horizontal planes and box supports. A box
+requires overlap with its finite footprint. The guide requires
 known inactive source roles and solved evidence that the hand carries no
 object load. It projects bounds of the actual hand's collision geometry into
 the requested wrist pose using achieved finger configuration. The wrist rate

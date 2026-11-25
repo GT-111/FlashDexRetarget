@@ -1375,11 +1375,12 @@ def test_native_rigid_transport_preserves_a_solved_grasp_across_dwell_to_motion(
     assert action.installed_control["source_transport_part_index"][0, 0] == 0
 
 
-def test_idle_plane_clearance_keeps_a_declared_support_hand_in_place(tmp_path):
+@pytest.mark.parametrize("support_kind", ("plane", "box"))
+def test_idle_support_clearance_keeps_a_declared_support_hand_in_place(tmp_path, support_kind):
     env, action, command, _ = _native_action_case(
         tmp_path, wrist_target_twist="filtered_correction_feedforward",
         source_contact_approach={"translation_m": .024, "guard": 1., "idle_support_clearance_m": .0015},
-        support_contacts=True, fixed_support_kind="plane",
+        support_contacts=True, fixed_support_kind=support_kind,
     )
     command.approach_dir_and_part = torch.zeros(2, 2, 3), torch.full((2, 2), -1)
     active = torch.zeros(2, 2, 2, dtype=torch.bool)
@@ -1389,7 +1390,7 @@ def test_idle_plane_clearance_keeps_a_declared_support_hand_in_place(tmp_path):
         "metadata": {"hand_sides": ("left", "right"), "part_body_names": ("base", "lid")},
         "active": active, "known": known,
     }
-    # Both target wrists would cross the configured plane. The second clone has
+    # Both target wrists would cross the configured support. The second clone has
     # unlabelled intent on the right, so it has no authority to move out of the way.
     known[1, 1, 0] = False
     pose = action._entity.data
@@ -1411,6 +1412,13 @@ def test_idle_plane_clearance_keeps_a_declared_support_hand_in_place(tmp_path):
     action.process_actions(raw)
     action.apply_actions()
     torch.testing.assert_close(action.installed_control["idle_support_offset_m"], first)
+    if support_kind == "box":
+        # The second clone's idle target clears the finite footprint horizontally.
+        known[1, 1, 0] = True
+        command.motion_lib.native_root_state_w["right"][1, 0] = .5
+        action.process_actions(raw)
+        action.apply_actions()
+        assert action.installed_control["idle_support_offset_m"][1, 1] == 0.
 
 
 def test_rigid_stationary_hold_uses_the_prepared_interval_within_each_clip():

@@ -261,15 +261,15 @@ class NativeResidualAction(ActionTerm):
         self._source_transport_commands = torch.full_like(self._source_contact_compression, torch.nan)
         self._source_transport_rotation = torch.zeros_like(self._source_contact_translation)
         self._idle_support_offset_m = torch.zeros_like(self._source_hold_offset_m)
-        self._idle_support_planes = ()
+        self._idle_support_faces = ()
         if self._idle_support_clearance_m:
             import mujoco
 
-            from .native_support import bind_idle_support_planes
+            from .native_support import bind_idle_support_faces
 
             plant = getattr(getattr(env, "sim", None), "plant", None)
             model = plant.model if plant is not None else mujoco.MjModel.from_xml_path(self.layout.scene_xml_path)
-            self._idle_support_planes = bind_idle_support_planes(
+            self._idle_support_faces = bind_idle_support_faces(
                 model, self.hand_body_names, self._entity.body_names, self.device)
         self._source_hold_pairs = ()
         self._source_hold_reference_rows = None
@@ -451,7 +451,7 @@ class NativeResidualAction(ActionTerm):
         translation = correction * cap
         if self._source_contact_guard is not None:
             translation = translation + self._source_contact_translation
-            if idle_clearance and self._idle_support_planes:
+            if idle_clearance and self._idle_support_faces:
                 translation = translation + self._idle_support_offset_m[..., None] * self._env.scene.gravity_up_w
             translation = translation.clamp(-cap, cap)
         return translation
@@ -662,7 +662,7 @@ class NativeResidualAction(ActionTerm):
         return torch.where(active[..., None], goal, fallback)
 
     def _clear_idle_support(self, command, source_step, rate_limit):
-        from .native_support import idle_plane_depth
+        from .native_support import idle_support_depth
 
         ids, ml = command._motion_flat_ids, command.motion_lib
         scene = self._env.scene
@@ -678,14 +678,14 @@ class NativeResidualAction(ActionTerm):
             reference = torch.stack([ml.native_root_state_w[side][ids, :7] for side in self.hand_sides], 1)
             target_position = reference[..., :3] + self._wrist_translation(idle_clearance=False)
             target_rotation = quat_box_plus(reference[..., 3:7], self._wrist_rotation())
-            for binding in self._idle_support_planes:
+            for binding in self._idle_support_faces:
                 hand = binding[0]
                 side = self.hand_sides[hand]
                 force = torch.stack([
                     solved["pairs"][f"{side}/{obj.entity_name}/{part.name}"]["normal_force_n"]
                     for obj, part in self.layout.part_bindings
                 ], -1)
-                depth = idle_plane_depth(position, rotation, target_position, target_rotation, scene.gravity_up_w, binding)
+                depth = idle_support_depth(position, rotation, target_position, target_rotation, binding)
                 eligible = (idle[:, hand] & ml.native_root_pose_support[side][ids]
                             & (force < .08).all(-1) & (depth > 0.))
                 offset = (depth + self._idle_support_clearance_m).clamp(max=self._source_contact_scale)
@@ -727,7 +727,7 @@ class NativeResidualAction(ActionTerm):
             step = step * (limit / step.norm(dim=-1, keepdim=True).clamp_min(limit))
             self._source_contact_translation.add_(step)
             self._source_contact_part.copy_(part)
-            if self._idle_support_planes:
+            if self._idle_support_faces:
                 self._clear_idle_support(command, step, limit)
         if self.cfg.wrist_target_twist == "filtered_correction_feedforward":
             self._correction_twist[..., :3] = (
